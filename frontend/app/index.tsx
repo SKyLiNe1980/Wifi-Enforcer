@@ -436,7 +436,7 @@ export default function Index() {
       </KeyboardAvoidingView>
 
       {/* PROFILE MODAL */}
-      <Modal visible={profileModal} animationType="slide" transparent onRequestClose={() => setProfileModal(false)}>
+      <Modal visible={profileModal} animationType="fade" transparent statusBarTranslucent hardwareAccelerated onRequestClose={() => setProfileModal(false)}>
         <View style={styles.modalWrap}>
           <View style={styles.modal}>
             <View style={styles.modalHeader}>
@@ -489,7 +489,7 @@ export default function Index() {
       </Modal>
 
       {/* SAVE PROFILE MODAL */}
-      <Modal visible={saveModal} animationType="fade" transparent onRequestClose={() => setSaveModal(false)}>
+      <Modal visible={saveModal} animationType="fade" transparent statusBarTranslucent hardwareAccelerated onRequestClose={() => setSaveModal(false)}>
         <View style={styles.modalWrap}>
           <View style={styles.modal}>
             <View style={styles.modalHeader}>
@@ -581,7 +581,7 @@ const styles = StyleSheet.create({
     borderRadius: 3,
   },
   smallBtnText: { color: C.green, fontFamily: MONO, fontSize: 10 },
-  grid: { flexDirection: "row", flexWrap: "wrap", gap: 8 },
+  grid: { flexDirection: "row", flexWrap: "wrap", justifyContent: "space-between" },
   gridItem: {
     width: "48.5%",
     backgroundColor: C.panel,
@@ -589,7 +589,7 @@ const styles = StyleSheet.create({
     borderColor: C.border,
     borderRadius: 4,
     padding: 10,
-    gap: 4,
+    marginBottom: 8,
     minHeight: 70,
   },
   gridLabel: { color: C.text, fontFamily: MONO, fontSize: 12, fontWeight: "600" },
