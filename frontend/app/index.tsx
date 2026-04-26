@@ -538,7 +538,7 @@ export default function App() {
         {/* TAB BAR */}
         <View style={s.tabbar}>
           <TabBtn t="quick" cur={tab} icon="flash" label="quick" onPress={setTab} />
-          <TabBtn t="terminal" cur={tab} icon="terminal" label="term" badge={logs.length} onPress={setTab} />
+          <TabBtn t="terminal" cur={tab} icon="console" label="term" badge={logs.length} onPress={setTab} />
           <TabBtn t="profiles" cur={tab} icon="bookmark-multiple" label="profiles" badge={profiles.length} onPress={setTab} />
           <TabBtn t="settings" cur={tab} icon="cog" label="settings" onPress={setTab} />
         </View>
