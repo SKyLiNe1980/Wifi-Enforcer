@@ -60,22 +60,27 @@ function withRootShellRegistered(config) {
     }
 
     if (!src.includes("RootShellPackage()")) {
-      // Try multiple known patterns (SDK 53/54 use slightly different MainApplication scaffolds)
+      // Try multiple known patterns (SDK 53/54 use different MainApplication scaffolds)
       const patterns = [
-        // Pattern A: `val packages = PackageList(this).packages` (most common)
+        // Pattern A (SDK 54): inline `PackageList(this).packages.apply { ... }` — inject inside the apply block
+        {
+          re: /(PackageList\(this\)\.packages\.apply\s*\{\s*\n)/,
+          inj: `$1            add(RootShellPackage())\n`,
+        },
+        // Pattern B (older SDK): `val packages = PackageList(this).packages`
         {
           re: /(val packages = PackageList\(this\)\.packages[^\n]*\n)/,
           inj: `$1            packages.add(RootShellPackage())\n`,
         },
-        // Pattern B: Java-style `List<ReactPackage> packages = new PackageList(this).getPackages();`
+        // Pattern C (Java-style): `List<ReactPackage> packages = new PackageList(this).getPackages();`
         {
           re: /(List<ReactPackage> packages = new PackageList\(this\)\.getPackages\(\);\n)/,
           inj: `$1      packages.add(new RootShellPackage());\n`,
         },
-        // Pattern C: `packages.addAll(...)` block — append before return
+        // Pattern D: `return packages` block — inject before the return
         {
-          re: /(\s+return packages\n\s+\})/,
-          inj: `\n            packages.add(RootShellPackage())$1`,
+          re: /(\n\s+)(return packages\n\s+\})/,
+          inj: `$1packages.add(RootShellPackage())$1$2`,
         },
       ];
       let injected = false;
@@ -91,7 +96,7 @@ function withRootShellRegistered(config) {
           "[withRootShell] ⚠️  Could not auto-patch MainApplication. " +
           "Open android/app/src/main/java/com/wifienforcer/MainApplication.kt and add manually:\n" +
           "    import com.wifienforcer.rootshell.RootShellPackage\n" +
-          "    packages.add(RootShellPackage())   // inside getPackages()",
+          "    add(RootShellPackage())   // inside the PackageList(this).packages.apply { } block",
         );
       } else {
         console.log("[withRootShell] ✓ patched MainApplication");
