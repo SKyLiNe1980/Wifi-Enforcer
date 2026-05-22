@@ -360,7 +360,7 @@ class Settings(BaseModel):
     iface_c: str = ""
     country: str = "US"
     active_iface: str = "A"          # "A" | "B" | "C" | "ALL"
-    chroot_path: str = "bootkali"    # NetHunter helper binary (bootkali, bootkali_login, nh, nethunter, …)
+    chroot_path: str = "bootkali custom_cmd"  # NetHunter chroot exec prefix (command gets appended as args)
 
 
 @api_router.get("/settings", response_model=Settings)

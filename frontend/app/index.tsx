@@ -132,7 +132,7 @@ export default function App() {
   const [newProfileDesc, setNewProfileDesc] = useState("");
   const [execMode, setExecMode] = useState<ExecMode>("mock");
   const [bridgeRoot, setBridgeRoot] = useState<boolean | null>(null);
-  const [chrootPath, setChrootPath] = useState("bootkali");
+  const [chrootPath, setChrootPath] = useState("bootkali custom_cmd");
   const termRef = useRef<ScrollView>(null);
 
   const ctx: Ctx = { iface, country };
@@ -152,10 +152,10 @@ export default function App() {
   // Wrap a command for the current exec mode (frontend-side wrapping for kali)
   const wrapForMode = useCallback((cmd: string): string => {
     if (execMode === "kali") {
-      // Pipe via stdin (works with bootkali, bootkali_login, bootkali_bash, nethunter, nh)
-      // even those that don't support -c. Escape single quotes for the outer shell.
-      const escaped = cmd.replace(/'/g, "'\\''");
-      return `echo '${escaped}' | ${chrootPath}`;
+      // OffSec NetHunter wrap: bootkali's only non-interactive arbitrary-cmd interface
+      // is `bootkali custom_cmd <command>`. The helper word-concats args and runs
+      // `chroot $MNT sudo <cmd>`. So we just APPEND our command — no quoting/piping.
+      return `${chrootPath} ${cmd}`;
     }
     return cmd;
   }, [execMode, chrootPath]);
@@ -629,14 +629,13 @@ export default function App() {
             autoCorrect={false}
           />
           <Text style={[s.helper, { marginTop: 4 }]}>
-            common: <Text style={{ color: C.cyan }}>bootkali</Text>,{" "}
-            <Text style={{ color: C.cyan }}>bootkali_login</Text>,{" "}
-            <Text style={{ color: C.cyan }}>bootkali_bash</Text>,{" "}
-            <Text style={{ color: C.cyan }}>nh</Text>,{" "}
-            <Text style={{ color: C.cyan }}>nethunter</Text>
+            OffSec NetHunter: <Text style={{ color: C.cyan }}>bootkali custom_cmd</Text>{" "}
+            (default — the only non-interactive way){"\n"}
+            SELinux fallback: <Text style={{ color: C.cyan }}>sh /system/bin/bootkali custom_cmd</Text>{"\n"}
+            Direct: <Text style={{ color: C.cyan }}>/data/data/com.offsec.nethunter/scripts/bin/busybox_nh chroot /data/local/nhsystem/kalifs /usr/bin/sudo</Text>
           </Text>
           <Text style={s.helper}>
-            wrap pattern: <Text style={{ color: C.magenta }}>echo '&lt;cmd&gt;' | {chrootPath}</Text>
+            wrap pattern: <Text style={{ color: C.magenta }}>{chrootPath} &lt;cmd&gt;</Text>
           </Text>
         </View>
       )}
