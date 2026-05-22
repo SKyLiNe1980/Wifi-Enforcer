@@ -307,16 +307,72 @@ DEFAULT_PROFILES = [
             "cmd wifi status",
         ],
     },
+    {
+        "name": "🩺 Wifi Diag",
+        "description": "Full wireless stack snapshot — regdomain, phys, interfaces, dmesg tail.",
+        "commands": [
+            "id",
+            "iw reg get",
+            "iw dev",
+            "iw phy",
+            "ifconfig -a",
+            "iwconfig",
+            "getprop wifi.interface",
+            "getprop wifi.country",
+            "cmd wifi status",
+            "dmesg | tail -30",
+        ],
+    },
+    {
+        "name": "🚀 TX Power Max (wlan2)",
+        "description": "AWUS036NH: down, managed, txpower 3000mBm, monitor, up. Order matters.",
+        "commands": [
+            "iw reg set KE",
+            "ifconfig wlan2 down",
+            "iw dev wlan2 set type managed",
+            "iw dev wlan2 set txpower fixed 3000",
+            "iw dev wlan2 set type monitor",
+            "ifconfig wlan2 up",
+            "iw dev wlan2 info",
+        ],
+    },
 ]
 
 
 @app.on_event("startup")
 async def seed():
-    count = await db.profiles.count_documents({})
-    if count == 0:
-        for p in DEFAULT_PROFILES:
+    # Idempotent: only insert profiles whose names don't already exist
+    existing_names = {d.get("name") async for d in db.profiles.find({}, {"name": 1, "_id": 0})}
+    inserted = 0
+    for p in DEFAULT_PROFILES:
+        if p["name"] not in existing_names:
             await db.profiles.insert_one(Profile(**p).dict())
-        logger.info("Seeded %d default profiles", len(DEFAULT_PROFILES))
+            inserted += 1
+    if inserted:
+        logger.info("Seeded %d new default profiles", inserted)
+
+
+# ---------- Settings (key/value app preferences) ----------
+class Settings(BaseModel):
+    exec_mode: str = "mock"          # "mock" | "real" | "kali"
+    iface_a: str = "wlan2"
+    iface_b: str = ""
+    iface_c: str = ""
+    country: str = "US"
+    active_iface: str = "A"          # "A" | "B" | "C" | "ALL"
+    chroot_path: str = "nethunter"   # binary name or full path
+
+
+@api_router.get("/settings", response_model=Settings)
+async def get_settings():
+    doc = await db.settings.find_one({"_id": "app"}, {"_id": 0})
+    return Settings(**(doc or {}))
+
+
+@api_router.put("/settings", response_model=Settings)
+async def put_settings(s: Settings):
+    await db.settings.update_one({"_id": "app"}, {"$set": s.dict()}, upsert=True)
+    return s
 
 
 app.include_router(api_router)

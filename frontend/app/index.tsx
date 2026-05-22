@@ -65,6 +65,8 @@ type Profile = {
 
 type Ctx = { iface: string; country: string };
 
+type ExecMode = "mock" | "real" | "kali";
+
 const QUICK_COMMANDS: { label: string; cmd: (c: Ctx) => string; icon: any }[] = [
   { label: "Disable WiFi", cmd: () => "svc wifi disable", icon: "wifi-off" },
   { label: "Enable WiFi", cmd: () => "svc wifi enable", icon: "wifi" },
@@ -112,6 +114,9 @@ function HighlightedCmd({ cmd }: { cmd: string }) {
 export default function App() {
   const [tab, setTab] = useState<"quick" | "terminal" | "profiles" | "settings">("quick");
   const [iface, setIface] = useState("wlan2");
+  const [ifaceB, setIfaceB] = useState("");
+  const [ifaceC, setIfaceC] = useState("");
+  const [activeIface, setActiveIface] = useState<"A" | "B" | "C" | "ALL">("A");
   const [country, setCountry] = useState("US");
   const [logs, setLogs] = useState<Log[]>([]);
   const [profiles, setProfiles] = useState<Profile[]>([]);
@@ -125,11 +130,33 @@ export default function App() {
   const [saveOpen, setSaveOpen] = useState(false);
   const [newProfileName, setNewProfileName] = useState("");
   const [newProfileDesc, setNewProfileDesc] = useState("");
-  const [realMode, setRealMode] = useState(false);
+  const [execMode, setExecMode] = useState<ExecMode>("mock");
   const [bridgeRoot, setBridgeRoot] = useState<boolean | null>(null);
   const termRef = useRef<ScrollView>(null);
 
   const ctx: Ctx = { iface, country };
+
+  // Resolve active interface(s) based on activeIface selector
+  const activeIfaces = useMemo<string[]>(() => {
+    const list = [iface, ifaceB, ifaceC].filter((x) => x.trim());
+    if (activeIface === "ALL") return list;
+    if (activeIface === "A") return [iface || "wlan0"];
+    if (activeIface === "B") return [ifaceB || iface];
+    return [ifaceC || iface];
+  }, [iface, ifaceB, ifaceC, activeIface]);
+
+  const primaryIface = activeIfaces[0] || iface;
+  const ctxActive: Ctx = { iface: primaryIface, country };
+
+  // Wrap a command for the current exec mode (frontend-side wrapping for kali)
+  const wrapForMode = useCallback((cmd: string): string => {
+    if (execMode === "kali") {
+      // Escape single quotes inside the command, then wrap with nethunter -c '...'
+      const escaped = cmd.replace(/'/g, "'\\''");
+      return `nethunter -c '${escaped}'`;
+    }
+    return cmd;
+  }, [execMode]);
 
   const fetchAll = useCallback(async () => {
     try {
@@ -156,8 +183,44 @@ export default function App() {
 
   // If bridge becomes unavailable, force back to mock
   useEffect(() => {
-    if (!HAS_NATIVE_ROOT) setRealMode(false);
+    if (!HAS_NATIVE_ROOT && execMode !== "mock") setExecMode("mock");
+  }, [execMode]);
+
+  // Load persisted settings on mount, save on change
+  useEffect(() => {
+    fetch(`${API}/settings`)
+      .then((r) => r.json())
+      .then((s) => {
+        if (s.iface_a) setIface(s.iface_a);
+        if (s.iface_b !== undefined) setIfaceB(s.iface_b);
+        if (s.iface_c !== undefined) setIfaceC(s.iface_c);
+        if (s.country) setCountry(s.country);
+        if (s.active_iface) setActiveIface(s.active_iface);
+        // Only restore exec_mode if bridge is available
+        if (HAS_NATIVE_ROOT && (s.exec_mode === "real" || s.exec_mode === "kali")) {
+          setExecMode(s.exec_mode);
+        }
+      })
+      .catch(() => {});
   }, []);
+
+  useEffect(() => {
+    const t = setTimeout(() => {
+      fetch(`${API}/settings`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          exec_mode: execMode,
+          iface_a: iface,
+          iface_b: ifaceB,
+          iface_c: ifaceC,
+          country,
+          active_iface: activeIface,
+        }),
+      }).catch(() => {});
+    }, 500);
+    return () => clearTimeout(t);
+  }, [execMode, iface, ifaceB, ifaceC, country, activeIface]);
 
   useEffect(() => {
     if (tab !== "terminal") return;
@@ -165,41 +228,63 @@ export default function App() {
     return () => clearTimeout(t);
   }, [logs, tab]);
 
+  // Substitute $IFACE in a command for a specific iface (when fanning out to ALL)
+  const substIface = (cmd: string, ifname: string) =>
+    cmd.replace(new RegExp(`\\b${iface}\\b`, "g"), ifname);
+
   const execute = useCallback(async (command: string) => {
     if (!command.trim() || running) return;
     setRunning(true);
+    const isReal = (execMode === "real" || execMode === "kali") && HAS_NATIVE_ROOT;
+    // Fan out across all active ifaces if ALL is selected
+    const targets = activeIface === "ALL" ? activeIfaces : [primaryIface];
     try {
-      if (realMode && HAS_NATIVE_ROOT) {
-        const r = await execReal(command);
-        setLogs((p) => [...p, {
-          id: String(Date.now()) + Math.random(),
-          timestamp: new Date().toISOString(),
-          ...r,
-        } as Log]);
-      } else {
-        const res = await fetch(`${API}/execute`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ command }),
-        });
-        const data: Log = await res.json();
-        setLogs((p) => [...p, data]);
+      for (const ifname of targets) {
+        const cmd = targets.length > 1 ? substIface(command, ifname) : command;
+        const wrapped = wrapForMode(cmd);
+        if (isReal) {
+          const r = await execReal(wrapped);
+          setLogs((p) => [...p, {
+            id: String(Date.now()) + Math.random(),
+            timestamp: new Date().toISOString(),
+            ...r,
+            command: cmd,   // show un-wrapped command in terminal
+          } as Log]);
+        } else {
+          const res = await fetch(`${API}/execute`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ command: cmd }),
+          });
+          const data: Log = await res.json();
+          setLogs((p) => [...p, data]);
+        }
       }
     } catch (e: any) {
       setLogs((p) => [...p, {
         id: String(Date.now()), command, output: `[err] ${e?.message || e}`,
-        exit_code: 1, duration_ms: 0, mocked: !realMode, timestamp: new Date().toISOString(),
+        exit_code: 1, duration_ms: 0, mocked: execMode === "mock", timestamp: new Date().toISOString(),
       }]);
     } finally { setRunning(false); }
-  }, [running, realMode]);
+  }, [running, execMode, activeIface, activeIfaces, primaryIface, iface, wrapForMode]);
 
   const runProfile = useCallback(async (p: Profile) => {
     setRunning(true);
+    const isReal = (execMode === "real" || execMode === "kali") && HAS_NATIVE_ROOT;
+    const targets = activeIface === "ALL" ? activeIfaces : [primaryIface];
     try {
-      if (realMode && HAS_NATIVE_ROOT && RootShell) {
-        const data = await RootShell.execBatch(p.commands);
-        const mapped: Log[] = data.logs.map((l: any) => ({
-          id: String(Date.now()) + Math.random(),
+      if (isReal && RootShell) {
+        // Fan out commands across target ifaces, all wrapped for chroot if needed
+        const flatCmds: string[] = [];
+        for (const ifname of targets) {
+          for (const c of p.commands) {
+            const subbed = targets.length > 1 ? substIface(c, ifname) : c;
+            flatCmds.push(wrapForMode(subbed));
+          }
+        }
+        const data = await RootShell.execBatch(flatCmds);
+        const mapped: Log[] = data.logs.map((l: any, i: number) => ({
+          id: String(Date.now()) + Math.random() + i,
           command: l.command, output: l.stdout || l.stderr || "",
           exit_code: l.exit_code, duration_ms: 0, mocked: false,
           timestamp: new Date().toISOString(),
@@ -213,7 +298,7 @@ export default function App() {
       setTab("terminal");
     } catch (e) { console.warn(e); }
     finally { setRunning(false); }
-  }, [realMode]);
+  }, [execMode, activeIface, activeIfaces, primaryIface, iface, wrapForMode]);
 
   const deleteProfile = useCallback(async (id: string) => {
     await fetch(`${API}/profiles/${id}`, { method: "DELETE" });
@@ -227,7 +312,7 @@ export default function App() {
 
   const saveCurrentAsProfile = useCallback(async () => {
     if (!newProfileName.trim()) { Alert.alert("Name required"); return; }
-    const cmds = QUICK_COMMANDS.map((q) => q.cmd(ctx));
+    const cmds = QUICK_COMMANDS.map((q) => q.cmd(ctxActive));
     await fetch(`${API}/profiles`, {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name: newProfileName.trim(), description: newProfileDesc.trim(), commands: cmds }),
@@ -272,8 +357,8 @@ export default function App() {
       <Text style={s.sectionTitle}>// context</Text>
       <View style={{ flexDirection: "row" }}>
         <View style={[s.field, { flex: 1, marginRight: 10 }]}>
-          <Text style={s.fieldLabel}>$IFACE</Text>
-          <TextInput testID="input-iface" value={iface} onChangeText={setIface}
+          <Text style={s.fieldLabel}>$IFACE_A</Text>
+          <TextInput testID="input-iface-a" value={iface} onChangeText={setIface}
             style={s.fieldInput} placeholder="wlan0" placeholderTextColor={C.textDim}
             autoCapitalize="none" autoCorrect={false} />
         </View>
@@ -284,6 +369,52 @@ export default function App() {
             style={s.fieldInput} placeholder="US" placeholderTextColor={C.textDim}
             autoCapitalize="characters" maxLength={2} />
         </View>
+      </View>
+      <View style={{ flexDirection: "row", marginTop: 8 }}>
+        <View style={[s.field, { flex: 1, marginRight: 10 }]}>
+          <Text style={s.fieldLabel}>$IFACE_B <Text style={{ color: C.textDim }}>(optional)</Text></Text>
+          <TextInput testID="input-iface-b" value={ifaceB} onChangeText={setIfaceB}
+            style={s.fieldInput} placeholder="wlan3" placeholderTextColor={C.textDim}
+            autoCapitalize="none" autoCorrect={false} />
+        </View>
+        <View style={[s.field, { flex: 1 }]}>
+          <Text style={s.fieldLabel}>$IFACE_C <Text style={{ color: C.textDim }}>(optional)</Text></Text>
+          <TextInput testID="input-iface-c" value={ifaceC} onChangeText={setIfaceC}
+            style={s.fieldInput} placeholder="wlan4" placeholderTextColor={C.textDim}
+            autoCapitalize="none" autoCorrect={false} />
+        </View>
+      </View>
+
+      {/* Active adapter chip selector */}
+      <View style={{ marginTop: 12 }}>
+        <Text style={s.fieldLabel}>active adapter</Text>
+        <View style={s.chipRow}>
+          {(["A", "B", "C", "ALL"] as const).map((k) => {
+            const enabled = k === "A" || (k === "B" && ifaceB) || (k === "C" && ifaceC) ||
+                            (k === "ALL" && (ifaceB || ifaceC));
+            const active = activeIface === k;
+            return (
+              <TouchableOpacity
+                key={k}
+                testID={`chip-${k}`}
+                disabled={!enabled}
+                onPress={() => setActiveIface(k)}
+                style={[
+                  s.chip,
+                  active && { backgroundColor: C.green, borderColor: C.green },
+                  !enabled && { opacity: 0.3 },
+                ]}
+              >
+                <Text style={[s.chipText, active && { color: C.bg, fontWeight: "800" }]}>{k}</Text>
+              </TouchableOpacity>
+            );
+          })}
+        </View>
+        {activeIface === "ALL" && activeIfaces.length > 1 && (
+          <Text style={[s.helper, { marginTop: 6 }]}>
+            quick actions will run on: <Text style={{ color: C.cyan }}>{activeIfaces.join(", ")}</Text>
+          </Text>
+        )}
       </View>
 
       <View style={[s.sectionRow, { marginTop: 24 }]}>
@@ -296,7 +427,7 @@ export default function App() {
 
       <View style={s.grid}>
         {QUICK_COMMANDS.map((q, i) => {
-          const cmd = q.cmd(ctx);
+          const cmd = q.cmd(ctxActive);
           return (
             <TouchableOpacity key={i} testID={`quick-${i}`} style={s.gridItem}
               onPress={() => { execute(cmd); setTab("terminal"); }} disabled={running} activeOpacity={0.7}>
@@ -419,39 +550,64 @@ export default function App() {
     <ScrollView contentContainerStyle={{ padding: 16, paddingBottom: 32 }}>
       <Text style={s.sectionTitle}>// system</Text>
       <View style={s.kvBlock}>
-        <KV k="exec mode" v={realMode ? "REAL · su -c" : "MOCK"} vColor={realMode ? C.green : C.yellow} />
+        <KV k="exec mode" v={execMode === "kali" ? "KALI · chroot" : execMode === "real" ? "REAL · su -c" : "MOCK"} vColor={execMode === "mock" ? C.yellow : C.green} />
         <KV k="bridge" v={HAS_NATIVE_ROOT ? (bridgeRoot ? "loaded · root granted" : bridgeRoot === false ? "loaded · root denied" : "loaded · checking…") : "absent (Expo Go / web)"} vColor={HAS_NATIVE_ROOT ? (bridgeRoot ? C.green : C.red) : C.textDim} />
         <KV k="root" v={rootInfo?.root_granted ? "GRANTED" : "..."} vColor={rootInfo?.root_granted ? C.green : C.red} />
         <KV k="device" v={rootInfo?.device || "..."} vColor={C.cyan} />
         <KV k="os" v={rootInfo?.android_version || "..."} vColor={C.cyan} />
+        <KV k="active iface" v={activeIface === "ALL" ? `ALL (${activeIfaces.join(", ")})` : `${activeIface} · ${primaryIface}`} vColor={C.cyan} />
         <KV k="api" v={API} vColor={C.textDim} />
       </View>
 
-      <Text style={[s.sectionTitle, { marginTop: 24 }]}>// execution</Text>
-      <TouchableOpacity testID="btn-toggle-real"
-        onPress={() => {
-          if (!HAS_NATIVE_ROOT) {
-            Alert.alert("Bridge not present", "REAL mode requires the built APK. See /app/root-bridge/README.md.");
-            return;
-          }
-          if (!bridgeRoot && !realMode) {
-            Alert.alert("Root not granted", "Open Magisk and grant root for WiFi Enforcer, then try again.");
-            return;
-          }
-          setRealMode((v) => !v);
-        }}
-        style={[s.row, !HAS_NATIVE_ROOT && { opacity: 0.6 }]}>
-        <MaterialCommunityIcons name={realMode ? "shield-check" : "shield-outline"} size={16} color={realMode ? C.green : C.yellow} />
-        <Text style={[s.rowText, { color: realMode ? C.green : C.yellow }]}>
-          {realMode ? "REAL mode — commands hit `su -c`" : "MOCK mode — commands simulated"}
-        </Text>
-        <View style={[s.toggle, realMode && { backgroundColor: C.green }]}>
-          <View style={[s.toggleKnob, realMode && { left: 18 }]} />
-        </View>
-      </TouchableOpacity>
+      <Text style={[s.sectionTitle, { marginTop: 24 }]}>// execution mode</Text>
+      <View style={s.segGroup}>
+        {(["mock", "real", "kali"] as ExecMode[]).map((m) => {
+          const active = execMode === m;
+          const disabled = m !== "mock" && !HAS_NATIVE_ROOT;
+          const color = m === "mock" ? C.yellow : m === "real" ? C.green : C.magenta;
+          return (
+            <TouchableOpacity
+              key={m}
+              testID={`btn-mode-${m}`}
+              onPress={() => {
+                if (disabled) {
+                  Alert.alert("Bridge not present", "Build the APK first. See /app/root-bridge/README.md.");
+                  return;
+                }
+                if (m !== "mock" && !bridgeRoot) {
+                  Alert.alert("Root not granted", "Open Magisk and grant root for WiFi Enforcer, then try again.");
+                  return;
+                }
+                setExecMode(m);
+              }}
+              style={[
+                s.segBtn,
+                active && { backgroundColor: color, borderColor: color },
+                disabled && { opacity: 0.4 },
+              ]}
+            >
+              <MaterialCommunityIcons
+                name={m === "mock" ? "shield-outline" : m === "real" ? "shield-check" : "linux"}
+                size={14}
+                color={active ? C.bg : color}
+              />
+              <Text style={[s.segBtnText, { color: active ? C.bg : color }]}>
+                {m === "mock" ? "MOCK" : m === "real" ? "REAL" : "KALI"}
+              </Text>
+            </TouchableOpacity>
+          );
+        })}
+      </View>
+      <Text style={s.helper}>
+        {execMode === "kali"
+          ? "commands wrapped: `nethunter -c '…'` — runs inside Kali chroot"
+          : execMode === "real"
+          ? "commands hit `su -c` directly on Android"
+          : "commands simulated by mock backend (no real exec)"}
+      </Text>
       {!HAS_NATIVE_ROOT && (
-        <Text style={s.helper}>
-          REAL mode is only available in the standalone APK. Build instructions ↓
+        <Text style={[s.helper, { marginTop: 4 }]}>
+          REAL/KALI are only available in the built APK.
         </Text>
       )}
 
@@ -521,8 +677,10 @@ export default function App() {
           </View>
           <View style={{ flexDirection: "row", alignItems: "center" }}>
             {running && <ActivityIndicator size="small" color={C.green} style={{ marginRight: 8 }} />}
-            <View style={[s.badge, { borderColor: realMode ? C.green : C.yellow }]}>
-              <Text style={[s.badgeText, { color: realMode ? C.green : C.yellow }]}>{realMode ? "REAL" : "MOCK"}</Text>
+            <View style={[s.badge, { borderColor: execMode === "kali" ? C.magenta : execMode === "real" ? C.green : C.yellow }]}>
+              <Text style={[s.badgeText, { color: execMode === "kali" ? C.magenta : execMode === "real" ? C.green : C.yellow }]}>
+                {execMode === "kali" ? "KALI" : execMode === "real" ? "REAL" : "MOCK"}
+              </Text>
             </View>
           </View>
         </View>
@@ -554,8 +712,8 @@ export default function App() {
                 </TouchableOpacity>
               </View>
               <Text style={s.helper}>
-                snapshot all 12 quick-action commands using $IFACE=
-                <Text style={{ color: C.cyan }}>{iface}</Text> $CC=
+                snapshot all 12 quick-action commands using active iface=
+                <Text style={{ color: C.cyan }}>{primaryIface}</Text> $CC=
                 <Text style={{ color: C.cyan }}>{country}</Text>
               </Text>
               <View style={[s.field, { marginTop: 12 }]}>
@@ -699,6 +857,22 @@ const s = StyleSheet.create({
     width: 16, height: 16, borderRadius: 8, backgroundColor: C.text,
     position: "absolute", left: 2, top: 2,
   },
+
+  chipRow: { flexDirection: "row", marginTop: 4 },
+  chip: {
+    paddingHorizontal: 14, paddingVertical: 6,
+    borderWidth: 1, borderColor: C.border, borderRadius: 3,
+    backgroundColor: C.panel, marginRight: 6, minWidth: 44, alignItems: "center",
+  },
+  chipText: { color: C.green, fontFamily: MONO, fontSize: 12, fontWeight: "600" },
+
+  segGroup: { flexDirection: "row", marginBottom: 6 },
+  segBtn: {
+    flex: 1, flexDirection: "row", alignItems: "center", justifyContent: "center",
+    borderWidth: 1, borderColor: C.border, backgroundColor: C.panel,
+    paddingVertical: 10, marginRight: 4, borderRadius: 4,
+  },
+  segBtnText: { fontFamily: MONO, fontSize: 11, fontWeight: "800", letterSpacing: 1, marginLeft: 4 },
 
   codeBlock: { backgroundColor: "#02050a", borderWidth: 1, borderColor: C.border, borderRadius: 4, padding: 10, marginBottom: 8 },
   codeText: { color: C.text, fontFamily: MONO, fontSize: 10 },
