@@ -132,6 +132,7 @@ export default function App() {
   const [newProfileDesc, setNewProfileDesc] = useState("");
   const [execMode, setExecMode] = useState<ExecMode>("mock");
   const [bridgeRoot, setBridgeRoot] = useState<boolean | null>(null);
+  const [chrootPath, setChrootPath] = useState("bootkali");
   const termRef = useRef<ScrollView>(null);
 
   const ctx: Ctx = { iface, country };
@@ -151,12 +152,13 @@ export default function App() {
   // Wrap a command for the current exec mode (frontend-side wrapping for kali)
   const wrapForMode = useCallback((cmd: string): string => {
     if (execMode === "kali") {
-      // Escape single quotes inside the command, then wrap with nethunter -c '...'
+      // Pipe via stdin (works with bootkali, bootkali_login, bootkali_bash, nethunter, nh)
+      // even those that don't support -c. Escape single quotes for the outer shell.
       const escaped = cmd.replace(/'/g, "'\\''");
-      return `nethunter -c '${escaped}'`;
+      return `echo '${escaped}' | ${chrootPath}`;
     }
     return cmd;
-  }, [execMode]);
+  }, [execMode, chrootPath]);
 
   const fetchAll = useCallback(async () => {
     try {
@@ -196,6 +198,7 @@ export default function App() {
         if (s.iface_c !== undefined) setIfaceC(s.iface_c);
         if (s.country) setCountry(s.country);
         if (s.active_iface) setActiveIface(s.active_iface);
+        if (s.chroot_path) setChrootPath(s.chroot_path);
         // Only restore exec_mode if bridge is available
         if (HAS_NATIVE_ROOT && (s.exec_mode === "real" || s.exec_mode === "kali")) {
           setExecMode(s.exec_mode);
@@ -216,11 +219,12 @@ export default function App() {
           iface_c: ifaceC,
           country,
           active_iface: activeIface,
+          chroot_path: chrootPath,
         }),
       }).catch(() => {});
     }, 500);
     return () => clearTimeout(t);
-  }, [execMode, iface, ifaceB, ifaceC, country, activeIface]);
+  }, [execMode, iface, ifaceB, ifaceC, country, activeIface, chrootPath]);
 
   useEffect(() => {
     if (tab !== "terminal") return;
@@ -609,6 +613,32 @@ export default function App() {
         <Text style={[s.helper, { marginTop: 4 }]}>
           REAL/KALI are only available in the built APK.
         </Text>
+      )}
+
+      {execMode === "kali" && (
+        <View style={[s.field, { marginTop: 10 }]}>
+          <Text style={s.fieldLabel}>chroot helper</Text>
+          <TextInput
+            testID="input-chroot-path"
+            value={chrootPath}
+            onChangeText={setChrootPath}
+            style={s.fieldInput}
+            placeholder="bootkali"
+            placeholderTextColor={C.textDim}
+            autoCapitalize="none"
+            autoCorrect={false}
+          />
+          <Text style={[s.helper, { marginTop: 4 }]}>
+            common: <Text style={{ color: C.cyan }}>bootkali</Text>,{" "}
+            <Text style={{ color: C.cyan }}>bootkali_login</Text>,{" "}
+            <Text style={{ color: C.cyan }}>bootkali_bash</Text>,{" "}
+            <Text style={{ color: C.cyan }}>nh</Text>,{" "}
+            <Text style={{ color: C.cyan }}>nethunter</Text>
+          </Text>
+          <Text style={s.helper}>
+            wrap pattern: <Text style={{ color: C.magenta }}>echo '&lt;cmd&gt;' | {chrootPath}</Text>
+          </Text>
+        </View>
       )}
 
       <Text style={[s.sectionTitle, { marginTop: 24 }]}>// data</Text>
