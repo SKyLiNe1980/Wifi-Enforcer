@@ -15,6 +15,52 @@ const path = require("path");
 
 const KOTLIN_FILES = ["RootShellModule.kt", "RootShellPackage.kt"];
 
+// Proguard rules — appended to android/app/proguard-rules.pro at prebuild time.
+// RN's stock proguard config does NOT explicitly keep @ReactMethod-annotated methods,
+// so R8 in release builds can strip ones it doesn't see invoked from Java/Kotlin.
+// JS calls them via reflection, so R8 has no idea they're reachable. This caused
+// new streaming methods (executeStream/killSession/listSessions) to silently
+// disappear from release APKs while older methods (exec/isRoot) survived.
+const PROGUARD_RULES = `
+# === RootShell native module (added by withRootShell config plugin) ===
+# Keep the module class and ALL @ReactMethod-annotated methods.
+# Without this, R8 in release builds strips streaming methods because JS
+# invokes them via reflection — R8 can't see the call sites.
+-keep class com.wifienforcer.rootshell.** { *; }
+-keepclassmembers class * {
+    @com.facebook.react.bridge.ReactMethod *;
+}
+-keepclassmembers class * extends com.facebook.react.bridge.ReactContextBaseJavaModule {
+    public *;
+}
+# ============================================================
+`;
+
+function withRootShellProguard(config) {
+  return withDangerousMod(config, [
+    "android",
+    async (config) => {
+      const proguardPath = path.join(
+        config.modRequest.platformProjectRoot,
+        "app/proguard-rules.pro",
+      );
+      try {
+        let existing = "";
+        if (fs.existsSync(proguardPath)) existing = fs.readFileSync(proguardPath, "utf8");
+        if (!existing.includes("RootShell native module")) {
+          fs.writeFileSync(proguardPath, existing + PROGUARD_RULES, "utf8");
+          console.log("[withRootShell] ✓ appended proguard keep rules");
+        } else {
+          console.log("[withRootShell] proguard rules already present");
+        }
+      } catch (e) {
+        console.warn(`[withRootShell] could not write proguard rules: ${e.message}`);
+      }
+      return config;
+    },
+  ]);
+}
+
 function withRootShellSources(config) {
   return withDangerousMod(config, [
     "android",
@@ -111,6 +157,7 @@ function withRootShellRegistered(config) {
 module.exports = function withRootShell(config) {
   console.log("[withRootShell] plugin invoked");
   config = withRootShellSources(config);
+  config = withRootShellProguard(config);
   config = withRootShellRegistered(config);
   return config;
 };
