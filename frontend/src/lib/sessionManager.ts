@@ -10,7 +10,7 @@
  * (e.g. airodump on wlan2, tcpdump on wlan3, wifite on wlan4) can run
  * simultaneously.
  */
-import { startStream, killStream, HAS_NATIVE_STREAMING } from "./rootShell";
+import { startStream, killStream, hasNativeStreaming } from "./rootShell";
 
 export type LineRecord = {
   stream: "stdout" | "stderr";
@@ -88,11 +88,16 @@ class SessionManager {
       status: "starting",
       lines: [],
       lineCount: 0,
-      mocked: !HAS_NATIVE_STREAMING,
+      mocked: false,  // determined below via lazy probe
     };
     this.sessions.set(id, state);
     this.pendingFlush.set(id, []);
     this.notify();
+
+    // Lazy check — at *call time*, not module-import time. The RN bridge sometimes
+    // hasn't built its method table yet when rootShell.ts is first evaluated.
+    const streamingAvailable = hasNativeStreaming();
+    state.mocked = !streamingAvailable;
 
     // Register with backend (best-effort)
     if (this.apiBase) {
@@ -108,7 +113,7 @@ class SessionManager {
       } catch (e) { /* best-effort */ }
     }
 
-    if (!HAS_NATIVE_STREAMING) {
+    if (!streamingAvailable) {
       // Preview / Expo Go fallback — synthesize a few mocked lines and end.
       state.status = "running";
       this.notify();

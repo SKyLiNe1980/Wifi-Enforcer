@@ -4,7 +4,7 @@ import {
 } from "react-native";
 import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
 import { sessionManager, SessionState } from "../lib/sessionManager";
-import { HAS_NATIVE_STREAMING } from "../lib/rootShell";
+import { hasNativeStreaming, RootShell, HAS_NATIVE_ROOT } from "../lib/rootShell";
 
 const C = {
   bg: "#04070a", panel: "#0a1116", panel2: "#0e1820", border: "#163041",
@@ -180,6 +180,19 @@ export default function LiveTab(props: Props) {
       {presetOpen && (
         <View style={s.presetDrawer}>
           <Text style={s.presetTitle}>// stream presets · iface={props.primaryIface}</Text>
+          {/* Native bridge diagnostic — helps debug "module loaded but methods missing" */}
+          {(() => {
+            const hasMod = !!RootShell;
+            const keys = hasMod ? Object.keys(RootShell as any) : [];
+            const hasExec = hasMod && typeof (RootShell as any).executeStream;
+            const hasKill = hasMod && typeof (RootShell as any).killSession;
+            const ok = hasNativeStreaming();
+            return (
+              <Text style={[s.helper, { color: ok ? C.greenDim : C.yellow, fontSize: 9 }]}>
+                bridge: root={HAS_NATIVE_ROOT ? "✓" : "✗"} · stream={ok ? "✓" : "✗"} · keys={keys.length} · exec={String(hasExec)} · kill={String(hasKill)}
+              </Text>
+            );
+          })()}
           <View style={s.presetGrid}>
             {PRESETS.map((p, i) => (
               <TouchableOpacity
@@ -216,7 +229,7 @@ export default function LiveTab(props: Props) {
               <Text style={s.runBtnText}>RUN</Text>
             </TouchableOpacity>
           </View>
-          {!HAS_NATIVE_STREAMING && (
+          {!hasNativeStreaming() && (
             <Text style={[s.helper, { color: C.yellow, marginTop: 6 }]}>
               ⚠ native streaming unavailable — presets run in MOCK simulator. Build the APK for real exec.
             </Text>

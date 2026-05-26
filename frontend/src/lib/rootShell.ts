@@ -45,11 +45,41 @@ export const RootShell: RNModule | null =
 
 export const HAS_NATIVE_ROOT = !!RootShell;
 
-// Streaming requires the new methods to exist on the native module.
-export const HAS_NATIVE_STREAMING =
-  !!RootShell && typeof (RootShell as any).executeStream === "function";
+/**
+ * Whether the native module exposes the streaming API (executeStream, killSession, …).
+ *
+ * IMPORTANT: We deliberately do NOT compute this at module-evaluation time as
+ * `typeof RootShell.executeStream === 'function'` — the RN legacy bridge is
+ * sometimes still building its method table when this file is imported, so
+ * the typeof check returns `undefined` even though the method is registered.
+ * Instead we check lazily at each use site.
+ */
+export function hasNativeStreaming(): boolean {
+  if (!RootShell) return false;
+  const m = RootShell as any;
+  return typeof m.executeStream === "function" || typeof m.executeStream === "object";
+}
 
-const emitter = HAS_NATIVE_STREAMING ? new NativeEventEmitter(NativeModules.RootShell) : null;
+// Back-compat constant — optimistic; assumes if root works, streaming ships with it.
+// Real check happens at call time via hasNativeStreaming().
+export const HAS_NATIVE_STREAMING = !!RootShell;
+
+// One-shot diagnostic — logs the actual method shape so we can see what
+// RN's bridge is exposing. Helps debug "module loaded but methods missing".
+if (RootShell) {
+  try {
+    const keys = Object.keys(RootShell as any);
+    const exec = typeof (RootShell as any).executeStream;
+    const kill = typeof (RootShell as any).killSession;
+    // eslint-disable-next-line no-console
+    console.log(`[RootShell] bridge probe: keys=${keys.join(",")} executeStream=${exec} killSession=${kill}`);
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.warn("[RootShell] probe failed", e);
+  }
+}
+
+const emitter = RootShell ? new NativeEventEmitter(NativeModules.RootShell) : null;
 
 export async function checkRoot(): Promise<boolean> {
   if (!RootShell) return false;
@@ -97,9 +127,16 @@ export function startStream(
     emitter.addListener("RootShell.pid", (e: PidEvent) => { if (e.sessionId === sessionId) cb.onPid?.(e); }),
   ];
 
-  RootShell.executeStream(sessionId, command).catch((err: any) => {
-    cb.onError?.({ sessionId, message: err?.message || "executeStream failed" });
-  });
+  try {
+    RootShell.executeStream(sessionId, command)
+      .then(() => { /* native ack */ })
+      .catch((err: any) => {
+        cb.onError?.({ sessionId, message: err?.message || "executeStream failed" });
+      });
+  } catch (e: any) {
+    // Method literally doesn't exist on the bridge (old APK, build mismatch, etc.)
+    cb.onError?.({ sessionId, message: `streaming method missing: ${e?.message || e}` });
+  }
 
   return () => { subs.forEach((s) => s.remove()); };
 }
