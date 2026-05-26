@@ -1,0 +1,24 @@
+{
+  "$schema": "https://modelcontextprotocol.io/schema/manifest.json",
+  "name": "wifi-enforcer",
+  "version": "0.2.0",
+  "description": "Drive a rooted Android pentest device with NetHunter chroot. Exposes WiFi Enforcer's profile library, arbitrary shell execution (mock/real/kali), interface management, and emergency PANIC stop as MCP tools.",
+  "author": "WiFi Enforcer project",
+  "license": "MIT",
+  "server": {
+    "type": "stdio",
+    "command": "python",
+    "args": ["wifi_enforcer_mcp.py"],
+    "env": {
+      "WIFI_ENFORCER_API": "http://127.0.0.1:8001/api",
+      "AUDIT_LOG_PATH": "/sdcard/wifi_enforcer_mcp_audit.jsonl"
+    }
+  },
+  "tools": [
+    "wifi_get_settings", "wifi_list_profiles", "wifi_list_logs", "wifi_diag", "wifi_get_health",
+    "wifi_execute", "wifi_run_profile", "wifi_create_profile", "wifi_delete_profile",
+    "wifi_set_iface_context", "wifi_set_exec_mode", "wifi_set_country",
+    "wifi_panic", "wifi_clear_logs", "wifi_get_audit_log"
+  ],
+  "tags": ["pentest", "wifi", "android", "kali", "nethunter", "rooted"]
+}

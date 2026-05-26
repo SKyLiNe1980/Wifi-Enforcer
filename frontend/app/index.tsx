@@ -198,7 +198,11 @@ export default function App() {
         if (s.iface_c !== undefined) setIfaceC(s.iface_c);
         if (s.country) setCountry(s.country);
         if (s.active_iface) setActiveIface(s.active_iface);
-        if (s.chroot_path) setChrootPath(s.chroot_path);
+        if (s.chroot_path) {
+          // Self-heal: legacy single-binary values get upgraded to the working bootkali form
+          const legacy = ["bootkali", "bootkali_login", "bootkali_bash", "nethunter", "nh"];
+          setChrootPath(legacy.includes(s.chroot_path.trim()) ? "bootkali custom_cmd" : s.chroot_path);
+        }
         // Only restore exec_mode if bridge is available
         if (HAS_NATIVE_ROOT && (s.exec_mode === "real" || s.exec_mode === "kali")) {
           setExecMode(s.exec_mode);
