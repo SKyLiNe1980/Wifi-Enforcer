@@ -16,6 +16,8 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { StatusBar } from "expo-status-bar";
 import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
 import { HAS_NATIVE_ROOT, checkRoot, execReal, RootShell } from "../src/lib/rootShell";
+import { sessionManager } from "../src/lib/sessionManager";
+import LiveTab from "../src/components/LiveTab";
 
 const API = `${process.env.EXPO_PUBLIC_BACKEND_URL}/api`;
 
@@ -67,6 +69,8 @@ type Ctx = { iface: string; country: string };
 
 type ExecMode = "mock" | "real" | "kali";
 
+const NETHUNTER_CHROOT = "/data_mirror/data_ce/null/0/com.offsec.nethunter/scripts/bin/busybox_nh chroot /data/local/nhsystem/kalifs /usr/bin/sudo -E PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
 const QUICK_COMMANDS: { label: string; cmd: (c: Ctx) => string; icon: any }[] = [
   { label: "Disable WiFi", cmd: () => "svc wifi disable", icon: "wifi-off" },
   { label: "Enable WiFi", cmd: () => "svc wifi enable", icon: "wifi" },
@@ -112,7 +116,7 @@ function HighlightedCmd({ cmd }: { cmd: string }) {
 
 // ============================================================
 export default function App() {
-  const [tab, setTab] = useState<"quick" | "terminal" | "profiles" | "settings">("quick");
+  const [tab, setTab] = useState<"quick" | "terminal" | "live" | "profiles" | "settings">("quick");
   const [iface, setIface] = useState("wlan2");
   const [ifaceB, setIfaceB] = useState("");
   const [ifaceC, setIfaceC] = useState("");
@@ -132,7 +136,7 @@ export default function App() {
   const [newProfileDesc, setNewProfileDesc] = useState("");
   const [execMode, setExecMode] = useState<ExecMode>("mock");
   const [bridgeRoot, setBridgeRoot] = useState<boolean | null>(null);
-  const [chrootPath, setChrootPath] = useState("bootkali custom_cmd");
+  const [chrootPath, setChrootPath] = useState(NETHUNTER_CHROOT);
   const termRef = useRef<ScrollView>(null);
 
   const ctx: Ctx = { iface, country };
@@ -177,6 +181,9 @@ export default function App() {
 
   useEffect(() => { fetchAll(); }, [fetchAll]);
 
+  // Initialize streaming session manager with backend API base
+  useEffect(() => { sessionManager.configure(API); }, []);
+
   // Detect native bridge & root status (only present in built APK; null in Expo Go/web)
   useEffect(() => {
     if (!HAS_NATIVE_ROOT) return;
@@ -199,9 +206,16 @@ export default function App() {
         if (s.country) setCountry(s.country);
         if (s.active_iface) setActiveIface(s.active_iface);
         if (s.chroot_path) {
-          // Self-heal: legacy single-binary values get upgraded to the working bootkali form
-          const legacy = ["bootkali", "bootkali_login", "bootkali_bash", "nethunter", "nh"];
-          setChrootPath(legacy.includes(s.chroot_path.trim()) ? "bootkali custom_cmd" : s.chroot_path);
+          // Self-heal: legacy values that don't work due to Android data isolation get upgraded
+          // to the data_mirror chroot pattern (the one that actually works on OffSec NetHunter).
+          const legacy = [
+            "bootkali", "bootkali_login", "bootkali_bash",
+            "bootkali custom_cmd",
+            "nethunter", "nh",
+            "echo | bootkali",
+          ];
+          const v = s.chroot_path.trim();
+          setChrootPath(legacy.includes(v) ? NETHUNTER_CHROOT : v);
         }
         // Only restore exec_mode if bridge is available
         if (HAS_NATIVE_ROOT && (s.exec_mode === "real" || s.exec_mode === "kali")) {
@@ -633,13 +647,14 @@ export default function App() {
             autoCorrect={false}
           />
           <Text style={[s.helper, { marginTop: 4 }]}>
-            OffSec NetHunter: <Text style={{ color: C.cyan }}>bootkali custom_cmd</Text>{" "}
-            (default — the only non-interactive way){"\n"}
-            SELinux fallback: <Text style={{ color: C.cyan }}>sh /system/bin/bootkali custom_cmd</Text>{"\n"}
-            Direct: <Text style={{ color: C.cyan }}>/data/data/com.offsec.nethunter/scripts/bin/busybox_nh chroot /data/local/nhsystem/kalifs /usr/bin/sudo</Text>
+            Default (OffSec NetHunter, data_mirror bypass) is set — works through Android data isolation.{"\n"}
+            Alternatives if your chroot lives elsewhere:{"\n"}
+            • <Text style={{ color: C.cyan }}>bootkali custom_cmd</Text> (if accessible from app context){"\n"}
+            • <Text style={{ color: C.cyan }}>sh /system/bin/bootkali custom_cmd</Text>{"\n"}
+            • Direct chroot to your own kalifs path
           </Text>
           <Text style={s.helper}>
-            wrap pattern: <Text style={{ color: C.magenta }}>{chrootPath} &lt;cmd&gt;</Text>
+            wrap: <Text style={{ color: C.magenta }}>{chrootPath.length > 80 ? chrootPath.slice(0, 77) + "…" : chrootPath}</Text>{" "}<Text style={{ color: C.green }}>&lt;cmd&gt;</Text>
           </Text>
         </View>
       )}
@@ -722,6 +737,17 @@ export default function App() {
         <View style={{ flex: 1 }}>
           {tab === "quick" && renderQuick()}
           {tab === "terminal" && renderTerminal()}
+          {tab === "live" && (
+            <LiveTab
+              iface={iface}
+              ifaceB={ifaceB}
+              ifaceC={ifaceC}
+              primaryIface={primaryIface}
+              country={country}
+              execMode={execMode}
+              wrap={wrapForMode}
+            />
+          )}
           {tab === "profiles" && renderProfiles()}
           {tab === "settings" && renderSettings()}
         </View>
@@ -730,6 +756,7 @@ export default function App() {
         <View style={s.tabbar}>
           <TabBtn t="quick" cur={tab} icon="flash" label="quick" onPress={setTab} />
           <TabBtn t="terminal" cur={tab} icon="console" label="term" badge={logs.length} onPress={setTab} />
+          <TabBtn t="live" cur={tab} icon="satellite-uplink" label="live" onPress={setTab} />
           <TabBtn t="profiles" cur={tab} icon="bookmark-multiple" label="profiles" badge={profiles.length} onPress={setTab} />
           <TabBtn t="settings" cur={tab} icon="cog" label="settings" onPress={setTab} />
         </View>

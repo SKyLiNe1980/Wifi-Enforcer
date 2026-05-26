@@ -363,6 +363,151 @@ def wifi_get_audit_log(lines: int = 100) -> list[dict]:
         return []
 
 
+# ============================================================
+# Streaming Sessions — for long-running tools (airodump, wifite, tcpdump)
+# ============================================================
+# The actual tool exec happens on the rooted Android device via the app's
+# native bridge. The app pushes line batches to the backend in near real-time
+# so this MCP server can expose them to LLM agents.
+
+@mcp.tool()
+def wifi_stream_start(command: str, iface: str = "", label: str = "") -> dict:
+    """🛰️ Start a STREAMING shell session for long-running tools that produce
+    continuous output (airodump-ng, wifite, tcpdump, hcxdumptool, dmesg -w, etc).
+    Unlike wifi_execute() which blocks, this returns immediately with a
+    session_id. Poll output with wifi_stream_tail(session_id, since=cursor).
+
+    NOTE: The session is only actually launched when the human-facing app is
+    open AND in REAL/KALI exec mode. This tool registers the session record
+    with the backend but does NOT itself spawn a process — the app's Live tab
+    polls this server and picks up new sessions to execute. (For autonomous
+    agent control without the app, run commands via wifi_execute and accept
+    the blocking behavior.)
+
+    Args:
+        command: full shell command, e.g. 'airodump-ng wlan2'.
+        iface:   optional interface tag for grouping in the UI.
+        label:   short human-readable label (defaults to the first word).
+
+    Returns:
+        {id, command, iface, label, started_at, status: 'running', ...}
+    """
+    if not command.strip():
+        raise ValueError("command required")
+    payload = {"command": command, "iface": iface, "label": label}
+    return _call("POST", "/sessions/start", json=payload)
+
+
+@mcp.tool()
+def wifi_stream_list(include_ended: bool = False) -> list[dict]:
+    """List active streaming sessions on the device.
+
+    Args:
+        include_ended: also include sessions that exited but haven't been
+            removed yet (default False — running only).
+
+    Returns:
+        list of {id, command, iface, label, started_at, pid, status,
+                 exit_code, duration_ms, line_count, mocked}.
+    """
+    return _call("GET", f"/sessions?include_ended={'true' if include_ended else 'false'}")
+
+
+@mcp.tool()
+def wifi_stream_tail(session_id: str, since: int = 0, max_lines: int = 500) -> dict:
+    """Fetch new output lines from a streaming session.
+
+    Args:
+        session_id: the id returned by wifi_stream_start or seen in
+            wifi_stream_list.
+        since: cursor (line_no) of the last line you've seen. Pass 0 to start
+            from the top of the ring buffer. Use the returned 'cursor' value
+            as 'since' on the next call to incrementally tail.
+        max_lines: cap on lines returned this call (default 500, max 500).
+
+    Returns:
+        {id, status, line_count, cursor, lines: [{stream, line, line_no, ts}, ...]}
+        — `cursor` is the new high-water mark to pass back as `since` next time.
+    """
+    max_lines = max(1, min(max_lines, 500))
+    return _call("GET", f"/sessions/{session_id}/tail?since={int(since)}&max_lines={max_lines}")
+
+
+@mcp.tool()
+def wifi_stream_grep(session_id: str, pattern: str, since: int = 0, max_lines: int = 500) -> dict:
+    """Tail a session AND filter lines client-side by a substring/regex.
+    Useful for catching WPA handshakes in airodump output, PMKID hashes from
+    hcxdumptool, EAPOL events from tcpdump, etc.
+
+    Args:
+        session_id, since, max_lines: same as wifi_stream_tail.
+        pattern: case-insensitive substring OR a Python regex (auto-detected
+            if it contains regex metachars).
+
+    Returns:
+        {id, status, cursor, matched_count, lines: [...filtered]}
+    """
+    import re as _re
+    raw = _call("GET", f"/sessions/{session_id}/tail?since={int(since)}&max_lines={int(max_lines)}")
+    metachars = set(".+*?[]{}()|\\^$")
+    if any(c in pattern for c in metachars):
+        try:
+            rx = _re.compile(pattern, _re.IGNORECASE)
+            matched = [l for l in raw.get("lines", []) if rx.search(l.get("line", ""))]
+        except _re.error:
+            needle = pattern.lower()
+            matched = [l for l in raw.get("lines", []) if needle in l.get("line", "").lower()]
+    else:
+        needle = pattern.lower()
+        matched = [l for l in raw.get("lines", []) if needle in l.get("line", "").lower()]
+    return {
+        "id": raw.get("id", session_id),
+        "status": raw.get("status"),
+        "cursor": raw.get("cursor", since),
+        "matched_count": len(matched),
+        "lines": matched,
+    }
+
+
+@mcp.tool()
+def wifi_stream_stop(session_id: str, graceful: bool = True) -> dict:
+    """Mark a streaming session for termination. The app's Live tab observes
+    this and issues SIGINT (graceful=True, lets airodump/tcpdump flush their
+    capture files) or SIGKILL (graceful=False, immediate) on the next poll.
+
+    Args:
+        session_id: target session.
+        graceful: True (recommended for capture tools) sends SIGINT then
+            escalates to SIGKILL after 2s; False sends SIGKILL immediately.
+
+    Returns:
+        {ok: true, session_id, requested: 'SIGINT'|'SIGKILL'}
+        NOTE: actual stop happens on-device — confirm via wifi_stream_list().
+    """
+    # Backend doesn't yet have a direct "kill" endpoint that signals the app
+    # (the app polls /sessions and runs killSession() locally). For now we
+    # mark the session with status=killing in its end record by appending
+    # a control line that the app interprets. Simplest: just call /end with
+    # status='killed' and let the app's onExit handler clean up.
+    # For graceful, we rely on the app to actually deliver SIGINT.
+    payload = {"exit_code": -1, "duration_ms": 0, "status": "killing" if graceful else "kill_force"}
+    _call("POST", f"/sessions/{session_id}/end", json=payload)
+    return {"ok": True, "session_id": session_id, "requested": "SIGINT" if graceful else "SIGKILL"}
+
+
+@mcp.tool()
+def wifi_stream_history(limit: int = 20) -> list[dict]:
+    """Persisted session summaries from MongoDB (ended sessions with their
+    last ~500 lines of output). Useful for retrospectively analyzing a recon
+    run after it completed.
+
+    Args:
+        limit: how many most-recent sessions to return (default 20, max 500).
+    """
+    limit = max(1, min(limit, 500))
+    return _call("GET", f"/sessions/history?limit={limit}")
+
+
 # ---------- Entry point ----------
 def main():
     transport = os.environ.get("MCP_TRANSPORT", "stdio").lower()

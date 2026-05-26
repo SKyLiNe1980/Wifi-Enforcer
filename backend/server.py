@@ -2,6 +2,7 @@ from fastapi import FastAPI, APIRouter, HTTPException
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
+from collections import deque
 import os
 import logging
 import re
@@ -9,7 +10,7 @@ import asyncio
 import random
 from pathlib import Path
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import List, Optional, Dict, Deque
 import uuid
 from datetime import datetime, timezone
 
@@ -360,7 +361,9 @@ class Settings(BaseModel):
     iface_c: str = ""
     country: str = "US"
     active_iface: str = "A"          # "A" | "B" | "C" | "ALL"
-    chroot_path: str = "bootkali custom_cmd"  # NetHunter chroot exec prefix (command gets appended as args)
+    # Default works for OffSec NetHunter on Android 11+ where data isolation hides /data/data/com.offsec.nethunter
+    # from foreign app contexts. We invoke busybox_nh + chroot directly via /data_mirror (the Magisk root-visible namespace).
+    chroot_path: str = "/data_mirror/data_ce/null/0/com.offsec.nethunter/scripts/bin/busybox_nh chroot /data/local/nhsystem/kalifs /usr/bin/sudo -E PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 
 @api_router.get("/settings", response_model=Settings)
@@ -373,6 +376,163 @@ async def get_settings():
 async def put_settings(s: Settings):
     await db.settings.update_one({"_id": "app"}, {"$set": s.dict()}, upsert=True)
     return s
+
+
+# ============================================================
+# Live Sessions — streaming output ring buffer
+# ============================================================
+# In-memory store. The native streaming runs on-device; the app PUSHes line
+# batches to /api/sessions/{id}/append every ~1-2s so the MCP server (and
+# remote dashboards) can poll a tail. On session end, we persist a summary
+# (last N lines + meta) to MongoDB for post-mortem audit.
+
+RING_SIZE = 2000           # max lines kept per active session
+SUMMARY_TAIL = 500         # how many trailing lines are persisted on end
+
+
+class SessionLine(BaseModel):
+    stream: str = "stdout"     # "stdout" | "stderr"
+    line: str
+    line_no: int = 0
+    ts: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class LiveSession(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    command: str
+    iface: str = ""
+    label: str = ""             # human-friendly tag e.g. "airodump-wlan2"
+    started_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    ended_at: Optional[str] = None
+    pid: Optional[int] = None
+    exit_code: Optional[int] = None
+    duration_ms: Optional[int] = None
+    line_count: int = 0
+    status: str = "running"     # "running" | "ended" | "killed" | "error"
+    mocked: bool = False
+
+
+class SessionStartRequest(BaseModel):
+    id: Optional[str] = None
+    command: str
+    iface: str = ""
+    label: str = ""
+    pid: Optional[int] = None
+    mocked: bool = False
+
+
+class SessionAppendRequest(BaseModel):
+    lines: List[SessionLine]
+
+
+class SessionEndRequest(BaseModel):
+    exit_code: int = 0
+    duration_ms: int = 0
+    status: str = "ended"   # "ended" | "killed" | "error"
+
+
+# Per-session in-memory state: {meta: LiveSession, buffer: deque[SessionLine], counter: int}
+LIVE_SESSIONS: Dict[str, dict] = {}
+
+
+def _get_session_or_404(sid: str) -> dict:
+    s = LIVE_SESSIONS.get(sid)
+    if not s:
+        raise HTTPException(404, f"live session {sid} not found")
+    return s
+
+
+@api_router.post("/sessions/start", response_model=LiveSession)
+async def session_start(req: SessionStartRequest):
+    sess = LiveSession(
+        id=req.id or str(uuid.uuid4()),
+        command=req.command,
+        iface=req.iface,
+        label=req.label or req.command.split()[0] if req.command.strip() else "session",
+        pid=req.pid,
+        mocked=req.mocked,
+    )
+    LIVE_SESSIONS[sess.id] = {
+        "meta": sess.dict(),
+        "buffer": deque(maxlen=RING_SIZE),
+        "counter": 0,
+    }
+    return sess
+
+
+@api_router.post("/sessions/{sid}/append")
+async def session_append(sid: str, req: SessionAppendRequest):
+    s = _get_session_or_404(sid)
+    buf: Deque = s["buffer"]
+    added = 0
+    for ln in req.lines:
+        s["counter"] += 1
+        rec = ln.dict()
+        rec["line_no"] = ln.line_no or s["counter"]
+        buf.append(rec)
+        added += 1
+    s["meta"]["line_count"] = s["counter"]
+    return {"appended": added, "total": s["counter"]}
+
+
+@api_router.get("/sessions/{sid}/tail")
+async def session_tail(sid: str, since: int = 0, max_lines: int = 500):
+    s = _get_session_or_404(sid)
+    buf: Deque = s["buffer"]
+    lines = [r for r in buf if r["line_no"] > since][-max_lines:]
+    return {
+        "id": sid,
+        "status": s["meta"]["status"],
+        "line_count": s["counter"],
+        "cursor": lines[-1]["line_no"] if lines else since,
+        "lines": lines,
+    }
+
+
+@api_router.post("/sessions/{sid}/end", response_model=LiveSession)
+async def session_end(sid: str, req: SessionEndRequest):
+    s = _get_session_or_404(sid)
+    meta = s["meta"]
+    meta["ended_at"] = datetime.now(timezone.utc).isoformat()
+    meta["exit_code"] = req.exit_code
+    meta["duration_ms"] = req.duration_ms
+    meta["status"] = req.status
+    # Persist summary to Mongo (truncated tail for audit)
+    tail = list(s["buffer"])[-SUMMARY_TAIL:]
+    summary = {**meta, "tail": tail}
+    try:
+        await db.session_summaries.insert_one(summary)
+    except Exception as e:
+        logger.warning("failed to persist session summary %s: %s", sid, e)
+    return LiveSession(**meta)
+
+
+@api_router.delete("/sessions/{sid}")
+async def session_delete(sid: str):
+    """Remove from in-memory store. The Mongo summary (if any) is preserved."""
+    if sid in LIVE_SESSIONS:
+        del LIVE_SESSIONS[sid]
+        return {"deleted": 1}
+    return {"deleted": 0}
+
+
+@api_router.get("/sessions")
+async def sessions_list(include_ended: bool = False):
+    out = []
+    for sid, s in LIVE_SESSIONS.items():
+        if not include_ended and s["meta"]["status"] != "running":
+            continue
+        out.append(s["meta"])
+    return out
+
+
+@api_router.get("/sessions/history")
+async def sessions_history(limit: int = 50):
+    """Persisted summaries from MongoDB (ended sessions)."""
+    docs = await db.session_summaries.find(
+        {}, {"_id": 0}
+    ).sort("ended_at", -1).to_list(min(max(limit, 1), 500))
+    return docs
 
 
 app.include_router(api_router)
