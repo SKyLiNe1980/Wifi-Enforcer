@@ -258,3 +258,86 @@ agent_communication:
       User must build the APK to test native streaming on device:
         cd /app/frontend && eas build -p android --profile preview
       Preview mode synthesizes 3 mock lines + warning banner so UI is visible.
+
+  - agent: "main"
+    message: |
+      Bug-fix round on streaming method registration:
+      • SYMPTOM: On user's release APK, `bridge root=✓ stream=✗ keys=1
+        exec=undefined kill=undefined`. Older methods (isRoot/exec/execBatch)
+        worked fine in KALI mode — confirmed by user running `id` successfully.
+      • DIAGNOSIS: `removeListeners(count: Int)` had primitive-int signature.
+        RN's bridge introspection expects boxed `Integer count` for this
+        RN-reserved method name. Signature mismatch caused the registrar
+        to abort scanning the rest of the class, silently dropping every
+        @ReactMethod declared AFTER the stub (executeStream/killSession/
+        listSessions all came after).
+      • FIX:
+        1. Changed `count: Int` → `count: Int?` so Kotlin generates
+           java.lang.Integer (boxed)
+        2. Moved both NativeEventEmitter stubs (addListener/removeListeners)
+           to the END of the class — belt-and-suspenders: even if RN still
+           hiccups, every real method registers first
+      • ALSO: Added persistent bridge diagnostic bar at top of Live tab
+        (was previously hidden in preset drawer)
+      • ALSO: Added "default startup mode" setting + removed the race-prone
+        useEffect that was force-reverting users' KALI/REAL preference back
+        to MOCK on every cold start due to module-import-time race with the
+        native bridge
+      • User rebuilding now — waiting for diagnostic readout to confirm.
+
+  - agent: "main"
+    message: |
+      FUTURE PHASE — DISTRIBUTED "ENFORCER SWARM" ARCHITECTURE (parked for later):
+      
+      User raised a high-value architectural vision: turn Enforcer from a
+      single-device app into a distributed mesh of heterogeneous worker nodes
+      (rooted phones as radio/capture nodes, desktop as GPU/compute, RPi as
+      sensor) coordinated via WireGuard mesh and an LLM-driven orchestrator.
+      
+      Concept validated as excellent, feasible, and a natural evolution of
+      current architecture:
+      • Backend already has session state — needs `node_id` + routing only
+      • MCP already abstracts tools — adding a `node` dimension is 1 param
+      • Live tab already supports multi-session — needs node-filter chip
+      • Transport problem solved externally via Tailscale/Headscale/raw WG
+      
+      Real-world precedents combining pieces of this: Cobalt Strike Team Server,
+      Sliver/Mythic/Havoc C2s, hashcat brain mode, Kismet remote capture,
+      BloodHound collector/analyzer split, WiFiPineapple Constellation.
+      Nobody has unified all this into a root-Android-first LLM-driven cockpit.
+      
+      Proposed phased rollout (when user is ready to start):
+        Phase 1: Node registration + heartbeat + Cluster tab (small effort)
+        Phase 2: Remote session execution forwarding (medium)
+        Phase 3: Tailscale auto-mesh bootstrap (small — Tailscale does heavy lifting)
+        Phase 4: MCP cluster-aware tools (small)
+        Phase 5: Pipeline DSL + smart dispatch — declarative cross-node jobs (large)
+        Phase 6: Cross-node PCAP merge + GPU offload for crack-on-capture (medium)
+      
+      Game-changing capabilities unlocked:
+      • Real-time capture→crack pipeline (phone captures handshake → desktop
+        GPU picks it up mid-capture → cracked PW back in seconds)
+      • Coordinated multi-radio captures across 2.4/5/6GHz simultaneously
+      • RSSI triangulation via geographically-distributed nodes
+      • LLM inference offload — Hermes on desktop GPU instead of phone
+      • 24/7 capture nodes that auto-rejoin tailnet as user commutes
+      • Distributed deauth/PMKID at scale without saturating one radio
+      
+      Hard parts to design around when we start:
+      • Phone battery economics — need power-aware scheduling
+      • Node availability flapping — orchestrator must replan when nodes drop
+      • Canonical state ownership — recommendation: orchestrator owns sessions,
+        workers stream into it, buffer-and-replay if orchestrator dies
+      • Auth & blast radius — per-node API tokens + audit log mandatory
+      • Discovery bootstrap UX — must be one QR scan, not a README
+      • Time sync — NTP/chrony before any cross-node PCAP merge
+      
+      Open questions to lock down before starting:
+        1. Tailscale (hosted) vs Headscale (self-hosted) vs raw WireGuard?
+        2. Is the desktop always-on? (determines if orchestrator is fixed or floats)
+        3. Air-gap mode required (LAN-only mesh, no control plane reachability)?
+        4. Personal fleet only, or eventually public open-source bootstrap UX?
+        5. MCP exposure: all nodes, or just orchestrator?
+      
+      Status: BACKLOG — not blocking current work. Resume after streaming +
+      PCAP-over-IP + airodump CSV parser + boot-time auto-apply phases.
