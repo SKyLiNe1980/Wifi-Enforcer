@@ -113,11 +113,12 @@ export default function LiveTab(props: Props) {
       command: wrapped,
       iface: ifaceForCmd,
       label: cmd.split(/\s+/)[0],
+      forceMock: props.execMode === "mock",
     });
     setSelectedId(id);
     setCustomCmd("");
     setPresetOpen(false);
-  }, [props.primaryIface, props.wrap]);
+  }, [props.primaryIface, props.wrap, props.execMode]);
 
   const runPreset = (p: typeof PRESETS[number]) => {
     const cmd = p.cmd(props.primaryIface);
@@ -141,6 +142,27 @@ export default function LiveTab(props: Props) {
 
   return (
     <View style={{ flex: 1, backgroundColor: C.bg }}>
+      {/* Persistent bridge diagnostic — debugging "stuck in mock" symptoms */}
+      <View style={s.bridgeBar}>
+        {(() => {
+          const hasMod = !!RootShell;
+          const keys = hasMod ? Object.keys(RootShell as any) : [];
+          const exec = hasMod ? typeof (RootShell as any).executeStream : "no-mod";
+          const kill = hasMod ? typeof (RootShell as any).killSession : "no-mod";
+          const ok = hasNativeStreaming();
+          const modeOk = props.execMode !== "mock";
+          return (
+            <Text style={[s.bridgeText, { color: ok && modeOk ? C.greenDim : C.yellow }]}>
+              <Text style={{ color: C.textDim }}>bridge </Text>
+              root=<Text style={{ color: HAS_NATIVE_ROOT ? C.green : C.red }}>{HAS_NATIVE_ROOT ? "✓" : "✗"}</Text>{" · "}
+              stream=<Text style={{ color: ok ? C.green : C.red }}>{ok ? "✓" : "✗"}</Text>{" · "}
+              mode=<Text style={{ color: modeOk ? C.green : C.yellow }}>{props.execMode}</Text>{" · "}
+              keys={keys.length} · exec={String(exec)} · kill={String(kill)}
+            </Text>
+          );
+        })()}
+      </View>
+
       {/* Session chips */}
       <View style={s.chipBar}>
         <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ padding: 8 }}>
@@ -180,19 +202,6 @@ export default function LiveTab(props: Props) {
       {presetOpen && (
         <View style={s.presetDrawer}>
           <Text style={s.presetTitle}>// stream presets · iface={props.primaryIface}</Text>
-          {/* Native bridge diagnostic — helps debug "module loaded but methods missing" */}
-          {(() => {
-            const hasMod = !!RootShell;
-            const keys = hasMod ? Object.keys(RootShell as any) : [];
-            const hasExec = hasMod && typeof (RootShell as any).executeStream;
-            const hasKill = hasMod && typeof (RootShell as any).killSession;
-            const ok = hasNativeStreaming();
-            return (
-              <Text style={[s.helper, { color: ok ? C.greenDim : C.yellow, fontSize: 9 }]}>
-                bridge: root={HAS_NATIVE_ROOT ? "✓" : "✗"} · stream={ok ? "✓" : "✗"} · keys={keys.length} · exec={String(hasExec)} · kill={String(hasKill)}
-              </Text>
-            );
-          })()}
           <View style={s.presetGrid}>
             {PRESETS.map((p, i) => (
               <TouchableOpacity
@@ -334,6 +343,11 @@ export default function LiveTab(props: Props) {
 }
 
 const s = StyleSheet.create({
+  bridgeBar: {
+    backgroundColor: "#020608", borderBottomWidth: 1, borderBottomColor: C.border,
+    paddingHorizontal: 10, paddingVertical: 4,
+  },
+  bridgeText: { fontFamily: MONO, fontSize: 9 },
   chipBar: {
     flexDirection: "row", alignItems: "center",
     backgroundColor: C.panel, borderBottomWidth: 1, borderBottomColor: C.border,

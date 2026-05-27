@@ -77,7 +77,7 @@ class SessionManager {
    * - Subscribes to native events and buffers lines
    * - Falls back to a "mock" mode if native streaming isn't available (preview)
    */
-  async start(opts: { command: string; iface?: string; label?: string; id?: string }): Promise<string> {
+  async start(opts: { command: string; iface?: string; label?: string; id?: string; forceMock?: boolean }): Promise<string> {
     const id = opts.id || `s${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
     const state: SessionState = {
       id,
@@ -96,7 +96,9 @@ class SessionManager {
 
     // Lazy check — at *call time*, not module-import time. The RN bridge sometimes
     // hasn't built its method table yet when rootShell.ts is first evaluated.
-    const streamingAvailable = hasNativeStreaming();
+    // forceMock=true also routes us into the mock branch (when user globally
+    // chose MOCK exec mode in settings).
+    const streamingAvailable = !opts.forceMock && hasNativeStreaming();
     state.mocked = !streamingAvailable;
 
     // Register with backend (best-effort)
