@@ -81,7 +81,35 @@ export default function LiveTab(props: Props) {
   const [customCmd, setCustomCmd] = useState("");
   const [autoScroll, setAutoScroll] = useState(true);
   const [presetOpen, setPresetOpen] = useState(false);
+  const [probeResult, setProbeResult] = useState<string>("");
   const outRef = useRef<ScrollView>(null);
+
+  // Tap any method chip to call it — proves whether it's *truly* registered
+  // (typeof === 'function' is necessary but not sufficient if RN's proxy is
+  // misleading; actually calling reveals "no such method" errors)
+  const probeMethod = useCallback(async (name: string) => {
+    if (!RootShell) { setProbeResult("no native module"); return; }
+    const m = (RootShell as any)[name];
+    if (typeof m !== "function") {
+      setProbeResult(`${name}: NOT REGISTERED (typeof=${typeof m})`);
+      return;
+    }
+    try {
+      let result: any;
+      if (name === "isRoot") result = await m.call(RootShell);
+      else if (name === "exec") result = await m.call(RootShell, "id");
+      else if (name === "execBatch") result = await m.call(RootShell, ["id"]);
+      else if (name === "executeStream") result = await m.call(RootShell, `probe_${Date.now()}`, "id");
+      else if (name === "killSession") result = await m.call(RootShell, "nonexistent", true);
+      else if (name === "listSessions") result = await m.call(RootShell);
+      else if (name === "addListener") { m.call(RootShell, "RootShell.line"); result = "ok (no return)"; }
+      else if (name === "removeListeners") { m.call(RootShell, 1); result = "ok (no return)"; }
+      const txt = typeof result === "object" ? JSON.stringify(result).slice(0, 200) : String(result);
+      setProbeResult(`${name} OK → ${txt}`);
+    } catch (e: any) {
+      setProbeResult(`${name} THREW → ${e?.message || String(e)}`);
+    }
+  }, []);
 
   useEffect(() => sessionManager.subscribe(() => force((n) => n + 1)), []);
   const sessions = sessionManager.list();
@@ -145,20 +173,56 @@ export default function LiveTab(props: Props) {
       {/* Persistent bridge diagnostic — debugging "stuck in mock" symptoms */}
       <View style={s.bridgeBar}>
         {(() => {
+          const ALL_METHODS = [
+            "isRoot", "exec", "execBatch",
+            "executeStream", "killSession", "listSessions",
+            "addListener", "removeListeners",
+          ];
           const hasMod = !!RootShell;
           const keys = hasMod ? Object.keys(RootShell as any) : [];
-          const exec = hasMod ? typeof (RootShell as any).executeStream : "no-mod";
-          const kill = hasMod ? typeof (RootShell as any).killSession : "no-mod";
           const ok = hasNativeStreaming();
           const modeOk = props.execMode !== "mock";
+          const methodStatus = ALL_METHODS.map((m) => {
+            const t = hasMod ? typeof (RootShell as any)[m] : "no-mod";
+            return { name: m, type: t, ok: t === "function" };
+          });
           return (
-            <Text style={[s.bridgeText, { color: ok && modeOk ? C.greenDim : C.yellow }]}>
-              <Text style={{ color: C.textDim }}>bridge </Text>
-              root=<Text style={{ color: HAS_NATIVE_ROOT ? C.green : C.red }}>{HAS_NATIVE_ROOT ? "✓" : "✗"}</Text>{" · "}
-              stream=<Text style={{ color: ok ? C.green : C.red }}>{ok ? "✓" : "✗"}</Text>{" · "}
-              mode=<Text style={{ color: modeOk ? C.green : C.yellow }}>{props.execMode}</Text>{" · "}
-              keys={keys.length} · exec={String(exec)} · kill={String(kill)}
-            </Text>
+            <>
+              <Text style={[s.bridgeText, { color: ok && modeOk ? C.greenDim : C.yellow }]}>
+                <Text style={{ color: C.textDim }}>bridge </Text>
+                root=<Text style={{ color: HAS_NATIVE_ROOT ? C.green : C.red }}>{HAS_NATIVE_ROOT ? "✓" : "✗"}</Text>{" · "}
+                stream=<Text style={{ color: ok ? C.green : C.red }}>{ok ? "✓" : "✗"}</Text>{" · "}
+                mode=<Text style={{ color: modeOk ? C.green : C.yellow }}>{props.execMode}</Text>{" · "}
+                keys={keys.length}
+              </Text>
+              {/* Per-method status grid — tap any to call it directly */}
+              <View style={{ flexDirection: "row", flexWrap: "wrap", marginTop: 4 }}>
+                {methodStatus.map((m) => (
+                  <TouchableOpacity
+                    key={m.name}
+                    onPress={() => probeMethod(m.name)}
+                    style={{
+                      paddingHorizontal: 5, paddingVertical: 2, marginRight: 4, marginBottom: 3,
+                      borderRadius: 2, borderWidth: 1,
+                      borderColor: m.ok ? C.greenDim : C.red,
+                      backgroundColor: m.ok ? "#06140c" : "#1a0808",
+                    }}
+                  >
+                    <Text style={{
+                      fontFamily: MONO, fontSize: 8,
+                      color: m.ok ? C.green : C.red,
+                    }}>
+                      {m.name}={m.type}
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+              {probeResult && (
+                <Text style={[s.bridgeText, { marginTop: 3, color: C.cyan }]} selectable>
+                  → {probeResult}
+                </Text>
+              )}
+            </>
           );
         })()}
       </View>
