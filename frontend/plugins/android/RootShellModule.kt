@@ -67,9 +67,8 @@ class RootShellModule(private val reactContext: ReactApplicationContext) :
         }
     }
 
-    // RN's NativeEventEmitter complains if these don't exist. They're no-ops on Android.
-    @ReactMethod fun addListener(eventName: String) { /* required for RN built-in EventEmitter */ }
-    @ReactMethod fun removeListeners(count: Int) { /* required for RN built-in EventEmitter */ }
+    // RN's NativeEventEmitter stubs were here — moved to the END of the class
+    // as a defensive measure. See bottom of file.
 
     // ------------------------------------------------------------------
     // Legacy synchronous API
@@ -319,6 +318,19 @@ class RootShellModule(private val reactContext: ReactApplicationContext) :
         }
         promise.resolve(arr)
     }
+
+    // ------------------------------------------------------------------
+    // RN NativeEventEmitter stubs — declared LAST as a defensive measure.
+    // ------------------------------------------------------------------
+    // RN's bridge introspection used to abort scanning the rest of the class
+    // when it hit `removeListeners(count: Int)` (primitive) — RN expects
+    // `Integer count` (boxed). Symptom was `typeof RootShell.executeStream`
+    // === 'undefined' on the JS side while older methods registered fine.
+    // Now: kotlin `Int?` -> java.lang.Integer (boxed); and these stubs come
+    // AFTER all real methods, so even if RN still chokes here, nothing real
+    // is lost.
+    @ReactMethod fun addListener(eventName: String) { /* no-op; RN-reserved */ }
+    @ReactMethod fun removeListeners(count: Int?) { /* no-op; RN-reserved */ }
 
     companion object {
         private const val TAG = "RootShell"
