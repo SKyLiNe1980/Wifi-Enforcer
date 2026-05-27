@@ -198,7 +198,16 @@ export default function App() {
   // saved KALI/REAL preference at every cold start. Now we trust the saved
   // setting and let runtime calls fail loudly if the bridge is truly absent.
 
-  // Load persisted settings on mount, save on change
+  // Settings persistence — fixed write-before-read race:
+  // Previously the PUT useEffect would fire on mount with initial state ("mock"
+  // for execMode and defaultExecMode), and on a slow fetch it would land BEFORE
+  // the GET resolved — overwriting the user's saved preference in MongoDB.
+  // Symptom: user toggles to KALI, force-closes app, reopens → back to MOCK.
+  // Fix: gate the PUT on a `settingsLoaded` ref that flips true only after the
+  // initial GET resolves (success OR error — we don't want to block writes forever).
+  const settingsLoaded = useRef(false);
+
+  // Load persisted settings on mount
   useEffect(() => {
     fetch(`${API}/settings`)
       .then((r) => r.json())
@@ -220,10 +229,6 @@ export default function App() {
           const v = s.chroot_path.trim();
           setChrootPath(legacy.includes(v) ? NETHUNTER_CHROOT : v);
         }
-        // Restore the user's preferred startup exec mode unconditionally.
-        // If the bridge happens to be unavailable on this boot, the command
-        // execution itself will surface the error — we don't silently revert
-        // their preference to MOCK like the old race-prone code did.
         if (s.default_exec_mode === "real" || s.default_exec_mode === "kali" || s.default_exec_mode === "mock") {
           setDefaultExecMode(s.default_exec_mode);
         }
@@ -232,10 +237,18 @@ export default function App() {
           setExecMode(startupMode);
         }
       })
-      .catch(() => {});
+      .catch(() => {})
+      .finally(() => {
+        // Allow writes only after we know what's persisted. Without this, the
+        // PUT below would race-clobber saved settings with the initial in-memory
+        // state on every cold start.
+        settingsLoaded.current = true;
+      });
   }, []);
 
+  // Save on change — but only AFTER initial load completes
   useEffect(() => {
+    if (!settingsLoaded.current) return;
     const t = setTimeout(() => {
       fetch(`${API}/settings`, {
         method: "PUT",
