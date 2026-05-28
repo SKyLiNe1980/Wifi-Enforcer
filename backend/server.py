@@ -376,6 +376,11 @@ async def get_settings():
 
 @api_router.put("/settings", response_model=Settings)
 async def put_settings(s: Settings):
+    # TEMPORARY DEBUG: log every PUT so we can see what exec_mode the client is sending.
+    # This helps diagnose "mock sticking" symptoms — if we see "kali" come in but the
+    # stored doc keeps reading "mock", something is overwriting it; if we never see
+    # "kali" come in at all, the client-side debounce/race is the culprit.
+    logger.info("PUT /settings exec_mode=%s iface_a=%s active=%s", s.exec_mode, s.iface_a, s.active_iface)
     await db.settings.update_one({"_id": "app"}, {"$set": s.dict()}, upsert=True)
     return s
 
