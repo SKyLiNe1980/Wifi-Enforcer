@@ -355,8 +355,9 @@ async def seed():
 
 # ---------- Settings (key/value app preferences) ----------
 class Settings(BaseModel):
-    exec_mode: str = "mock"          # "mock" | "real" | "kali" — current session mode
-    default_exec_mode: str = "mock"  # "mock" | "real" | "kali" — mode to load on app startup
+    exec_mode: str = "mock"                       # "mock" | "real" | "kali" — current session mode
+    default_exec_mode: Optional[str] = None       # explicit user choice for startup mode;
+                                                   # None = never set → fall back to last exec_mode
     iface_a: str = "wlan2"
     iface_b: str = ""
     iface_c: str = ""
