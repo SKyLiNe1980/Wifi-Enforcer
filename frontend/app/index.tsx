@@ -625,6 +625,24 @@ export default function App() {
                   return;
                 }
                 setExecMode(m);
+                // Fire-and-forget direct PUT bypassing the debounced useEffect.
+                // The debounce/race kept losing mode changes on real devices, so
+                // we now write through immediately on every mode tap. This is the
+                // single source of truth for mode persistence — useEffect-based
+                // save still exists for OTHER settings (iface, country, etc.).
+                fetch(`${API}/settings`, {
+                  method: "PUT",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    exec_mode: m,
+                    iface_a: iface,
+                    iface_b: ifaceB,
+                    iface_c: ifaceC,
+                    country,
+                    active_iface: activeIface,
+                    chroot_path: chrootPath,
+                  }),
+                }).catch(() => {});
               }}
               style={[
                 s.segBtn,
