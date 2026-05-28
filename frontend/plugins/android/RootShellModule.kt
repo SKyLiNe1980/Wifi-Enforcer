@@ -277,38 +277,47 @@ class RootShellModule(private val reactContext: ReactApplicationContext) :
             promise.resolve(false)
             return
         }
-        try {
-            val pid = s.pid
-            if (graceful && pid != null) {
-                // Send SIGINT — most pentest tools (airodump-ng, tcpdump, wifite) catch this,
-                // flush their output files, and exit cleanly. Children spawned by the parent
-                // typically receive a cascade from the parent's SIGINT handler.
-                runCatching {
-                    Runtime.getRuntime().exec(arrayOf("su", "-c", "kill -INT $pid")).waitFor()
-                }
-                // Escalate after 2s if still alive
-                Thread({
+        // Resolve the promise IMMEDIATELY so the JS-side `await killStream()` doesn't
+        // block on the kill subprocess. Then do the actual kill work on a background
+        // thread, where waitFor() is allowed to block freely.
+        //
+        // Why this matters: `Runtime.exec("su -c kill ...").waitFor()` blocks the
+        // caller until the subprocess returns. RN dispatches @ReactMethod calls on
+        // its bridge thread; blocking there freezes the entire JS↔native pipe.
+        // Magisk/SuperSU permission prompts can take seconds → ANR → app crash
+        // (which is exactly what happened on the first airodump Stop tap; subsequent
+        // taps worked because Magisk had cached the permission).
+        promise.resolve(true)
+        Thread({
+            try {
+                val pid = s.pid
+                if (graceful && pid != null) {
+                    // SIGINT — pentest tools (airodump-ng, tcpdump, wifite, hcxdumptool)
+                    // catch this and flush their capture files cleanly before exit.
+                    runCatching {
+                        Runtime.getRuntime().exec(arrayOf("su", "-c", "kill -INT $pid")).waitFor()
+                    }
+                    // Escalate after 2s grace if process is still alive
                     try { Thread.sleep(2000) } catch (_: InterruptedException) { }
                     if (sessions.containsKey(sessionId) && !s.ended) {
+                        Log.w(TAG, "session $sessionId did not exit on SIGINT — escalating to SIGKILL")
                         runCatching {
                             Runtime.getRuntime().exec(arrayOf("su", "-c", "kill -KILL $pid")).waitFor()
                         }
                         runCatching { s.proc.destroy() }
                     }
-                }, "rootshell-escalate-$sessionId").start()
-            } else {
-                if (pid != null) {
-                    runCatching {
-                        Runtime.getRuntime().exec(arrayOf("su", "-c", "kill -KILL $pid")).waitFor()
+                } else {
+                    if (pid != null) {
+                        runCatching {
+                            Runtime.getRuntime().exec(arrayOf("su", "-c", "kill -KILL $pid")).waitFor()
+                        }
                     }
+                    runCatching { s.proc.destroy() }
                 }
-                runCatching { s.proc.destroy() }
+            } catch (e: Exception) {
+                Log.e(TAG, "killSession background work failed for $sessionId", e)
             }
-            promise.resolve(true)
-        } catch (e: Exception) {
-            Log.e(TAG, "killSession failed", e)
-            promise.reject("ROOT_KILL_ERR", e.message ?: "unknown", e)
-        }
+        }, "rootshell-kill-$sessionId").start()
     }
 
     @ReactMethod

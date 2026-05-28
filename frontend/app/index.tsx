@@ -135,7 +135,6 @@ export default function App() {
   const [newProfileName, setNewProfileName] = useState("");
   const [newProfileDesc, setNewProfileDesc] = useState("");
   const [execMode, setExecMode] = useState<ExecMode>("mock");
-  const [defaultExecMode, setDefaultExecMode] = useState<ExecMode>("mock");
   const [bridgeRoot, setBridgeRoot] = useState<boolean | null>(null);
   const [chrootPath, setChrootPath] = useState(NETHUNTER_CHROOT);
   const termRef = useRef<ScrollView>(null);
@@ -229,12 +228,14 @@ export default function App() {
           const v = s.chroot_path.trim();
           setChrootPath(legacy.includes(v) ? NETHUNTER_CHROOT : v);
         }
-        if (s.default_exec_mode === "real" || s.default_exec_mode === "kali" || s.default_exec_mode === "mock") {
-          setDefaultExecMode(s.default_exec_mode);
-        }
-        const startupMode = (s.default_exec_mode || s.exec_mode) as ExecMode | undefined;
-        if (startupMode === "real" || startupMode === "kali" || startupMode === "mock") {
-          setExecMode(startupMode);
+        // Restore the last exec_mode used. Simple persistence — whatever mode
+        // you were in when you closed the app is what you boot into.
+        // (Removed the prior `default_exec_mode` split — see git history. The
+        // dual concept was confusing AND had a default-default bug where backend's
+        // implicit "mock" default would silently clobber a user's actual saved
+        // exec_mode on every cold start.)
+        if (s.exec_mode === "real" || s.exec_mode === "kali" || s.exec_mode === "mock") {
+          setExecMode(s.exec_mode);
         }
       })
       .catch(() => {})
@@ -255,7 +256,6 @@ export default function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           exec_mode: execMode,
-          default_exec_mode: defaultExecMode,
           iface_a: iface,
           iface_b: ifaceB,
           iface_c: ifaceC,
@@ -266,7 +266,7 @@ export default function App() {
       }).catch(() => {});
     }, 500);
     return () => clearTimeout(t);
-  }, [execMode, defaultExecMode, iface, ifaceB, ifaceC, country, activeIface, chrootPath]);
+  }, [execMode, iface, ifaceB, ifaceC, country, activeIface, chrootPath]);
 
   useEffect(() => {
     if (tab !== "terminal") return;
@@ -656,38 +656,8 @@ export default function App() {
           REAL/KALI are only available in the built APK.
         </Text>
       )}
-
-      <Text style={[s.sectionTitle, { marginTop: 24 }]}>// default startup mode</Text>
-      <View style={s.segGroup}>
-        {(["mock", "real", "kali"] as ExecMode[]).map((m) => {
-          const active = defaultExecMode === m;
-          const color = m === "mock" ? C.yellow : m === "real" ? C.green : C.magenta;
-          return (
-            <TouchableOpacity
-              key={m}
-              testID={`btn-default-mode-${m}`}
-              onPress={() => setDefaultExecMode(m)}
-              style={[
-                s.segBtn,
-                active && { backgroundColor: color, borderColor: color },
-              ]}
-            >
-              <MaterialCommunityIcons
-                name={m === "mock" ? "shield-outline" : m === "real" ? "shield-check" : "linux"}
-                size={14}
-                color={active ? C.bg : color}
-              />
-              <Text style={[s.segBtnText, { color: active ? C.bg : color }]}>
-                {m === "mock" ? "MOCK" : m === "real" ? "REAL" : "KALI"}
-              </Text>
-            </TouchableOpacity>
-          );
-        })}
-      </View>
-      <Text style={s.helper}>
-        mode the app loads on cold start. defaults to MOCK so first launch is safe;
-        set to {defaultExecMode === "kali" ? "KALI" : defaultExecMode === "real" ? "REAL" : "MOCK"} to
-        skip the manual toggle every time.
+      <Text style={[s.helper, { marginTop: 4, color: C.cyan }]}>
+        ℹ this selection persists across app restarts.
       </Text>
 
       {execMode === "kali" && (
