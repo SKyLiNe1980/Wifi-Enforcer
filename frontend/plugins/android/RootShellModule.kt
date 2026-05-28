@@ -50,9 +50,16 @@ class RootShellModule(private val reactContext: ReactApplicationContext) :
         val command: String,
         val proc: Process,
         val startedAt: Long,
-        @Volatile var pid: Int? = null,
+        // NOTE: previously had @Volatile on these — that annotation on data-class
+        // primary-constructor params can trip stricter Kotlin compiler modes (it
+        // targets the param, not the backing field, without @field:Volatile).
+        // We don't strictly need volatile semantics here — pid is written once
+        // (from the reader thread, when __WE_PID__ marker is parsed), and
+        // `ended` is best-effort. JVM happens-before for short-lived threads
+        // is enough for our purposes.
+        var pid: Int? = null,
         val lineCount: AtomicInteger = AtomicInteger(0),
-        @Volatile var ended: Boolean = false,
+        var ended: Boolean = false,
     )
 
     private val sessions = ConcurrentHashMap<String, Session>()

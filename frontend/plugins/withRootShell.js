@@ -71,19 +71,35 @@ function withRootShellSources(config) {
       );
       fs.mkdirSync(targetDir, { recursive: true });
       const srcDir = path.join(__dirname, "android");
+      console.log(`[withRootShell] ============================================`);
       console.log(`[withRootShell] copying sources from ${srcDir} → ${targetDir}`);
+      console.log(`[withRootShell] BUILD MARKER: ROOTSHELL-STREAMING-V2`);
       let copied = 0;
       for (const f of KOTLIN_FILES) {
         const src = path.join(srcDir, f);
         const dst = path.join(targetDir, f);
         if (fs.existsSync(src)) {
+          const stat = fs.statSync(src);
           fs.copyFileSync(src, dst);
-          console.log(`[withRootShell] ✓ copied ${f}`);
+          // Also log content fingerprint so we can verify in EAS logs that the
+          // file actually has the streaming methods. Search for these markers
+          // in the build log to confirm the correct .kt was uploaded:
+          //   "has-executeStream: true"   <-- new methods present
+          //   "has-executeStream: false"  <-- OLD .kt was uploaded (bug)
+          const content = fs.readFileSync(src, "utf8");
+          const hasExec = content.includes("fun executeStream(");
+          const hasKill = content.includes("fun killSession(");
+          const hasList = content.includes("fun listSessions(");
+          console.log(`[withRootShell] ✓ copied ${f} (${stat.size} bytes)`);
+          console.log(`[withRootShell]   has-executeStream: ${hasExec}`);
+          console.log(`[withRootShell]   has-killSession:   ${hasKill}`);
+          console.log(`[withRootShell]   has-listSessions:  ${hasList}`);
           copied++;
         } else {
           console.warn(`[withRootShell] ✗ MISSING ${src}`);
         }
       }
+      console.log(`[withRootShell] ============================================`);
       if (copied !== KOTLIN_FILES.length) {
         throw new Error(
           `[withRootShell] FATAL: only copied ${copied}/${KOTLIN_FILES.length} Kotlin files. ` +
