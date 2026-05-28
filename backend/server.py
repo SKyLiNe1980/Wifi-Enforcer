@@ -355,9 +355,7 @@ async def seed():
 
 # ---------- Settings (key/value app preferences) ----------
 class Settings(BaseModel):
-    exec_mode: str = "mock"                       # "mock" | "real" | "kali" — current session mode
-    default_exec_mode: Optional[str] = None       # explicit user choice for startup mode;
-                                                   # None = never set → fall back to last exec_mode
+    exec_mode: str = "mock"                       # "mock" | "real" | "kali" — persisted across restarts
     iface_a: str = "wlan2"
     iface_b: str = ""
     iface_c: str = ""
@@ -381,7 +379,14 @@ async def put_settings(s: Settings):
     # stored doc keeps reading "mock", something is overwriting it; if we never see
     # "kali" come in at all, the client-side debounce/race is the culprit.
     logger.info("PUT /settings exec_mode=%s iface_a=%s active=%s", s.exec_mode, s.iface_a, s.active_iface)
-    await db.settings.update_one({"_id": "app"}, {"$set": s.dict()}, upsert=True)
+    # Also $unset any legacy default_exec_mode key that may still be lingering
+    # in the stored doc from a prior schema. Without this, a future migration
+    # back to a stricter model would choke on it.
+    await db.settings.update_one(
+        {"_id": "app"},
+        {"$set": s.dict(), "$unset": {"default_exec_mode": ""}},
+        upsert=True,
+    )
     return s
 
 
