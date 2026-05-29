@@ -220,6 +220,12 @@ export default function App() {
     fetch(`${API}/settings`)
       .then((r) => r.json())
       .then((s) => {
+        // TEMPORARY DEBUG (remove after issue confirmed fixed): trace what
+        // GET /settings returned and what mode we're about to apply, so a
+        // LogFox capture can tell us whether the backend value is what
+        // we expect AND whether setExecMode actually runs.
+        // eslint-disable-next-line no-console
+        console.log(`[settings] GET /settings → exec_mode=${s?.exec_mode} iface_a=${s?.iface_a} country=${s?.country}`);
         if (s.iface_a) setIface(s.iface_a);
         if (s.iface_b !== undefined) setIfaceB(s.iface_b);
         if (s.iface_c !== undefined) setIfaceC(s.iface_c);
@@ -244,7 +250,12 @@ export default function App() {
         // implicit "mock" default would silently clobber a user's actual saved
         // exec_mode on every cold start.)
         if (s.exec_mode === "real" || s.exec_mode === "kali" || s.exec_mode === "mock") {
+          // eslint-disable-next-line no-console
+          console.log(`[settings] applying exec_mode=${s.exec_mode}`);
           setExecMode(s.exec_mode);
+        } else {
+          // eslint-disable-next-line no-console
+          console.log(`[settings] exec_mode rejected (value="${s.exec_mode}", type=${typeof s.exec_mode}) — staying on initial mock`);
         }
       })
       .catch(() => {})

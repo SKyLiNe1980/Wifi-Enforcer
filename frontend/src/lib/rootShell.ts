@@ -18,6 +18,7 @@ import { NativeModules, NativeEventEmitter, Platform } from "react-native";
  */
 
 type LineEvent = { sessionId: string; stream: "stdout" | "stderr"; line: string; lineNo: number };
+type LinesEvent = { sessionId: string; stream: "stdout" | "stderr"; lines: string[]; count: number; toLineNo: number };
 type ExitEvent = { sessionId: string; exit_code: number; duration_ms: number; line_count: number };
 type ErrorEvent = { sessionId: string; message: string };
 type PidEvent = { sessionId: string; pid: number };
@@ -100,6 +101,7 @@ export async function execReal(cmd: string) {
 
 export type StreamCallbacks = {
   onLine?: (e: LineEvent) => void;
+  onLines?: (e: LinesEvent) => void;
   onExit?: (e: ExitEvent) => void;
   onError?: (e: ErrorEvent) => void;
   onPid?: (e: PidEvent) => void;
@@ -122,6 +124,7 @@ export function startStream(
   }
   const subs = [
     emitter.addListener("RootShell.line", (e: LineEvent) => { if (e.sessionId === sessionId) cb.onLine?.(e); }),
+    emitter.addListener("RootShell.lines", (e: LinesEvent) => { if (e.sessionId === sessionId) cb.onLines?.(e); }),
     emitter.addListener("RootShell.exit", (e: ExitEvent) => { if (e.sessionId === sessionId) cb.onExit?.(e); }),
     emitter.addListener("RootShell.error", (e: ErrorEvent) => { if (e.sessionId === sessionId) cb.onError?.(e); }),
     emitter.addListener("RootShell.pid", (e: PidEvent) => { if (e.sessionId === sessionId) cb.onPid?.(e); }),

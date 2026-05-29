@@ -13,6 +13,9 @@ import java.io.DataOutputStream
 import java.io.InputStream
 import java.io.InputStreamReader
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
@@ -60,9 +63,85 @@ class RootShellModule(private val reactContext: ReactApplicationContext) :
         var pid: Int? = null,
         val lineCount: AtomicInteger = AtomicInteger(0),
         var ended: Boolean = false,
+        // ----------------------------------------------------------------
+        // BATCHING BUFFERS — accumulate lines on the reader threads and
+        // flush as a single RootShell.lines event every ~80ms (or eagerly
+        // at 250-line high-watermark). Without this, `dmesg -k` (and any
+        // tool that bursts thousands of lines/sec) drives the RN bridge
+        // serializer at 100% CPU on the JS thread → ANR → app killed.
+        // See crash log 2026-05-29 23:21:34: 184% CPU, 200k page faults.
+        // ----------------------------------------------------------------
+        val stdoutBuf: ArrayList<String> = ArrayList(256),
+        val stderrBuf: ArrayList<String> = ArrayList(64),
     )
 
     private val sessions = ConcurrentHashMap<String, Session>()
+
+    // ------------------------------------------------------------------
+    // Output-batching scheduler
+    // ------------------------------------------------------------------
+    // A single daemon thread drains every session's buffered lines every
+    // FLUSH_INTERVAL_MS into a single RootShell.lines event per stream.
+    // The reader threads (one per fd) push into per-session ArrayLists
+    // under that buffer's intrinsic lock; the flusher swaps the list out
+    // and emits in one bridge call. Reader threads ALSO eager-flush at
+    // FLUSH_HIGH_WATERMARK lines to bound peak memory on dmesg-style
+    // bursts (~30k lines instantly).
+    private val flusher: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor { r ->
+        Thread(r, "rootshell-flusher").apply { isDaemon = true }
+    }
+
+    init {
+        flusher.scheduleAtFixedRate(
+            {
+                try { flushAllSessions() } catch (e: Exception) { Log.w(TAG, "scheduled flush failed", e) }
+            },
+            FLUSH_INTERVAL_MS, FLUSH_INTERVAL_MS, TimeUnit.MILLISECONDS,
+        )
+    }
+
+    private fun flushAllSessions() {
+        // Snapshot of session refs — values() iterator is weakly consistent on
+        // ConcurrentHashMap which is fine; missing a brand-new session for one
+        // tick is acceptable, it will catch up next tick.
+        for (s in sessions.values) flushSession(s)
+    }
+
+    private fun flushSession(s: Session) {
+        val outBatch: ArrayList<String>? = synchronized(s.stdoutBuf) {
+            if (s.stdoutBuf.isEmpty()) null
+            else {
+                val copy = ArrayList(s.stdoutBuf)
+                s.stdoutBuf.clear()
+                copy
+            }
+        }
+        val errBatch: ArrayList<String>? = synchronized(s.stderrBuf) {
+            if (s.stderrBuf.isEmpty()) null
+            else {
+                val copy = ArrayList(s.stderrBuf)
+                s.stderrBuf.clear()
+                copy
+            }
+        }
+        if (outBatch != null) emitLineBatch(s, "stdout", outBatch)
+        if (errBatch != null) emitLineBatch(s, "stderr", errBatch)
+    }
+
+    private fun emitLineBatch(s: Session, label: String, lines: List<String>) {
+        val m = Arguments.createMap()
+        m.putString("sessionId", s.id)
+        m.putString("stream", label)
+        val arr = Arguments.createArray()
+        for (l in lines) arr.pushString(l)
+        m.putArray("lines", arr)
+        m.putInt("count", lines.size)
+        // The cumulative line counter at the END of this batch — JS can use
+        // (toLineNo - count + 1)..toLineNo to reconstruct individual line_no
+        // values if it needs them. Cheaper than putting an Int per line.
+        m.putInt("toLineNo", s.lineCount.get())
+        emit(EVT_LINES, m)
+    }
 
     private fun emit(event: String, params: WritableMap) {
         try {
@@ -217,6 +296,9 @@ class RootShellModule(private val reactContext: ReactApplicationContext) :
                     val code = proc.waitFor()
                     val dur = (System.currentTimeMillis() - session.startedAt).toInt()
                     session.ended = true
+                    // Flush any trailing buffered lines BEFORE the exit event so
+                    // JS sees all output before it sees "ended" status.
+                    flushSession(session)
                     val m = Arguments.createMap()
                     m.putString("sessionId", sessionId)
                     m.putInt("exit_code", code)
@@ -245,8 +327,10 @@ class RootShellModule(private val reactContext: ReactApplicationContext) :
         try {
             val reader = BufferedReader(InputStreamReader(stream))
             var line = reader.readLine()
+            val buf = if (label == "stdout") session.stdoutBuf else session.stderrBuf
             while (line != null) {
-                // Intercept the PID marker on stdout
+                // Intercept the PID marker on stdout — always single-emit so JS
+                // sees it ASAP and can store the PID for killSession().
                 if (label == "stdout" && session.pid == null && line.startsWith("__WE_PID__")) {
                     session.pid = line.removePrefix("__WE_PID__").trim().toIntOrNull()
                     val m = Arguments.createMap()
@@ -254,13 +338,22 @@ class RootShellModule(private val reactContext: ReactApplicationContext) :
                     m.putInt("pid", session.pid ?: -1)
                     emit(EVT_PID, m)
                 } else {
-                    val n = session.lineCount.incrementAndGet()
-                    val m = Arguments.createMap()
-                    m.putString("sessionId", session.id)
-                    m.putString("stream", label)
-                    m.putString("line", line)
-                    m.putInt("lineNo", n)
-                    emit(EVT_LINE, m)
+                    session.lineCount.incrementAndGet()
+                    var eagerFlush = false
+                    synchronized(buf) {
+                        buf.add(line)
+                        if (buf.size >= FLUSH_HIGH_WATERMARK) eagerFlush = true
+                    }
+                    if (eagerFlush) {
+                        // Drain THIS stream only — don't drag the other one's
+                        // batch boundary along; they're independent fds.
+                        val drained: ArrayList<String> = synchronized(buf) {
+                            val copy = ArrayList(buf)
+                            buf.clear()
+                            copy
+                        }
+                        if (drained.isNotEmpty()) emitLineBatch(session, label, drained)
+                    }
                 }
                 line = reader.readLine()
             }
@@ -350,9 +443,17 @@ class RootShellModule(private val reactContext: ReactApplicationContext) :
 
     companion object {
         private const val TAG = "RootShell"
-        const val EVT_LINE = "RootShell.line"
+        const val EVT_LINE = "RootShell.line"          // legacy single-line — no longer emitted by readStreamLines; kept for back-compat
+        const val EVT_LINES = "RootShell.lines"        // batched lines event — preferred
         const val EVT_EXIT = "RootShell.exit"
         const val EVT_ERROR = "RootShell.error"
         const val EVT_PID = "RootShell.pid"
+        // Tuning knobs for the output batcher. Drains every 80ms, OR eagerly when a
+        // single stream's buffer hits 250 lines (whichever comes first). 250 lines
+        // is roughly one screen of dense terminal output; 80ms is 12 Hz which is
+        // below the 16ms-per-frame budget so we never block the JS thread for a
+        // visible-stutter duration.
+        const val FLUSH_INTERVAL_MS = 80L
+        const val FLUSH_HIGH_WATERMARK = 250
     }
 }
