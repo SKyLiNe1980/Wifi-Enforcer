@@ -198,6 +198,24 @@ def _mock_output(cmd: str) -> tuple[str, int]:
     return (f"[mock] queued: would exec `{c}` via su (no real exec in preview)", 0)
 
 
+LOG_MAX = 200  # cap historical log entries to avoid flooding the terminal scrollback on every launch
+
+
+async def _prune_logs():
+    """Trim db.command_logs to the most recent LOG_MAX entries.
+    Idempotent — safe to call after every insert. Uses a single bulk delete keyed on
+    a sentinel cutoff timestamp so it stays O(1) writes regardless of overflow size."""
+    count = await db.command_logs.count_documents({})
+    if count <= LOG_MAX:
+        return
+    # Find the timestamp of the LOG_MAX-th newest entry; delete anything older.
+    cursor = db.command_logs.find({}, {"timestamp": 1, "_id": 0}).sort("timestamp", -1).skip(LOG_MAX).limit(1)
+    cutoff_doc = await cursor.to_list(1)
+    if cutoff_doc:
+        cutoff = cutoff_doc[0]["timestamp"]
+        await db.command_logs.delete_many({"timestamp": {"$lte": cutoff}})
+
+
 async def execute_mock(command: str) -> CommandLog:
     started = datetime.now(timezone.utc)
     # simulate latency
@@ -206,6 +224,7 @@ async def execute_mock(command: str) -> CommandLog:
     dur = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
     log = CommandLog(command=command, output=out, exit_code=code, duration_ms=dur, mocked=True)
     await db.command_logs.insert_one(log.dict())
+    await _prune_logs()
     return log
 
 
