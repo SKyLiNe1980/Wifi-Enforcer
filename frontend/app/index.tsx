@@ -620,11 +620,41 @@ export default function App() {
                   Alert.alert("Bridge not present", "Build the APK first. See /app/root-bridge/README.md.");
                   return;
                 }
-                if (m !== "mock" && !bridgeRoot) {
+                // Only block if root has been EXPLICITLY checked and denied.
+                // `bridgeRoot === null` means the async checkRoot() probe hasn't
+                // resolved yet — historically we bailed here, which silently
+                // dropped KALI taps during the first ~hundred ms of cold boot
+                // and was the root cause of "MOCK keeps sticking on reopen".
+                // Now we proceed optimistically; if root is truly absent, the
+                // actual command exec will fail loudly with a useful error.
+                if (m !== "mock" && bridgeRoot === false) {
                   Alert.alert("Root not granted", "Open Magisk and grant root for WiFi Enforcer, then try again.");
                   return;
                 }
+                // If still probing, kick off a background re-check so the UI
+                // catches up to reality without blocking this tap.
+                if (m !== "mock" && bridgeRoot === null && HAS_NATIVE_ROOT) {
+                  checkRoot().then(setBridgeRoot).catch(() => setBridgeRoot(false));
+                }
                 setExecMode(m);
+                // Fire-and-forget direct PUT bypassing the debounced useEffect.
+                // The debounce/race kept losing mode changes on real devices, so
+                // we now write through immediately on every mode tap. This is the
+                // single source of truth for mode persistence — useEffect-based
+                // save still exists for OTHER settings (iface, country, etc.).
+                fetch(`${API}/settings`, {
+                  method: "PUT",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    exec_mode: m,
+                    iface_a: iface,
+                    iface_b: ifaceB,
+                    iface_c: ifaceC,
+                    country,
+                    active_iface: activeIface,
+                    chroot_path: chrootPath,
+                  }),
+                }).catch(() => {});
               }}
               style={[
                 s.segBtn,

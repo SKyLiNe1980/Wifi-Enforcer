@@ -1,8 +1,8 @@
 {
   "expo": {
-    "name": "WiFi Enforcer",
+    "name": "Enforcer",
     "slug": "wifi-enforcer",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
     "scheme": "wifienforcer",
@@ -43,7 +43,8 @@
         }
       ],
       "./plugins/withRootShell",
-      "expo-web-browser"
+      "expo-web-browser",
+      "expo-font"
     ],
     "experiments": {
       "typedRoutes": true
