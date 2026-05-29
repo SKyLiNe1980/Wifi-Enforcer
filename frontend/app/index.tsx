@@ -173,7 +173,9 @@ export default function App() {
         fetch(`${API}/profiles`).then((r) => r.json()),
       ]);
       setRootInfo(h);
-      setLogs((lg as Log[]).slice().reverse());
+      const reversed = (lg as Log[]).slice().reverse();
+      historicalCountRef.current = reversed.length;
+      setLogs(reversed);
       setProfiles(pf as Profile[]);
     } catch (e) {
       console.warn("fetchAll error", e);
@@ -206,6 +208,12 @@ export default function App() {
   // Fix: gate the PUT on a `settingsLoaded` ref that flips true only after the
   // initial GET resolves (success OR error — we don't want to block writes forever).
   const settingsLoaded = useRef(false);
+  // Tracks how many log entries were already historical at the moment the app
+  // last fetched from the backend. Anything in the `logs` array at an index
+  // below this value is "from a previous session" and gets visually dimmed +
+  // sits above a divider. New entries (appended during this session) render
+  // at full brightness below the divider.
+  const historicalCountRef = useRef<number>(0);
 
   // Load persisted settings on mount
   useEffect(() => {
@@ -354,6 +362,7 @@ export default function App() {
 
   const clearLogs = useCallback(async () => {
     await fetch(`${API}/logs`, { method: "DELETE" });
+    historicalCountRef.current = 0;
     setLogs([]);
   }, []);
 
@@ -502,24 +511,39 @@ export default function App() {
         <Text style={s.bannerSub}>
           {`# session: ${rootInfo?.device || "..."} · ${rootInfo?.android_version || "..."}\n# entries: ${logs.length} · status: ${running ? "BUSY" : "idle"}\n`}
         </Text>
-        {logs.map((l) => (
-          <View key={l.id} style={{ marginBottom: 10 }}>
-            <View style={{ flexDirection: "row", flexWrap: "wrap" }}>
-              <Text style={{ color: C.prompt, fontFamily: MONO, fontSize: 12 }}>root@android</Text>
-              <Text style={{ color: C.textDim, fontFamily: MONO, fontSize: 12 }}>:/ # </Text>
-              <HighlightedCmd cmd={l.command} />
-            </View>
-            {!!l.output && (
-              <Text style={[s.termOut, l.exit_code !== 0 && { color: C.red }]} selectable>
-                {l.output}
-              </Text>
-            )}
-            <Text style={s.termMeta}>
-              <Text style={{ color: l.exit_code === 0 ? C.greenDim : C.red }}>exit={l.exit_code}</Text>
-              <Text style={{ color: C.textDim }}> · {l.duration_ms}ms · {l.mocked ? "mock" : "real"}</Text>
-            </Text>
-          </View>
-        ))}
+        {logs.map((l, idx) => {
+          const isHistorical = idx < historicalCountRef.current;
+          const isFirstCurrent = idx === historicalCountRef.current && historicalCountRef.current > 0;
+          return (
+            <React.Fragment key={l.id}>
+              {isFirstCurrent && (
+                <View style={{ flexDirection: "row", alignItems: "center", marginVertical: 8 }}>
+                  <View style={{ flex: 1, height: 1, backgroundColor: C.textDim, opacity: 0.4 }} />
+                  <Text style={{ color: C.cyan, fontFamily: MONO, fontSize: 10, marginHorizontal: 8, letterSpacing: 1 }}>
+                    ── CURRENT SESSION ──
+                  </Text>
+                  <View style={{ flex: 1, height: 1, backgroundColor: C.textDim, opacity: 0.4 }} />
+                </View>
+              )}
+              <View style={{ marginBottom: 10, opacity: isHistorical ? 0.45 : 1 }}>
+                <View style={{ flexDirection: "row", flexWrap: "wrap" }}>
+                  <Text style={{ color: C.prompt, fontFamily: MONO, fontSize: 12 }}>root@android</Text>
+                  <Text style={{ color: C.textDim, fontFamily: MONO, fontSize: 12 }}>:/ # </Text>
+                  <HighlightedCmd cmd={l.command} />
+                </View>
+                {!!l.output && (
+                  <Text style={[s.termOut, l.exit_code !== 0 && { color: C.red }]} selectable>
+                    {l.output}
+                  </Text>
+                )}
+                <Text style={s.termMeta}>
+                  <Text style={{ color: l.exit_code === 0 ? C.greenDim : C.red }}>exit={l.exit_code}</Text>
+                  <Text style={{ color: C.textDim }}> · {l.duration_ms}ms · {l.mocked ? "mock" : "real"}</Text>
+                </Text>
+              </View>
+            </React.Fragment>
+          );
+        })}
         {logs.length === 0 && (
           <Text style={{ color: C.textDim, fontFamily: MONO, fontSize: 12 }}>
             (no commands yet — go to Quick or type below)
