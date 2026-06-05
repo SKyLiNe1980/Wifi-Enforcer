@@ -18,6 +18,7 @@ import { NativeModules, NativeEventEmitter, Platform } from "react-native";
  */
 
 type LineEvent = { sessionId: string; stream: "stdout" | "stderr"; line: string; lineNo: number };
+type LinesEvent = { sessionId: string; stream: "stdout" | "stderr"; lines: string[]; count: number; toLineNo: number };
 type ExitEvent = { sessionId: string; exit_code: number; duration_ms: number; line_count: number };
 type ErrorEvent = { sessionId: string; message: string };
 type PidEvent = { sessionId: string; pid: number };
@@ -35,6 +36,7 @@ type RNModule = {
   // Streaming
   executeStream(sessionId: string, command: string): Promise<string>;
   killSession(sessionId: string, graceful: boolean): Promise<boolean>;
+  writeStdin(sessionId: string, text: string, appendNewline: boolean): Promise<number>;
   listSessions(): Promise<Array<{
     sessionId: string; command: string; pid: number; started_at: number; line_count: number;
   }>>;
@@ -100,6 +102,7 @@ export async function execReal(cmd: string) {
 
 export type StreamCallbacks = {
   onLine?: (e: LineEvent) => void;
+  onLines?: (e: LinesEvent) => void;
   onExit?: (e: ExitEvent) => void;
   onError?: (e: ErrorEvent) => void;
   onPid?: (e: PidEvent) => void;
@@ -122,6 +125,7 @@ export function startStream(
   }
   const subs = [
     emitter.addListener("RootShell.line", (e: LineEvent) => { if (e.sessionId === sessionId) cb.onLine?.(e); }),
+    emitter.addListener("RootShell.lines", (e: LinesEvent) => { if (e.sessionId === sessionId) cb.onLines?.(e); }),
     emitter.addListener("RootShell.exit", (e: ExitEvent) => { if (e.sessionId === sessionId) cb.onExit?.(e); }),
     emitter.addListener("RootShell.error", (e: ErrorEvent) => { if (e.sessionId === sessionId) cb.onError?.(e); }),
     emitter.addListener("RootShell.pid", (e: PidEvent) => { if (e.sessionId === sessionId) cb.onPid?.(e); }),
@@ -144,6 +148,16 @@ export function startStream(
 export async function killStream(sessionId: string, graceful: boolean): Promise<boolean> {
   if (!RootShell) return false;
   try { return await RootShell.killSession(sessionId, graceful); } catch { return false; }
+}
+
+/**
+ * Send text to a running session's stdin. Used by the AI tab to deliver
+ * chat input to interactive CLI agents (hermes, CAI, …). Returns the
+ * number of bytes written, or 0 if the bridge is unavailable / call fails.
+ */
+export async function writeStdin(sessionId: string, text: string, appendNewline: boolean = true): Promise<number> {
+  if (!RootShell || typeof (RootShell as any).writeStdin !== "function") return 0;
+  try { return await RootShell.writeStdin(sessionId, text, appendNewline); } catch { return 0; }
 }
 
 export async function listStreams() {

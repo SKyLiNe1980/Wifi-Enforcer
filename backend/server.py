@@ -370,6 +370,8 @@ async def seed():
             inserted += 1
     if inserted:
         logger.info("Seeded %d new default profiles", inserted)
+    # AI launcher profiles — Hermes + the rest of the agent zoo
+    await _seed_ai_profiles_if_empty()
 
 
 # ---------- Settings (key/value app preferences) ----------
@@ -559,6 +561,200 @@ async def sessions_history(limit: int = 50):
         {}, {"_id": 0}
     ).sort("ended_at", -1).to_list(min(max(limit, 1), 500))
     return docs
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  AI tab — agent launcher profiles + conversation log
+# ──────────────────────────────────────────────────────────────────────────────
+# Separate from regular wifi command profiles because the semantics are
+# different: AI profiles wrap interactive CLI agents (hermes, CAI-Framework,
+# HEAVEN, Pentagi, …) with optional pty wrapping, optional system-prompt seed
+# line, and a distinct conversation log so chat history doesn't pollute the
+# wifi command terminal scrollback.
+
+WRAP_MODES = {"none", "pty", "unbuffered"}
+
+
+class AIProfile(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    name: str
+    command: str                   # the launcher, e.g. "hermes"
+    description: str = ""
+    wrap_mode: str = "none"        # "none" | "pty" | "unbuffered"
+    send_newline: bool = True      # append \n to each stdin send
+    send_initial: Optional[str] = None  # optional first line auto-sent after launch
+    icon: str = "🤖"
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class AIProfileCreate(BaseModel):
+    name: str
+    command: str
+    description: str = ""
+    wrap_mode: str = "none"
+    send_newline: bool = True
+    send_initial: Optional[str] = None
+    icon: str = "🤖"
+
+
+class AIProfileUpdate(BaseModel):
+    name: Optional[str] = None
+    command: Optional[str] = None
+    description: Optional[str] = None
+    wrap_mode: Optional[str] = None
+    send_newline: Optional[bool] = None
+    send_initial: Optional[str] = None
+    icon: Optional[str] = None
+
+
+class AILogEntry(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    profile_id: Optional[str] = None
+    profile_name: str = ""
+    session_id: Optional[str] = None
+    kind: str = "user"             # "user" | "system" | "agent"
+    content: str = ""
+    timestamp: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class AILogCreate(BaseModel):
+    profile_id: Optional[str] = None
+    profile_name: str = ""
+    session_id: Optional[str] = None
+    kind: str = "user"
+    content: str = ""
+
+
+AI_LOG_MAX = 500
+
+
+async def _prune_ai_logs():
+    count = await db.ai_logs.count_documents({})
+    if count <= AI_LOG_MAX:
+        return
+    cursor = db.ai_logs.find({}, {"timestamp": 1, "_id": 0}).sort("timestamp", -1).skip(AI_LOG_MAX).limit(1)
+    cutoff_doc = await cursor.to_list(1)
+    if cutoff_doc:
+        cutoff = cutoff_doc[0]["timestamp"]
+        await db.ai_logs.delete_many({"timestamp": {"$lte": cutoff}})
+
+
+@api_router.get("/ai-profiles", response_model=List[AIProfile])
+async def get_ai_profiles():
+    docs = await db.ai_profiles.find({}, {"_id": 0}).sort("created_at", 1).to_list(500)
+    return [AIProfile(**d) for d in docs]
+
+
+@api_router.post("/ai-profiles", response_model=AIProfile)
+async def create_ai_profile(p: AIProfileCreate):
+    if p.wrap_mode not in WRAP_MODES:
+        raise HTTPException(status_code=400, detail=f"wrap_mode must be one of {sorted(WRAP_MODES)}")
+    if not p.name.strip() or not p.command.strip():
+        raise HTTPException(status_code=400, detail="name and command are required")
+    prof = AIProfile(**p.dict())
+    await db.ai_profiles.insert_one(prof.dict())
+    return prof
+
+
+@api_router.put("/ai-profiles/{profile_id}", response_model=AIProfile)
+async def update_ai_profile(profile_id: str, p: AIProfileUpdate):
+    existing = await db.ai_profiles.find_one({"id": profile_id}, {"_id": 0})
+    if not existing:
+        raise HTTPException(status_code=404, detail="profile not found")
+    patch = {k: v for k, v in p.dict().items() if v is not None}
+    if "wrap_mode" in patch and patch["wrap_mode"] not in WRAP_MODES:
+        raise HTTPException(status_code=400, detail=f"wrap_mode must be one of {sorted(WRAP_MODES)}")
+    if patch:
+        await db.ai_profiles.update_one({"id": profile_id}, {"$set": patch})
+    merged = {**existing, **patch}
+    return AIProfile(**merged)
+
+
+@api_router.delete("/ai-profiles/{profile_id}")
+async def delete_ai_profile(profile_id: str):
+    res = await db.ai_profiles.delete_one({"id": profile_id})
+    return {"deleted": res.deleted_count == 1}
+
+
+@api_router.get("/ai-logs", response_model=List[AILogEntry])
+async def get_ai_logs(limit: int = 200, session_id: Optional[str] = None, profile_id: Optional[str] = None):
+    q: dict = {}
+    if session_id:
+        q["session_id"] = session_id
+    if profile_id:
+        q["profile_id"] = profile_id
+    docs = await db.ai_logs.find(q, {"_id": 0}).sort("timestamp", -1).to_list(min(max(limit, 1), 1000))
+    docs.reverse()  # oldest-first for UI
+    return [AILogEntry(**d) for d in docs]
+
+
+@api_router.post("/ai-logs", response_model=AILogEntry)
+async def create_ai_log(e: AILogCreate):
+    entry = AILogEntry(**e.dict())
+    await db.ai_logs.insert_one(entry.dict())
+    await _prune_ai_logs()
+    return entry
+
+
+@api_router.delete("/ai-logs")
+async def clear_ai_logs(session_id: Optional[str] = None, profile_id: Optional[str] = None):
+    q: dict = {}
+    if session_id:
+        q["session_id"] = session_id
+    if profile_id:
+        q["profile_id"] = profile_id
+    res = await db.ai_logs.delete_many(q)
+    return {"deleted": res.deleted_count}
+
+
+async def _seed_ai_profiles_if_empty():
+    """One-shot seed of canonical AI profiles. Only runs if collection is empty
+    so it never overwrites the user's tweaks."""
+    count = await db.ai_profiles.count_documents({})
+    if count > 0:
+        return
+    seeds = [
+        AIProfile(
+            name="Hermes",
+            command="hermes",
+            description="Nous Hermes agent (DeepSeek V4 Pro). Just type `hermes` in a Kali term.",
+            wrap_mode="none",
+            send_newline=True,
+            send_initial=None,
+            icon="🜲",
+        ),
+        AIProfile(
+            name="CAI Framework",
+            command="cai",
+            description="CAI-Framework — Cybersecurity AI orchestrator.",
+            wrap_mode="none",
+            icon="🛡️",
+        ),
+        AIProfile(
+            name="HEAVEN",
+            command="heaven",
+            description="HEAVEN Pentest Framework.",
+            wrap_mode="none",
+            icon="⛧",
+        ),
+        AIProfile(
+            name="Pentagi",
+            command="pentagi",
+            description="Pentagi agent.",
+            wrap_mode="none",
+            icon="🜂",
+        ),
+        AIProfile(
+            name="PentestAgent",
+            command="pentestagent",
+            description="PentestAgent.",
+            wrap_mode="none",
+            icon="🜃",
+        ),
+    ]
+    for p in seeds:
+        await db.ai_profiles.insert_one(p.dict())
+    logger.info("seeded %d AI profiles", len(seeds))
 
 
 app.include_router(api_router)

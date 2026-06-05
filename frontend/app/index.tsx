@@ -18,6 +18,7 @@ import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
 import { HAS_NATIVE_ROOT, checkRoot, execReal, RootShell } from "../src/lib/rootShell";
 import { sessionManager } from "../src/lib/sessionManager";
 import LiveTab from "../src/components/LiveTab";
+import AITab from "../src/components/AITab";
 
 const API = `${process.env.EXPO_PUBLIC_BACKEND_URL}/api`;
 
@@ -117,7 +118,7 @@ function HighlightedCmd({ cmd }: { cmd: string }) {
 
 // ============================================================
 export default function App() {
-  const [tab, setTab] = useState<"quick" | "terminal" | "live" | "profiles" | "settings">("quick");
+  const [tab, setTab] = useState<"quick" | "terminal" | "live" | "ai" | "profiles" | "settings">("quick");
   const [iface, setIface] = useState("wlan2");
   const [ifaceB, setIfaceB] = useState("");
   const [ifaceC, setIfaceC] = useState("");
@@ -220,6 +221,12 @@ export default function App() {
     fetch(`${API}/settings`)
       .then((r) => r.json())
       .then((s) => {
+        // TEMPORARY DEBUG (remove after issue confirmed fixed): trace what
+        // GET /settings returned and what mode we're about to apply, so a
+        // LogFox capture can tell us whether the backend value is what
+        // we expect AND whether setExecMode actually runs.
+        // eslint-disable-next-line no-console
+        console.log(`[settings] GET /settings → exec_mode=${s?.exec_mode} iface_a=${s?.iface_a} country=${s?.country}`);
         if (s.iface_a) setIface(s.iface_a);
         if (s.iface_b !== undefined) setIfaceB(s.iface_b);
         if (s.iface_c !== undefined) setIfaceC(s.iface_c);
@@ -244,7 +251,12 @@ export default function App() {
         // implicit "mock" default would silently clobber a user's actual saved
         // exec_mode on every cold start.)
         if (s.exec_mode === "real" || s.exec_mode === "kali" || s.exec_mode === "mock") {
+          // eslint-disable-next-line no-console
+          console.log(`[settings] applying exec_mode=${s.exec_mode}`);
           setExecMode(s.exec_mode);
+        } else {
+          // eslint-disable-next-line no-console
+          console.log(`[settings] exec_mode rejected (value="${s.exec_mode}", type=${typeof s.exec_mode}) — staying on initial mock`);
         }
       })
       .catch(() => {})
@@ -830,6 +842,13 @@ export default function App() {
               wrap={wrapForMode}
             />
           )}
+          {tab === "ai" && (
+            <AITab
+              execMode={execMode}
+              wrap={wrapForMode}
+              apiBase={API}
+            />
+          )}
           {tab === "profiles" && renderProfiles()}
           {tab === "settings" && renderSettings()}
         </View>
@@ -839,8 +858,9 @@ export default function App() {
           <TabBtn t="quick" cur={tab} icon="flash" label="quick" onPress={setTab} />
           <TabBtn t="terminal" cur={tab} icon="console" label="term" badge={logs.length} onPress={setTab} />
           <TabBtn t="live" cur={tab} icon="satellite-uplink" label="live" onPress={setTab} />
-          <TabBtn t="profiles" cur={tab} icon="bookmark-multiple" label="profiles" badge={profiles.length} onPress={setTab} />
-          <TabBtn t="settings" cur={tab} icon="cog" label="settings" onPress={setTab} />
+          <TabBtn t="ai" cur={tab} icon="robot-outline" label="ai" onPress={setTab} />
+          <TabBtn t="profiles" cur={tab} icon="bookmark-multiple" label="prof" badge={profiles.length} onPress={setTab} />
+          <TabBtn t="settings" cur={tab} icon="cog" label="set" onPress={setTab} />
         </View>
 
         {/* SAVE PROFILE INLINE PANEL */}

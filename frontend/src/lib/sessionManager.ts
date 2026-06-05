@@ -10,7 +10,7 @@
  * (e.g. airodump on wlan2, tcpdump on wlan3, wifite on wlan4) can run
  * simultaneously.
  */
-import { startStream, killStream, hasNativeStreaming } from "./rootShell";
+import { startStream, killStream, hasNativeStreaming, writeStdin } from "./rootShell";
 
 export type LineRecord = {
   stream: "stdout" | "stderr";
@@ -40,6 +40,12 @@ type Listener = () => void;
 const RING_MAX = 1500;          // lines kept in memory per session
 const FLUSH_INTERVAL_MS = 1500;  // how often we POST a batch to backend
 const FLUSH_BATCH_MAX = 200;     // max lines in one POST
+// Coalesce UI notifications to ~30Hz max. Without this, a dmesg-style burst
+// (even when native-batched) still triggers a re-render per arriving batch
+// (~12Hz × multiple streams), which is fine, but if multiple sessions are
+// running concurrently the React renders can stack. rAF coalescing folds any
+// number of state changes within one frame into a single re-render.
+const NOTIFY_THROTTLE_MS = 33;
 
 class SessionManager {
   sessions = new Map<string, SessionState>();
@@ -48,6 +54,10 @@ class SessionManager {
   private listeners = new Set<Listener>();
   private flushTimer: ReturnType<typeof setInterval> | null = null;
   private apiBase: string = "";
+  // Notify-throttle state — coalesce multiple line batches arriving inside
+  // one frame budget into a single subscriber notification.
+  private notifyTimer: ReturnType<typeof setTimeout> | null = null;
+  private notifyPending: boolean = false;
 
   configure(apiBase: string) {
     this.apiBase = apiBase.replace(/\/$/, "");
@@ -61,7 +71,28 @@ class SessionManager {
     return () => { this.listeners.delete(l); };
   }
 
-  private notify() { this.listeners.forEach((l) => { try { l(); } catch {} }); }
+  private notify() {
+    // Throttle: at most one fan-out per NOTIFY_THROTTLE_MS, with a trailing
+    // notification scheduled if any further requests arrived during the
+    // throttle window. This keeps the UI responsive without burning the JS
+    // thread when 30k lines/sec are streaming in.
+    if (this.notifyTimer) {
+      this.notifyPending = true;
+      return;
+    }
+    this.fanOut();
+    this.notifyTimer = setTimeout(() => {
+      this.notifyTimer = null;
+      if (this.notifyPending) {
+        this.notifyPending = false;
+        this.notify();
+      }
+    }, NOTIFY_THROTTLE_MS);
+  }
+
+  private fanOut() {
+    this.listeners.forEach((l) => { try { l(); } catch {} });
+  }
 
   list(): SessionState[] {
     return Array.from(this.sessions.values()).sort((a, b) => b.startedAt - a.startedAt);
@@ -135,6 +166,13 @@ class SessionManager {
         s.pid = e.pid; s.status = "running";
         this.notify();
       },
+      // Preferred path — native batches lines and we apply them as one
+      // push + one bounded splice + one notify per batch. This is what
+      // keeps dmesg-style bursts (~30k lines/sec) from ANR'ing the JS thread.
+      onLines: (e) => this.handleLinesBatch(id, e.stream, e.lines, e.toLineNo),
+      // Fallback for any straggler `RootShell.line` events (PID was emitted
+      // per-line, no other code path uses this now — but keep the listener
+      // wired so old APKs that still emit it don't break.)
       onLine: (e) => this.handleLine(id, { stream: e.stream, line: e.line, line_no: e.lineNo }),
       onExit: (e) => this.handleExit(id, e.exit_code, e.duration_ms),
       onError: (e) => {
@@ -156,6 +194,36 @@ class SessionManager {
     if (s.lines.length > RING_MAX) s.lines.splice(0, s.lines.length - RING_MAX);
     s.lineCount = Math.max(s.lineCount, l.line_no);
     const pf = this.pendingFlush.get(id); if (pf) pf.push(rec);
+    this.notify();
+  }
+
+  /**
+   * Apply a batch of lines from native in O(batch) work — one push, one
+   * bounded splice if we overflow the ring, one notify. This is the hot
+   * path under heavy streaming load (dmesg, wifite, airodump after some
+   * minutes of capture).
+   */
+  private handleLinesBatch(id: string, stream: "stdout" | "stderr", lines: string[], toLineNo: number) {
+    const s = this.sessions.get(id); if (!s) return;
+    if (lines.length === 0) return;
+    if (s.status === "starting") s.status = "running";
+    const now = Date.now();
+    // Reconstruct per-line numbers: the batch ends at toLineNo, so the
+    // first line in the batch is (toLineNo - count + 1). This may slightly
+    // over/under-count if stdout and stderr interleave (they share the
+    // same counter), but it's a UI label only — ordering remains correct.
+    const startLineNo = toLineNo - lines.length + 1;
+    const records: LineRecord[] = new Array(lines.length);
+    for (let i = 0; i < lines.length; i++) {
+      records[i] = { stream, line: lines[i], line_no: startLineNo + i, ts: now };
+    }
+    // Single push (Array.prototype.push is variadic — one call adds all).
+    s.lines.push(...records);
+    if (s.lines.length > RING_MAX) s.lines.splice(0, s.lines.length - RING_MAX);
+    s.lineCount = Math.max(s.lineCount, toLineNo);
+    // Backend flush queue
+    const pf = this.pendingFlush.get(id);
+    if (pf) pf.push(...records);
     this.notify();
   }
 
@@ -186,6 +254,36 @@ class SessionManager {
         this.flushSession(id).then(() => this.endBackend(id, -2, Date.now() - cur.startedAt, "killed")).catch(() => {});
       }
     }, 5000);
+  }
+
+  /**
+   * Send a line of text to a running session's stdin. Used by the AI tab to
+   * feed user chat input into hermes / CAI / etc. Echoes the sent text into
+   * the session's own line buffer (as a "stdout" record prefixed with "▸ ")
+   * so the conversation reads top-to-bottom as a transcript. Returns the
+   * number of bytes the native side wrote, or 0 on failure / non-native.
+   */
+  async sendInput(id: string, text: string, appendNewline: boolean = true): Promise<number> {
+    const s = this.sessions.get(id);
+    if (!s) return 0;
+    if (s.status !== "running" && s.status !== "starting") return 0;
+    const written = await writeStdin(id, text, appendNewline);
+    // Echo locally so the UI shows what the user typed, even if the agent
+    // doesn't echo it back itself. The leading "▸ " marker lets the
+    // renderer style user-input differently from agent output.
+    const echoLine = `▸ ${text}`;
+    const rec: LineRecord = {
+      stream: "stdout",
+      line: echoLine,
+      line_no: s.lineCount + 1,
+      ts: Date.now(),
+    };
+    s.lines.push(rec);
+    if (s.lines.length > RING_MAX) s.lines.splice(0, s.lines.length - RING_MAX);
+    s.lineCount += 1;
+    const pf = this.pendingFlush.get(id); if (pf) pf.push(rec);
+    this.notify();
+    return written;
   }
 
   /** Remove a session from local + backend memory (Mongo summary preserved). */
