@@ -36,6 +36,7 @@ type RNModule = {
   // Streaming
   executeStream(sessionId: string, command: string): Promise<string>;
   killSession(sessionId: string, graceful: boolean): Promise<boolean>;
+  writeStdin(sessionId: string, text: string, appendNewline: boolean): Promise<number>;
   listSessions(): Promise<Array<{
     sessionId: string; command: string; pid: number; started_at: number; line_count: number;
   }>>;
@@ -147,6 +148,16 @@ export function startStream(
 export async function killStream(sessionId: string, graceful: boolean): Promise<boolean> {
   if (!RootShell) return false;
   try { return await RootShell.killSession(sessionId, graceful); } catch { return false; }
+}
+
+/**
+ * Send text to a running session's stdin. Used by the AI tab to deliver
+ * chat input to interactive CLI agents (hermes, CAI, …). Returns the
+ * number of bytes written, or 0 if the bridge is unavailable / call fails.
+ */
+export async function writeStdin(sessionId: string, text: string, appendNewline: boolean = true): Promise<number> {
+  if (!RootShell || typeof (RootShell as any).writeStdin !== "function") return 0;
+  try { return await RootShell.writeStdin(sessionId, text, appendNewline); } catch { return 0; }
 }
 
 export async function listStreams() {

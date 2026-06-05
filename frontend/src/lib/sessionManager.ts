@@ -10,7 +10,7 @@
  * (e.g. airodump on wlan2, tcpdump on wlan3, wifite on wlan4) can run
  * simultaneously.
  */
-import { startStream, killStream, hasNativeStreaming } from "./rootShell";
+import { startStream, killStream, hasNativeStreaming, writeStdin } from "./rootShell";
 
 export type LineRecord = {
   stream: "stdout" | "stderr";
@@ -254,6 +254,36 @@ class SessionManager {
         this.flushSession(id).then(() => this.endBackend(id, -2, Date.now() - cur.startedAt, "killed")).catch(() => {});
       }
     }, 5000);
+  }
+
+  /**
+   * Send a line of text to a running session's stdin. Used by the AI tab to
+   * feed user chat input into hermes / CAI / etc. Echoes the sent text into
+   * the session's own line buffer (as a "stdout" record prefixed with "▸ ")
+   * so the conversation reads top-to-bottom as a transcript. Returns the
+   * number of bytes the native side wrote, or 0 on failure / non-native.
+   */
+  async sendInput(id: string, text: string, appendNewline: boolean = true): Promise<number> {
+    const s = this.sessions.get(id);
+    if (!s) return 0;
+    if (s.status !== "running" && s.status !== "starting") return 0;
+    const written = await writeStdin(id, text, appendNewline);
+    // Echo locally so the UI shows what the user typed, even if the agent
+    // doesn't echo it back itself. The leading "▸ " marker lets the
+    // renderer style user-input differently from agent output.
+    const echoLine = `▸ ${text}`;
+    const rec: LineRecord = {
+      stream: "stdout",
+      line: echoLine,
+      line_no: s.lineCount + 1,
+      ts: Date.now(),
+    };
+    s.lines.push(rec);
+    if (s.lines.length > RING_MAX) s.lines.splice(0, s.lines.length - RING_MAX);
+    s.lineCount += 1;
+    const pf = this.pendingFlush.get(id); if (pf) pf.push(rec);
+    this.notify();
+    return written;
   }
 
   /** Remove a session from local + backend memory (Mongo summary preserved). */

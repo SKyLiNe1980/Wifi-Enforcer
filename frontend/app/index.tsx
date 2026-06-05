@@ -18,6 +18,7 @@ import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
 import { HAS_NATIVE_ROOT, checkRoot, execReal, RootShell } from "../src/lib/rootShell";
 import { sessionManager } from "../src/lib/sessionManager";
 import LiveTab from "../src/components/LiveTab";
+import AITab from "../src/components/AITab";
 
 const API = `${process.env.EXPO_PUBLIC_BACKEND_URL}/api`;
 
@@ -117,7 +118,7 @@ function HighlightedCmd({ cmd }: { cmd: string }) {
 
 // ============================================================
 export default function App() {
-  const [tab, setTab] = useState<"quick" | "terminal" | "live" | "profiles" | "settings">("quick");
+  const [tab, setTab] = useState<"quick" | "terminal" | "live" | "ai" | "profiles" | "settings">("quick");
   const [iface, setIface] = useState("wlan2");
   const [ifaceB, setIfaceB] = useState("");
   const [ifaceC, setIfaceC] = useState("");
@@ -841,6 +842,13 @@ export default function App() {
               wrap={wrapForMode}
             />
           )}
+          {tab === "ai" && (
+            <AITab
+              execMode={execMode}
+              wrap={wrapForMode}
+              apiBase={API}
+            />
+          )}
           {tab === "profiles" && renderProfiles()}
           {tab === "settings" && renderSettings()}
         </View>
@@ -850,8 +858,9 @@ export default function App() {
           <TabBtn t="quick" cur={tab} icon="flash" label="quick" onPress={setTab} />
           <TabBtn t="terminal" cur={tab} icon="console" label="term" badge={logs.length} onPress={setTab} />
           <TabBtn t="live" cur={tab} icon="satellite-uplink" label="live" onPress={setTab} />
-          <TabBtn t="profiles" cur={tab} icon="bookmark-multiple" label="profiles" badge={profiles.length} onPress={setTab} />
-          <TabBtn t="settings" cur={tab} icon="cog" label="settings" onPress={setTab} />
+          <TabBtn t="ai" cur={tab} icon="robot-outline" label="ai" onPress={setTab} />
+          <TabBtn t="profiles" cur={tab} icon="bookmark-multiple" label="prof" badge={profiles.length} onPress={setTab} />
+          <TabBtn t="settings" cur={tab} icon="cog" label="set" onPress={setTab} />
         </View>
 
         {/* SAVE PROFILE INLINE PANEL */}

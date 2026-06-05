@@ -428,6 +428,45 @@ class RootShellModule(private val reactContext: ReactApplicationContext) :
         promise.resolve(arr)
     }
 
+    /**
+     * Write to the running session's stdin. Used by the AI tab to send chat
+     * input to interactive CLI agents (hermes, CAI, …). We write on a worker
+     * thread to keep the JS call non-blocking — `proc.outputStream.write()`
+     * can block if the pipe is full (rare for chat input, but possible if
+     * the agent stops reading because it's mid-response).
+     *
+     * The data is written verbatim. If [appendNewline] is true a single
+     * trailing '\n' is appended — most line-buffered CLIs need this to
+     * actually consume the input. Set false for binary or partial-line
+     * sends.
+     */
+    @ReactMethod
+    fun writeStdin(sessionId: String, text: String, appendNewline: Boolean, promise: Promise) {
+        val session = sessions[sessionId]
+        if (session == null) {
+            promise.reject("E_NO_SESSION", "Session not found: $sessionId")
+            return
+        }
+        if (session.ended) {
+            promise.reject("E_SESSION_ENDED", "Session $sessionId already ended")
+            return
+        }
+        Thread({
+            try {
+                val payload = if (appendNewline) "$text\n" else text
+                val out = session.proc.outputStream
+                synchronized(out) {
+                    out.write(payload.toByteArray(Charsets.UTF_8))
+                    out.flush()
+                }
+                promise.resolve(payload.length)
+            } catch (e: Exception) {
+                Log.w(TAG, "writeStdin failed for $sessionId", e)
+                promise.reject("E_STDIN_WRITE", e.message ?: "stdin write failed")
+            }
+        }, "rootshell-stdin-$sessionId").start()
+    }
+
     // ------------------------------------------------------------------
     // RN NativeEventEmitter stubs — declared LAST as a defensive measure.
     // ------------------------------------------------------------------
