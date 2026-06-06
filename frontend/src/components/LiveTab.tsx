@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import {
-  View, Text, StyleSheet, ScrollView, TouchableOpacity, TextInput, Alert, Platform,
+  View, Text, StyleSheet, ScrollView, FlatList, TouchableOpacity, TextInput, Alert, Platform,
 } from "react-native";
 import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
 import { sessionManager, SessionState } from "../lib/sessionManager";
@@ -82,7 +82,7 @@ export default function LiveTab(props: Props) {
   const [autoScroll, setAutoScroll] = useState(true);
   const [presetOpen, setPresetOpen] = useState(false);
   const [probeResult, setProbeResult] = useState<string>("");
-  const outRef = useRef<ScrollView>(null);
+  const outRef = useRef<FlatList | null>(null);
 
   // Tap any method chip to call it — proves whether it's *truly* registered
   // (typeof === 'function' is necessary but not sufficient if RN's proxy is
@@ -364,31 +364,45 @@ export default function LiveTab(props: Props) {
             </View>
           </View>
 
-          <ScrollView
-            ref={outRef}
-            style={{ flex: 1, backgroundColor: "#02050a" }}
-            contentContainerStyle={{ padding: 10, paddingBottom: 24 }}
-            onScrollBeginDrag={() => setAutoScroll(false)}
-          >
-            {selected.lines.length === 0 ? (
+          {selected.lines.length === 0 ? (
+            <View style={{ flex: 1, backgroundColor: "#02050a", padding: 10 }}>
               <Text style={s.helper}>(no output yet)</Text>
-            ) : (
-              selected.lines.map((l, i) => (
+            </View>
+          ) : (
+            <FlatList
+              ref={outRef}
+              style={{ flex: 1, backgroundColor: "#02050a" }}
+              contentContainerStyle={{ padding: 10, paddingBottom: 24 }}
+              data={selected.lines}
+              keyExtractor={(l, i) => `${l.line_no}-${i}`}
+              renderItem={({ item: l }) => (
                 <Text
-                  key={`${l.line_no}-${i}`}
                   selectable
                   style={[s.outLine, l.stream === "stderr" && { color: C.red }]}
                 >
                   {l.line}
                 </Text>
-              ))
-            )}
-            {selected.errorMessage && (
-              <Text style={[s.outLine, { color: C.red, marginTop: 6 }]}>
-                [error] {selected.errorMessage}
-              </Text>
-            )}
-          </ScrollView>
+              )}
+              onScrollBeginDrag={() => setAutoScroll(false)}
+              // Virtualization tuning for terminal-style streaming output:
+              //  * initialNumToRender: small — we always scroll to the bottom,
+              //    so showing the first N rendered immediately is wasteful.
+              //  * maxToRenderPerBatch / windowSize: keep render work bounded
+              //    even during dmesg-style bursts that previously ANR'd the
+              //    UI thread with thousands of <Text> mounted simultaneously.
+              //  * removeClippedSubviews: drops offscreen views from the
+              //    native hierarchy entirely on Android — single biggest win.
+              initialNumToRender={30}
+              maxToRenderPerBatch={20}
+              windowSize={10}
+              removeClippedSubviews={Platform.OS === "android"}
+              ListFooterComponent={selected.errorMessage ? (
+                <Text style={[s.outLine, { color: C.red, marginTop: 6 }]}>
+                  [error] {selected.errorMessage}
+                </Text>
+              ) : null}
+            />
+          )}
         </View>
       ) : (
         <View style={{ flex: 1, alignItems: "center", justifyContent: "center", padding: 24 }}>

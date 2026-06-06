@@ -583,6 +583,11 @@ class AIProfile(BaseModel):
     wrap_mode: str = "none"        # "none" | "pty" | "unbuffered"
     send_newline: bool = True      # append \n to each stdin send
     send_initial: Optional[str] = None  # optional first line auto-sent after launch
+    # Optional shell snippet run BEFORE the main command (inside the same
+    # login shell). Use to source env files, activate venvs, cd into a working
+    # dir, etc. Joined to `command` via `&&` so a non-zero pre-exit aborts.
+    # Example: "source /root/.hermes/.env && cd /root/.hermes"
+    pre_command: Optional[str] = None
     icon: str = "🤖"
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
@@ -594,6 +599,7 @@ class AIProfileCreate(BaseModel):
     wrap_mode: str = "none"
     send_newline: bool = True
     send_initial: Optional[str] = None
+    pre_command: Optional[str] = None
     icon: str = "🤖"
 
 
@@ -604,6 +610,7 @@ class AIProfileUpdate(BaseModel):
     wrap_mode: Optional[str] = None
     send_newline: Optional[bool] = None
     send_initial: Optional[str] = None
+    pre_command: Optional[str] = None
     icon: Optional[str] = None
 
 
