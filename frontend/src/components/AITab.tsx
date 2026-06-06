@@ -42,26 +42,27 @@ type Props = {
 // ─── Helpers ───────────────────────────────────────────────────────────────
 /**
  * Decide what to actually `exec` for an AI session. We always spawn a login
- * shell (`bash -l`) — that way the rc-file sourcing chain (/etc/profile →
- * /etc/bash.bashrc → ~/.bashrc → optionally ~/.profile) fires synchronously
+ * shell — that way the rc-file sourcing chain (/etc/zsh/zshenv,
+ * /etc/zsh/zprofile, ~/.zshenv, ~/.zprofile, ~/.zshrc) fires synchronously
  * before the shell reads stdin. The actual launcher command (hermes, cai,
  * …) is then written into the shell's stdin via sessionManager.sendInput
  * once the session is running.
  *
- * Rationale: previously we did `sudo -E hermes` directly, which spawned
- * hermes in a bare environment (no .zshrc, no .bashrc, no venv activation,
- * no $HOME assumptions). Hermes thought it was on a brand-new install
- * because none of its state files were findable. Going through `bash -l`
- * reproduces exactly the env a real NetHunter terminal would have.
+ * Defaults to `zsh -l` because that's NetHunter Kali's default user shell.
+ * If a user has bash-only setups in the future we'll add a `login_shell`
+ * field on AIProfile.
  *
  * `wrap_mode` controls optional pty/unbuffer wrapping around the login
- * shell — same as before, just one level out.
+ * shell. Note: we explicitly set `SHELL=/bin/zsh` before invoking `script`,
+ * because util-linux `script` reads `$SHELL` to decide what shell to spawn
+ * — and inside the chroot it would otherwise inherit Android's
+ * `/system/bin/sh` from the host context (which doesn't exist in the
+ * kalifs root → "no such file" error).
  */
 function applyAIWrap(mode: AIProfile["wrap_mode"]): string {
-  const loginShell = "bash -l";
+  const loginShell = "zsh -l";
   if (mode === "pty") {
-    // pty wrapping for agents that need a real TTY (readline, ncurses, …)
-    return `script -qc '${loginShell}' /dev/null`;
+    return `SHELL=/bin/zsh script -qc '${loginShell}' /dev/null`;
   }
   if (mode === "unbuffered") {
     return `unbuffer ${loginShell}`;
@@ -90,13 +91,20 @@ export default function AITab(props: Props) {
   const [profiles, setProfiles] = useState<AIProfile[]>([]);
   const [selectedId, setSelectedIdState] = useState<string | null>(aiTabPersistent.selectedId);
   const [activeSessionId, setActiveSessionIdState] = useState<string | null>(aiTabPersistent.activeSessionId);
-  const [activeSession, setActiveSession] = useState<SessionState | null>(
-    aiTabPersistent.activeSessionId ? sessionManager.sessions.get(aiTabPersistent.activeSessionId) || null : null,
-  );
+  // Tick counter — bumped on every sessionManager notification to force a
+  // re-render. sessionManager mutates SessionState in place, so we can't
+  // rely on reference equality. Same pattern as LiveTab uses.
+  const [, force] = useState(0);
   const [inputText, setInputText] = useState("");
   const [sending, setSending] = useState(false);
   const scrollRef = useRef<FlatList | null>(null);
   const autoScrollRef = useRef<boolean>(true);
+
+  // Always read the latest session from sessionManager (singleton) so we
+  // see in-place mutations after a force-rerender.
+  const activeSession: SessionState | null = activeSessionId
+    ? sessionManager.sessions.get(activeSessionId) || null
+    : null;
 
   // Persisted setters — write to module-level on every change so the next
   // mount can pick up where we left off.
@@ -112,31 +120,30 @@ export default function AITab(props: Props) {
   // Configure sessionManager with the API base (idempotent, sessionManager guards re-init)
   useEffect(() => { sessionManager.configure(props.apiBase); }, [props.apiBase]);
 
-  // On mount: if we had an active session, refresh the activeSession mirror
-  // (the session may have produced more output while this tab was unmounted)
+  // On mount: if we had an active session, just trigger a re-render so the
+  // FlatList reads the up-to-date lines from sessionManager.sessions. If
+  // the session has been fully cleaned up while we were unmounted, drop it.
   useEffect(() => {
     if (activeSessionId) {
       const s = sessionManager.sessions.get(activeSessionId);
-      setActiveSession(s || null);
-      // If the session is gone entirely (e.g. ended + cleaned up), forget it
       if (!s) {
         aiTabPersistent.activeSessionId = null;
         setActiveSessionIdState(null);
+      } else {
+        force((n) => n + 1);
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Subscribe to sessionManager updates
+  // Subscribe to sessionManager updates. Same `force` counter pattern as
+  // LiveTab — every notify bumps a tick so React re-renders and FlatList's
+  // extraData prop changes, pulling fresh data out of sessionManager's
+  // in-place-mutated SessionState.
   useEffect(() => {
-    const unsub = sessionManager.subscribe(() => {
-      if (activeSessionId) {
-        const s = sessionManager.sessions.get(activeSessionId) || null;
-        setActiveSession(s);
-      }
-    });
+    const unsub = sessionManager.subscribe(() => force((n) => n + 1));
     return unsub;
-  }, [activeSessionId]);
+  }, []);
 
   // Load AI profiles
   const fetchProfiles = useCallback(async () => {
@@ -193,7 +200,7 @@ export default function AITab(props: Props) {
         label: selectedProfile.name,
       });
       setActiveSessionId(id);
-      setActiveSession(sessionManager.sessions.get(id) || null);
+      force((n) => n + 1);
       // Log session start
       fetch(`${props.apiBase}/ai-logs`, {
         method: "POST",
@@ -295,7 +302,7 @@ export default function AITab(props: Props) {
             const s = sessionManager.sessions.get(activeSessionId);
             if (s) {
               s.lines = [];
-              setActiveSession({ ...s });
+              force((n) => n + 1);
             }
           },
         },
@@ -408,6 +415,12 @@ export default function AITab(props: Props) {
           style={s.transcript}
           contentContainerStyle={{ padding: 8 }}
           data={lines}
+          // CRITICAL: extraData watches a primitive that changes on every
+          // new batch arrival. Without this FlatList sees data={lines} as the
+          // same array reference (sessionManager mutates it in place via push)
+          // and skips re-rendering — so output appears frozen even though
+          // the parent re-rendered. lineCount monotonically increases.
+          extraData={activeSession?.lineCount}
           keyExtractor={(l, i) => `${l.line_no}-${i}`}
           renderItem={({ item: l }) => {
             const isUserEcho = l.line.startsWith("▸ ");
