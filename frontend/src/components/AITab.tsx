@@ -70,15 +70,45 @@ type Props = {
  * `/system/bin/sh` from the host context (which doesn't exist in the
  * kalifs root → "no such file" error).
  */
+/**
+ * Wrap the AI agent's login shell with the right env + optional pty/unbuffer.
+ *
+ * Why every one of these env vars matters for TUI rendering:
+ *   - SHELL=/bin/zsh    → forces `script` to spawn zsh (inside chroot,
+ *                         $SHELL defaults to Android's /system/bin/sh
+ *                         which doesn't exist on the chroot side).
+ *   - TERM=xterm-256color → tells Rich/Textual/prompt-toolkit "you have
+ *                         a fully-featured terminal" so they enable
+ *                         cursor positioning + 256-color + Live widgets.
+ *   - COLORTERM=truecolor → 24-bit color OK; unlocks Rich's prettier
+ *                         theme paths (especially for syntax highlight).
+ *   - FORCE_COLOR=1     → Rich-specific override that bypasses TTY auto-
+ *                         detection. Even if isatty() lies, colors stay on.
+ *   - COLUMNS=120 LINES=40 → CRITICAL for Rich.Live animations: when Rich
+ *                         can't determine terminal size it sets width=0
+ *                         and DISABLES animated status lines (spinner,
+ *                         "thinking…" overwrites, progress bars) — they
+ *                         fall back to one-line-per-update spam. The
+ *                         hardcoded 120×40 is generous enough for any
+ *                         layout the S10+ xterm can display; a future
+ *                         enhancement will dynamically pass xterm.js's
+ *                         actual cols/rows here via TIOCSWINSZ.
+ *   - PYTHONUNBUFFERED=1 → flush stdout immediately so spinners feel
+ *                         live, not in 4KB chunks.
+ *
+ * The env block prefixes every wrap mode so the agent inherits the same
+ * baseline regardless of pty/unbuffer/none choice.
+ */
 function applyAIWrap(mode: AIProfile["wrap_mode"]): string {
+  const env = `SHELL=/bin/zsh TERM=xterm-256color COLORTERM=truecolor FORCE_COLOR=1 COLUMNS=120 LINES=40 PYTHONUNBUFFERED=1`;
   const loginShell = "zsh -l";
   if (mode === "pty") {
-    return `SHELL=/bin/zsh script -qc '${loginShell}' /dev/null`;
+    return `${env} script -qc '${loginShell}' /dev/null`;
   }
   if (mode === "unbuffered") {
-    return `unbuffer ${loginShell}`;
+    return `${env} unbuffer ${loginShell}`;
   }
-  return loginShell;
+  return `${env} ${loginShell}`;
 }
 
 /**

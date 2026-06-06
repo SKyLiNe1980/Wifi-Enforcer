@@ -59,7 +59,10 @@ const persistent: { sessionId: string | null } = { sessionId: null };
  * the same `script` invocation so the PTY is still set up correctly).
  */
 function shellInvocation(): string {
-  return `SHELL=/bin/zsh HOME=/root TERM=xterm-256color script -qc 'zsh -l 2>/dev/null || bash -l' /dev/null`;
+  // Same TUI-friendly env block as AITab's applyAIWrap — see AITab.tsx for
+  // the per-var rationale. We keep these in sync deliberately so an
+  // interactive shell and an AI agent see identical terminal capability.
+  return `SHELL=/bin/zsh HOME=/root TERM=xterm-256color COLORTERM=truecolor FORCE_COLOR=1 COLUMNS=120 LINES=40 PYTHONUNBUFFERED=1 script -qc 'zsh -l 2>/dev/null || bash -l' /dev/null`;
 }
 
 export default function TerminalShell({ execMode, wrap, pendingInjection }: Props) {
