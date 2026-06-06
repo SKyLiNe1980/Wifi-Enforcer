@@ -70,6 +70,40 @@ function applyAIWrap(mode: AIProfile["wrap_mode"]): string {
   return loginShell;
 }
 
+/**
+ * Strip ANSI escape sequences from a single line of streamed output. Hermes
+ * (and basically every modern Python CLI agent using Rich / prompt-toolkit /
+ * blessed / textual) emits cursor-positioning + color codes even in --cli
+ * "plain" mode, because the prompt input loop still uses readline-style
+ * editing. Our flat scrollback view can't honor cursor positioning, so we
+ * just rip the escapes out and render the leftover text.
+ *
+ * Covers:
+ *   - CSI sequences:   ESC [ params final-letter   (most common — colors, cursor)
+ *   - OSC sequences:   ESC ] ... BEL / ESC \\      (window title, hyperlinks)
+ *   - Lone \r without \n:  redraw-current-line — we drop the prefix
+ *   - ESC standalone or with single-char following  (less common)
+ */
+function cleanAnsi(line: string): string {
+  if (!line) return line;
+  let out = line
+    // CSI:  ESC [ ... final
+    .replace(/\x1b\[[\d;?]*[A-Za-z]/g, "")
+    // OSC:  ESC ] ... (BEL | ESC \)
+    .replace(/\x1b\][^\x07\x1b]*(\x07|\x1b\\)/g, "")
+    // Two-char ESC sequences: ESC followed by =, >, (, ), 7, 8 etc.
+    .replace(/\x1b[=>78\(\)][0-9A-Za-z]?/g, "")
+    // Any remaining bare ESC
+    .replace(/\x1b/g, "");
+  // Lone carriage returns: keep only what's after the last \r on the line,
+  // since that's what the terminal would display after the "redraw"
+  if (out.indexOf("\r") !== -1) {
+    const parts = out.split("\r");
+    out = parts[parts.length - 1];
+  }
+  return out;
+}
+
 // ─── Module-level state that survives tab unmounts ───────────────────────
 // AITab is unmounted/remounted by index.tsx every time the user switches
 // tabs. To make sessions feel persistent across tab switches we stash the
@@ -443,6 +477,13 @@ export default function AITab(props: Props) {
             const { contentOffset, contentSize, layoutMeasurement } = e.nativeEvent;
             const distance = contentSize.height - (contentOffset.y + layoutMeasurement.height);
             if (distance < 40) autoScrollRef.current = true;
+          }}
+          // Auto-scroll on new content: fires AFTER FlatList has measured the
+          // new items, unlike a useEffect on lineCount which races layout.
+          onContentSizeChange={() => {
+            if (autoScrollRef.current) {
+              scrollRef.current?.scrollToEnd({ animated: false });
+            }
           }}
           // Same virtualization tuning as LiveTab — keep dmesg-style bursts
           // from rendering thousands of <Text> simultaneously on the UI
