@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import {
-  View, Text, StyleSheet, ScrollView, TouchableOpacity, TextInput, Alert, Platform,
+  View, Text, StyleSheet, ScrollView, FlatList, TouchableOpacity, TextInput, Alert, Platform,
   KeyboardAvoidingView,
 } from "react-native";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
@@ -28,6 +28,7 @@ export type AIProfile = {
   wrap_mode: "none" | "pty" | "unbuffered";
   send_newline: boolean;
   send_initial: string | null;
+  pre_command: string | null;
   icon: string;
   created_at: string;
 };
@@ -39,35 +40,92 @@ type Props = {
 };
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
-/** Apply pty/unbuffer wrapping to the raw command BEFORE the exec-mode wrap. */
-function applyAIWrap(rawCmd: string, mode: AIProfile["wrap_mode"]): string {
+/**
+ * Decide what to actually `exec` for an AI session. We always spawn a login
+ * shell (`bash -l`) — that way the rc-file sourcing chain (/etc/profile →
+ * /etc/bash.bashrc → ~/.bashrc → optionally ~/.profile) fires synchronously
+ * before the shell reads stdin. The actual launcher command (hermes, cai,
+ * …) is then written into the shell's stdin via sessionManager.sendInput
+ * once the session is running.
+ *
+ * Rationale: previously we did `sudo -E hermes` directly, which spawned
+ * hermes in a bare environment (no .zshrc, no .bashrc, no venv activation,
+ * no $HOME assumptions). Hermes thought it was on a brand-new install
+ * because none of its state files were findable. Going through `bash -l`
+ * reproduces exactly the env a real NetHunter terminal would have.
+ *
+ * `wrap_mode` controls optional pty/unbuffer wrapping around the login
+ * shell — same as before, just one level out.
+ */
+function applyAIWrap(mode: AIProfile["wrap_mode"]): string {
+  const loginShell = "bash -l";
   if (mode === "pty") {
-    // `script -qc "..." /dev/null` allocates a pty without writing a typescript.
-    // Escape any double quotes in the command body so we don't break out.
-    const escaped = rawCmd.replace(/"/g, '\\"');
-    return `script -qc "${escaped}" /dev/null`;
+    // pty wrapping for agents that need a real TTY (readline, ncurses, …)
+    return `script -qc '${loginShell}' /dev/null`;
   }
   if (mode === "unbuffered") {
-    return `unbuffer ${rawCmd}`;
+    return `unbuffer ${loginShell}`;
   }
-  return rawCmd;
+  return loginShell;
 }
+
+// ─── Module-level state that survives tab unmounts ───────────────────────
+// AITab is unmounted/remounted by index.tsx every time the user switches
+// tabs. To make sessions feel persistent across tab switches we stash the
+// active session id + the user's profile selection at module scope. The
+// underlying SessionState already lives in sessionManager (singleton), so
+// we just need to remember which id to look up.
+const aiTabPersistent: {
+  activeSessionId: string | null;
+  selectedId: string | null;
+} = {
+  activeSessionId: null,
+  selectedId: null,
+};
 
 // ──────────────────────────────────────────────────────────────────────────
 // Main component
 // ──────────────────────────────────────────────────────────────────────────
 export default function AITab(props: Props) {
   const [profiles, setProfiles] = useState<AIProfile[]>([]);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
-  const [activeSession, setActiveSession] = useState<SessionState | null>(null);
+  const [selectedId, setSelectedIdState] = useState<string | null>(aiTabPersistent.selectedId);
+  const [activeSessionId, setActiveSessionIdState] = useState<string | null>(aiTabPersistent.activeSessionId);
+  const [activeSession, setActiveSession] = useState<SessionState | null>(
+    aiTabPersistent.activeSessionId ? sessionManager.sessions.get(aiTabPersistent.activeSessionId) || null : null,
+  );
   const [inputText, setInputText] = useState("");
   const [sending, setSending] = useState(false);
-  const scrollRef = useRef<ScrollView | null>(null);
+  const scrollRef = useRef<FlatList | null>(null);
   const autoScrollRef = useRef<boolean>(true);
+
+  // Persisted setters — write to module-level on every change so the next
+  // mount can pick up where we left off.
+  const setSelectedId = useCallback((id: string | null) => {
+    aiTabPersistent.selectedId = id;
+    setSelectedIdState(id);
+  }, []);
+  const setActiveSessionId = useCallback((id: string | null) => {
+    aiTabPersistent.activeSessionId = id;
+    setActiveSessionIdState(id);
+  }, []);
 
   // Configure sessionManager with the API base (idempotent, sessionManager guards re-init)
   useEffect(() => { sessionManager.configure(props.apiBase); }, [props.apiBase]);
+
+  // On mount: if we had an active session, refresh the activeSession mirror
+  // (the session may have produced more output while this tab was unmounted)
+  useEffect(() => {
+    if (activeSessionId) {
+      const s = sessionManager.sessions.get(activeSessionId);
+      setActiveSession(s || null);
+      // If the session is gone entirely (e.g. ended + cleaned up), forget it
+      if (!s) {
+        aiTabPersistent.activeSessionId = null;
+        setActiveSessionIdState(null);
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Subscribe to sessionManager updates
   useEffect(() => {
@@ -123,16 +181,20 @@ export default function AITab(props: Props) {
       );
       return;
     }
-    const raw = applyAIWrap(selectedProfile.command, selectedProfile.wrap_mode);
-    const wrapped = props.wrap(raw);
+    // Step 1: launch a login shell (bash -l) wrapped by the chosen pty/unbuffer
+    // mode and the outer exec-mode chroot prefix. This shell will source rc
+    // files (/etc/profile, /etc/bash.bashrc, ~/.bashrc) before reading stdin,
+    // so the hermes/cai/etc launcher gets a fully-bootstrapped environment.
+    const shellInvocation = applyAIWrap(selectedProfile.wrap_mode);
+    const wrappedShell = props.wrap(shellInvocation);
     try {
       const id = await sessionManager.start({
-        command: wrapped,
+        command: wrappedShell,
         label: selectedProfile.name,
       });
       setActiveSessionId(id);
       setActiveSession(sessionManager.sessions.get(id) || null);
-      // Log session start to ai-logs (fire-and-forget)
+      // Log session start
       fetch(`${props.apiBase}/ai-logs`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -141,15 +203,27 @@ export default function AITab(props: Props) {
           profile_name: selectedProfile.name,
           session_id: id,
           kind: "system",
-          content: `session started · command=${selectedProfile.command} · wrap=${selectedProfile.wrap_mode}`,
+          content: `session started · shell=${shellInvocation} · launcher=${selectedProfile.command}`,
         }),
       }).catch(() => {});
-      // If profile has a send_initial, auto-send it after a small delay so the
-      // agent has time to print its banner / settle stdin before we feed it.
+
+      // Step 2: send the launcher command (and optional pre_command) into the
+      // login shell's stdin. Wait ~800ms so bash has time to source its rc
+      // files before our line lands in its input queue (otherwise our line
+      // might race ahead of rc execution and run in a half-bootstrapped env).
+      const launcher = selectedProfile.pre_command
+        ? `${selectedProfile.pre_command} && ${selectedProfile.command}`
+        : selectedProfile.command;
+      setTimeout(() => {
+        sessionManager.sendInput(id, launcher, true).catch(() => {});
+      }, 800);
+
+      // Step 3: optional send_initial — auto-sent ~1.5s after the launcher
+      // boots so the agent has time to print its banner before we feed it.
       if (selectedProfile.send_initial) {
         setTimeout(() => {
           sessionManager.sendInput(id, selectedProfile.send_initial!, selectedProfile.send_newline).catch(() => {});
-        }, 1500);
+        }, 2300);
       }
     } catch (e: any) {
       Alert.alert("Failed to start", e?.message || "Unknown error");
@@ -240,7 +314,7 @@ export default function AITab(props: Props) {
     >
       {/* Profile selector */}
       <View style={s.profileBar}>
-        <Text style={s.sectionLabel}>// agent</Text>
+        <Text style={s.sectionLabel}>{"// agent"}</Text>
         <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ paddingRight: 12 }}>
           {profiles.map((p) => {
             const active = p.id === selectedId;
@@ -315,19 +389,11 @@ export default function AITab(props: Props) {
       </View>
 
       {/* Transcript pane */}
-      <ScrollView
-        ref={scrollRef}
-        style={s.transcript}
-        contentContainerStyle={{ padding: 8 }}
-        onScrollBeginDrag={() => { autoScrollRef.current = false; }}
-        onMomentumScrollEnd={(e) => {
-          // Re-enable auto-scroll if user dragged to within 40px of the bottom
-          const { contentOffset, contentSize, layoutMeasurement } = e.nativeEvent;
-          const distance = contentSize.height - (contentOffset.y + layoutMeasurement.height);
-          if (distance < 40) autoScrollRef.current = true;
-        }}
-      >
-        {lines.length === 0 ? (
+      {lines.length === 0 ? (
+        <ScrollView
+          style={s.transcript}
+          contentContainerStyle={{ padding: 8 }}
+        >
           <Text style={s.placeholder}>
             {isRunning
               ? "// waiting for agent output…"
@@ -335,13 +401,19 @@ export default function AITab(props: Props) {
               ? `// tap START to launch ${selectedProfile.name}`
               : "// no agent selected"}
           </Text>
-        ) : (
-          lines.map((l, i) => {
+        </ScrollView>
+      ) : (
+        <FlatList
+          ref={scrollRef}
+          style={s.transcript}
+          contentContainerStyle={{ padding: 8 }}
+          data={lines}
+          keyExtractor={(l, i) => `${l.line_no}-${i}`}
+          renderItem={({ item: l }) => {
             const isUserEcho = l.line.startsWith("▸ ");
             const isStderr = l.stream === "stderr";
             return (
               <Text
-                key={`${l.line_no}-${i}`}
                 style={[
                   s.line,
                   isUserEcho && { color: C.userPrompt },
@@ -352,9 +424,22 @@ export default function AITab(props: Props) {
                 {l.line}
               </Text>
             );
-          })
-        )}
-      </ScrollView>
+          }}
+          onScrollBeginDrag={() => { autoScrollRef.current = false; }}
+          onMomentumScrollEnd={(e) => {
+            const { contentOffset, contentSize, layoutMeasurement } = e.nativeEvent;
+            const distance = contentSize.height - (contentOffset.y + layoutMeasurement.height);
+            if (distance < 40) autoScrollRef.current = true;
+          }}
+          // Same virtualization tuning as LiveTab — keep dmesg-style bursts
+          // from rendering thousands of <Text> simultaneously on the UI
+          // thread (the original ANR cause per 06-06 crash log).
+          initialNumToRender={30}
+          maxToRenderPerBatch={20}
+          windowSize={10}
+          removeClippedSubviews={Platform.OS === "android"}
+        />
+      )}
 
       {/* Input bar */}
       <View style={s.inputBar}>
