@@ -488,3 +488,133 @@ agent_communication:
           - Chroot wrap echo spam suppression
           - Settings sub-tabs restructure
           - Wifite2 PMKID one-tap profile
+
+========================================================================
+2026-06-06 — SETTINGS SUB-TABS + AI PROFILE CRUD + PERSISTENT SHELL
+========================================================================
+
+Two-part session focused on UX polish + a long-overdue Terminal upgrade.
+
+frontend:
+  - task: "Settings sub-tabs (general / profiles / agents)"
+    implemented: true
+    working: true
+    file: "frontend/app/index.tsx"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        - working: true
+          agent: "main"
+          comment: |
+            Bottom tab bar shrunk from 6 → 5 (quick/term/live/ai/set). Profiles
+            and AI Agents now nest as sub-tabs inside Settings with their own
+            segmented control. Backwards-compat: any old persisted
+            tab="profiles" state silently redirects to Settings > Profiles.
+            Verified via screenshot on web preview — general/profiles/agents
+            all render correctly, badges show counts.
+
+  - task: "AI Agents CRUD (Settings > AI Agents)"
+    implemented: true
+    working: true
+    file: "frontend/app/index.tsx"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        - working: true
+          agent: "main"
+          comment: |
+            Full list view + inline edit sheet. Fields covered:
+              - name (required), command (required), description
+              - pre_command (chained with && before command)
+              - icon (emoji, max 4 chars)
+              - wrap_mode segmented (none/pty/unbuffered)
+              - view_mode segmented (TUI xterm.js / scrollback)
+              - send_newline toggle row
+            Skipped for v1: send_initial (rarely used).
+            Optimistic UI + error reconcile on failure. Backend already
+            had POST/PUT/DELETE for /api/ai-profiles, all reused.
+            Verified via screenshot: editor opens, fields populate, segmented
+            controls work; deletion confirmation dialog appears.
+
+  - task: "Persistent shell mode for Terminal tab"
+    implemented: true
+    working: "needs-eas-build"
+    file: "frontend/src/components/TerminalShell.tsx"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        - working: "needs-eas-build"
+          agent: "main"
+          comment: |
+            New TerminalShell component reuses the XTermView + sessionManager
+            architecture from the AI tab. Terminal tab now has a sub-tab
+            toggle: classic (existing su -c per-command card view) and
+            shell (new persistent zsh -l session in PTY).
+
+            Shell invocation:
+              SHELL=/bin/zsh HOME=/root TERM=xterm-256color
+              script -qc 'zsh -l 2>/dev/null || bash -l' /dev/null
+
+            Why this exact incantation:
+              - `script` allocates a PTY (without it: no colors, no readline,
+                no zsh prompt redraw)
+              - SHELL=/bin/zsh forces `script` to pick zsh inside the chroot
+                (otherwise it'd inherit Android's /system/bin/sh)
+              - HOME=/root so zsh finds its rc-files
+              - TERM=xterm-256color tells the shell + apps what we can render
+              - `|| bash -l` fallback for users without zsh in their chroot
+
+            Session id persisted in module-level state so tab switches don't
+            kill the shell. Clear button sends Ctrl-L (form-feed) rather than
+            wiping the buffer — preserves shell-side state. EOF/SIGKILL
+            options when closing.
+
+            Defaults to "classic" mode so existing quick-command workflow
+            isn't disrupted. User explicitly opts into persistent shell.
+
+            Mock mode shows a warning that REAL/KALI exec mode is required.
+            Verified via screenshot: toggle works, idle state renders
+            cleanly, control bar appears. Real shell session requires EAS
+            build (native streaming + writeStdin needed).
+
+test_plan:
+  current_focus:
+    - "User EAS-builds the APK and validates persistent shell with `cd` / env vars persisting"
+    - "User validates Settings > AI Agents create/edit/delete flow"
+    - "User validates Profiles tab moved cleanly into Settings sub-tab"
+  stuck_tasks: []
+  test_all: false
+  test_priority: "user_device_validation"
+
+agent_communication:
+    - agent: "main"
+      message: |
+        Three features ready for device validation:
+
+        1. SETTINGS SUB-TABS — pure UI restructure, no native deps. Should
+           work in any build/Expo Go. The settingsSubTab state lives in
+           App-level useState — does NOT persist across cold boot (a
+           deliberate choice for "always land on general" predictability).
+
+        2. AI PROFILE EDITOR — pure backend CRUD that already existed; new
+           UI is the inline sheet. Verified locally via curl + screenshot.
+
+        3. PERSISTENT SHELL — requires EAS build. Architecture reuses
+           AITab's XTermView + sessionManager pattern so anything that
+           works for Hermes will work here. Test plan:
+             • Open Terminal tab in shell mode
+             • Tap OPEN SHELL (must have REAL or KALI exec mode)
+             • Verify zsh prompt appears
+             • `cd /root` then `pwd` → should show /root (state persists!)
+             • Run htop / vim / nano → should render correctly
+             • Switch to Quick tab and back → shell should still be alive
+             • Tap CLOSE → graceful EOF or SIGKILL choice
+
+        NEXT (per backlog):
+          - Chroot wrap echo spam suppression
+          - Wifite2 PMKID one-tap profile
+          - Nodes Tab / swarm clustering
+
