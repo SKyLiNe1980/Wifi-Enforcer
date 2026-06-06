@@ -1,3 +1,9 @@
+/* eslint-disable react/jsx-no-comment-textnodes */
+// `// section` headings are an intentional, project-wide UI convention
+// (e.g. "// system", "// danger zone") — they render as visible text in
+// the dark terminal-style theme. The eslint rule that flags JSX children
+// starting with "//" can't tell text-as-style from a stray code comment,
+// so we disable it for this file only.
 import React, { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import {
   View,
@@ -19,6 +25,7 @@ import { HAS_NATIVE_ROOT, checkRoot, execReal, RootShell } from "../src/lib/root
 import { sessionManager } from "../src/lib/sessionManager";
 import LiveTab from "../src/components/LiveTab";
 import AITab from "../src/components/AITab";
+import TerminalShell from "../src/components/TerminalShell";
 
 const API = `${process.env.EXPO_PUBLIC_BACKEND_URL}/api`;
 
@@ -37,6 +44,9 @@ const C = {
   text: "#cfeadb",
   textDim: "#6c8a82",
   prompt: "#5cffb1",
+  // AI-tab accent — kept in sync with AITab.tsx so badges/buttons feel
+  // unified across the AI tab and the new Settings > AI Agents sub-tab.
+  aiAccent: "#b08aff",
 };
 
 const MONO = Platform.select({ ios: "Menlo", android: "monospace", default: "monospace" });
@@ -141,6 +151,30 @@ export default function App() {
   const [chrootPath, setChrootPath] = useState(NETHUNTER_CHROOT);
   const termRef = useRef<ScrollView>(null);
 
+  // ─── Settings sub-tabs ───────────────────────────────────────────────────
+  // The bottom tab bar was getting overcrowded (quick/term/live/ai/prof/set
+  // = 6 tabs, each ~16% of screen width — too cramped on the S10+ in
+  // portrait). We nested "Profiles" + "AI Agents" under Settings as
+  // sub-tabs so the bottom bar shrinks to a balanced 5 tabs.
+  const [settingsSubTab, setSettingsSubTab] = useState<"general" | "profiles" | "agents">("general");
+
+  // ─── Terminal tab mode ───────────────────────────────────────────────────
+  // Classic = one-shot `su -c` per command (stateless, current behavior).
+  // Shell   = persistent `zsh -l` in a PTY, rendered via xterm.js so
+  //           `cd`, env vars, vim, htop, command history etc. all work.
+  // Stateless first-mount default = "classic" because users expect the
+  // existing quick-command card flow when they tap Terminal.
+  const [terminalMode, setTerminalMode] = useState<"classic" | "shell">("classic");
+
+  // ─── AI profile editor state ─────────────────────────────────────────────
+  // Inline edit sheet inside Settings > AI Agents. `aiEditing === null`
+  // when the sheet is closed; an AIProfile (existing) when editing; or a
+  // partial draft (no id) when creating a new one.
+  const [aiProfilesList, setAiProfilesList] = useState<any[]>([]);
+  const [aiEditOpen, setAiEditOpen] = useState(false);
+  const [aiEditing, setAiEditing] = useState<any | null>(null);  // AIProfile | draft
+  const [aiSaving, setAiSaving] = useState(false);
+
   const ctx: Ctx = { iface, country };
 
   // Resolve active interface(s) based on activeIface selector
@@ -184,6 +218,118 @@ export default function App() {
   }, []);
 
   useEffect(() => { fetchAll(); }, [fetchAll]);
+
+  // ─── AI profile CRUD ──────────────────────────────────────────────────
+  // Fetches/creates/updates/deletes AIProfile docs. Lives at the App level
+  // so both the AI tab (chip selector, used by AITab.tsx) and the new
+  // Settings > AI Agents sub-tab can share a single source of truth.
+  // We keep AITab's internal fetch too — they de-dupe via the backend.
+  const fetchAIProfiles = useCallback(async () => {
+    try {
+      const r = await fetch(`${API}/ai-profiles`);
+      if (!r.ok) return;
+      const data = await r.json();
+      setAiProfilesList(data);
+    } catch {
+      /* non-fatal */
+    }
+  }, []);
+
+  useEffect(() => { fetchAIProfiles(); }, [fetchAIProfiles]);
+
+  /** Open the editor sheet — pass null for "new", or an existing profile for "edit". */
+  const openAIEditor = useCallback((p: any | null) => {
+    setAiEditing(
+      p
+        ? { ...p }
+        : {
+            // sensible defaults for new agents — match the seed profile defaults
+            name: "",
+            command: "",
+            description: "",
+            wrap_mode: "none",
+            view_mode: "xterm",
+            send_newline: true,
+            send_initial: null,
+            pre_command: null,
+            icon: "🤖",
+          },
+    );
+    setAiEditOpen(true);
+  }, []);
+
+  const closeAIEditor = useCallback(() => {
+    setAiEditOpen(false);
+    // Defer clearing so the sheet fade-out doesn't show empty fields.
+    setTimeout(() => setAiEditing(null), 200);
+  }, []);
+
+  const saveAIProfile = useCallback(async () => {
+    if (!aiEditing) return;
+    const name = (aiEditing.name || "").trim();
+    const command = (aiEditing.command || "").trim();
+    if (!name || !command) {
+      Alert.alert("Required fields", "Both name and command are required.");
+      return;
+    }
+    setAiSaving(true);
+    try {
+      // Build payload — null-out empty strings on optional fields so backend
+      // stores actual null instead of "". pre_command especially: an empty
+      // string would get joined with `&&` and fail the shell.
+      const payload: any = {
+        name,
+        command,
+        description: aiEditing.description || "",
+        wrap_mode: aiEditing.wrap_mode || "none",
+        view_mode: aiEditing.view_mode || "xterm",
+        send_newline: aiEditing.send_newline !== false,
+        send_initial: aiEditing.send_initial && aiEditing.send_initial.trim() ? aiEditing.send_initial.trim() : null,
+        pre_command: aiEditing.pre_command && aiEditing.pre_command.trim() ? aiEditing.pre_command.trim() : null,
+        icon: aiEditing.icon || "🤖",
+      };
+      const isUpdate = !!aiEditing.id;
+      const url = isUpdate ? `${API}/ai-profiles/${aiEditing.id}` : `${API}/ai-profiles`;
+      const method = isUpdate ? "PUT" : "POST";
+      const r = await fetch(url, {
+        method,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (!r.ok) {
+        const txt = await r.text();
+        throw new Error(`HTTP ${r.status}: ${txt}`);
+      }
+      await fetchAIProfiles();
+      closeAIEditor();
+    } catch (e: any) {
+      Alert.alert("Save failed", e?.message || "Unknown error");
+    } finally {
+      setAiSaving(false);
+    }
+  }, [aiEditing, fetchAIProfiles, closeAIEditor]);
+
+  const deleteAIProfile = useCallback(async (id: string, name: string) => {
+    Alert.alert(
+      "Delete agent?",
+      `Permanently remove "${name}"? This won't touch any running session.`,
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Delete",
+          style: "destructive",
+          onPress: async () => {
+            try {
+              await fetch(`${API}/ai-profiles/${id}`, { method: "DELETE" });
+              await fetchAIProfiles();
+            } catch {
+              Alert.alert("Delete failed", "Network error.");
+            }
+          },
+        },
+      ],
+    );
+  }, [fetchAIProfiles]);
 
   // Initialize streaming session manager with backend API base
   useEffect(() => { sessionManager.configure(API); }, []);
@@ -517,67 +663,96 @@ export default function App() {
 
   const renderTerminal = () => (
     <View style={{ flex: 1 }}>
-      <ScrollView ref={termRef} style={{ flex: 1, backgroundColor: "#02050a" }}
-        contentContainerStyle={{ padding: 12, paddingBottom: 24 }}>
-        <Text style={s.banner}>{BANNER}</Text>
-        <Text style={s.bannerSub}>
-          {`# session: ${rootInfo?.device || "..."} · ${rootInfo?.android_version || "..."}\n# entries: ${logs.length} · status: ${running ? "BUSY" : "idle"}\n`}
-        </Text>
-        {logs.map((l, idx) => {
-          const isHistorical = idx < historicalCountRef.current;
-          const isFirstCurrent = idx === historicalCountRef.current && historicalCountRef.current > 0;
+      {/* Mode toggle — classic (one-shot cards) vs shell (persistent zsh).
+          Defaults to classic so we don't break the existing quick-command
+          flow. Shell mode requires REAL or KALI execMode (won't work in
+          mock since there's no real shell to keep alive). */}
+      <View style={s.subTabBar}>
+        {(["classic", "shell"] as const).map((m) => {
+          const active = terminalMode === m;
+          const label = m === "classic" ? `classic · ${logs.length}` : "shell · zsh -l";
+          const icon: any = m === "classic" ? "console-network" : "console";
           return (
-            <React.Fragment key={l.id}>
-              {isFirstCurrent && (
-                <View style={{ flexDirection: "row", alignItems: "center", marginVertical: 8 }}>
-                  <View style={{ flex: 1, height: 1, backgroundColor: C.textDim, opacity: 0.4 }} />
-                  <Text style={{ color: C.cyan, fontFamily: MONO, fontSize: 10, marginHorizontal: 8, letterSpacing: 1 }}>
-                    ── CURRENT SESSION ──
-                  </Text>
-                  <View style={{ flex: 1, height: 1, backgroundColor: C.textDim, opacity: 0.4 }} />
-                </View>
-              )}
-              <View style={{ marginBottom: 10, opacity: isHistorical ? 0.45 : 1 }}>
-                <View style={{ flexDirection: "row", flexWrap: "wrap" }}>
-                  <Text style={{ color: C.prompt, fontFamily: MONO, fontSize: 12 }}>root@android</Text>
-                  <Text style={{ color: C.textDim, fontFamily: MONO, fontSize: 12 }}>:/ # </Text>
-                  <HighlightedCmd cmd={l.command} />
-                </View>
-                {!!l.output && (
-                  <Text style={[s.termOut, l.exit_code !== 0 && { color: C.red }]} selectable>
-                    {l.output}
-                  </Text>
-                )}
-                <Text style={s.termMeta}>
-                  <Text style={{ color: l.exit_code === 0 ? C.greenDim : C.red }}>exit={l.exit_code}</Text>
-                  <Text style={{ color: C.textDim }}> · {l.duration_ms}ms · {l.mocked ? "mock" : "real"}</Text>
-                </Text>
-              </View>
-            </React.Fragment>
+            <TouchableOpacity
+              key={m}
+              testID={`term-mode-${m}`}
+              onPress={() => setTerminalMode(m)}
+              style={[s.subTab, active && s.subTabActive]}
+            >
+              <MaterialCommunityIcons name={icon} size={14} color={active ? C.green : C.textDim} />
+              <Text style={[s.subTabText, active && { color: C.green }]}>{label}</Text>
+            </TouchableOpacity>
           );
         })}
-        {logs.length === 0 && (
-          <Text style={{ color: C.textDim, fontFamily: MONO, fontSize: 12 }}>
-            (no commands yet — go to Quick or type below)
-          </Text>
-        )}
-      </ScrollView>
-
-      <View style={s.cmdRow}>
-        <Text style={{ color: C.prompt, fontFamily: MONO, fontSize: 13 }}># </Text>
-        <TextInput testID="input-custom-cmd" value={customCmd} onChangeText={setCustomCmd}
-          placeholder="su -c …" placeholderTextColor={C.textDim} style={s.cmdInput}
-          onSubmitEditing={() => { if (customCmd.trim()) { execute(customCmd); setCustomCmd(""); } }}
-          autoCapitalize="none" autoCorrect={false} returnKeyType="send" />
-        {running && <ActivityIndicator size="small" color={C.green} style={{ marginRight: 6 }} />}
-        <TouchableOpacity testID="btn-run-custom"
-          style={[s.runBtn, !customCmd.trim() && { opacity: 0.4 }]}
-          disabled={!customCmd.trim() || running}
-          onPress={() => { execute(customCmd); setCustomCmd(""); }}>
-          <Ionicons name="play" size={14} color={C.bg} />
-          <Text style={s.runBtnText}>RUN</Text>
-        </TouchableOpacity>
       </View>
+
+      {terminalMode === "shell" ? (
+        <TerminalShell execMode={execMode} wrap={wrapForMode} />
+      ) : (
+        <>
+          <ScrollView ref={termRef} style={{ flex: 1, backgroundColor: "#02050a" }}
+            contentContainerStyle={{ padding: 12, paddingBottom: 24 }}>
+            <Text style={s.banner}>{BANNER}</Text>
+            <Text style={s.bannerSub}>
+              {`# session: ${rootInfo?.device || "..."} · ${rootInfo?.android_version || "..."}\n# entries: ${logs.length} · status: ${running ? "BUSY" : "idle"}\n`}
+            </Text>
+            {logs.map((l, idx) => {
+              const isHistorical = idx < historicalCountRef.current;
+              const isFirstCurrent = idx === historicalCountRef.current && historicalCountRef.current > 0;
+              return (
+                <React.Fragment key={l.id}>
+                  {isFirstCurrent && (
+                    <View style={{ flexDirection: "row", alignItems: "center", marginVertical: 8 }}>
+                      <View style={{ flex: 1, height: 1, backgroundColor: C.textDim, opacity: 0.4 }} />
+                      <Text style={{ color: C.cyan, fontFamily: MONO, fontSize: 10, marginHorizontal: 8, letterSpacing: 1 }}>
+                        ── CURRENT SESSION ──
+                      </Text>
+                      <View style={{ flex: 1, height: 1, backgroundColor: C.textDim, opacity: 0.4 }} />
+                    </View>
+                  )}
+                  <View style={{ marginBottom: 10, opacity: isHistorical ? 0.45 : 1 }}>
+                    <View style={{ flexDirection: "row", flexWrap: "wrap" }}>
+                      <Text style={{ color: C.prompt, fontFamily: MONO, fontSize: 12 }}>root@android</Text>
+                      <Text style={{ color: C.textDim, fontFamily: MONO, fontSize: 12 }}>:/ # </Text>
+                      <HighlightedCmd cmd={l.command} />
+                    </View>
+                    {!!l.output && (
+                      <Text style={[s.termOut, l.exit_code !== 0 && { color: C.red }]} selectable>
+                        {l.output}
+                      </Text>
+                    )}
+                    <Text style={s.termMeta}>
+                      <Text style={{ color: l.exit_code === 0 ? C.greenDim : C.red }}>exit={l.exit_code}</Text>
+                      <Text style={{ color: C.textDim }}> · {l.duration_ms}ms · {l.mocked ? "mock" : "real"}</Text>
+                    </Text>
+                  </View>
+                </React.Fragment>
+              );
+            })}
+            {logs.length === 0 && (
+              <Text style={{ color: C.textDim, fontFamily: MONO, fontSize: 12 }}>
+                (no commands yet — go to Quick or type below)
+              </Text>
+            )}
+          </ScrollView>
+
+          <View style={s.cmdRow}>
+            <Text style={{ color: C.prompt, fontFamily: MONO, fontSize: 13 }}># </Text>
+            <TextInput testID="input-custom-cmd" value={customCmd} onChangeText={setCustomCmd}
+              placeholder="su -c …" placeholderTextColor={C.textDim} style={s.cmdInput}
+              onSubmitEditing={() => { if (customCmd.trim()) { execute(customCmd); setCustomCmd(""); } }}
+              autoCapitalize="none" autoCorrect={false} returnKeyType="send" />
+            {running && <ActivityIndicator size="small" color={C.green} style={{ marginRight: 6 }} />}
+            <TouchableOpacity testID="btn-run-custom"
+              style={[s.runBtn, !customCmd.trim() && { opacity: 0.4 }]}
+              disabled={!customCmd.trim() || running}
+              onPress={() => { execute(customCmd); setCustomCmd(""); }}>
+              <Ionicons name="play" size={14} color={C.bg} />
+              <Text style={s.runBtnText}>RUN</Text>
+            </TouchableOpacity>
+          </View>
+        </>
+      )}
     </View>
   );
 
@@ -630,6 +805,37 @@ export default function App() {
   );
 
   const renderSettings = () => (
+    <View style={{ flex: 1 }}>
+      {/* Sub-tab bar — nested navigation inside Settings. We use a small
+          segmented control rather than the bottom tab bar to keep the
+          main bar simple. Profiles + AI Agents previously lived as
+          top-level tabs but the bar was getting overcrowded. */}
+      <View style={s.subTabBar}>
+        {(["general", "profiles", "agents"] as const).map((sub) => {
+          const active = settingsSubTab === sub;
+          const label = sub === "general" ? "general" : sub === "profiles" ? `profiles · ${profiles.length}` : `agents · ${aiProfilesList.length}`;
+          const icon: any = sub === "general" ? "cog" : sub === "profiles" ? "bookmark-multiple" : "robot-outline";
+          return (
+            <TouchableOpacity
+              key={sub}
+              testID={`settings-subtab-${sub}`}
+              onPress={() => setSettingsSubTab(sub)}
+              style={[s.subTab, active && s.subTabActive]}
+            >
+              <MaterialCommunityIcons name={icon} size={14} color={active ? C.green : C.textDim} />
+              <Text style={[s.subTabText, active && { color: C.green }]}>{label}</Text>
+            </TouchableOpacity>
+          );
+        })}
+      </View>
+
+      {settingsSubTab === "profiles" ? renderProfiles()
+        : settingsSubTab === "agents" ? renderAIProfiles()
+        : renderGeneralSettings()}
+    </View>
+  );
+
+  const renderGeneralSettings = () => (
     <ScrollView contentContainerStyle={{ padding: 16, paddingBottom: 32 }}>
       <Text style={s.sectionTitle}>// system</Text>
       <View style={s.kvBlock}>
@@ -806,6 +1012,73 @@ export default function App() {
     </ScrollView>
   );
 
+  // ─── Settings > AI Agents sub-tab ─────────────────────────────────────
+  // Full CRUD for AIProfile docs. Each row shows the agent's icon, name,
+  // command, and a 2-line meta strip with wrap_mode/view_mode/send_newline
+  // badges. Tap a row to edit, swipe-style buttons to delete, top "+ new"
+  // to create from scratch. Editor sheet is rendered at the bottom of the
+  // App tree alongside other overlays.
+  const renderAIProfiles = () => (
+    <ScrollView contentContainerStyle={{ padding: 16, paddingBottom: 32 }}>
+      <View style={s.sectionRow}>
+        <Text style={s.sectionTitle}>// agents ({aiProfilesList.length})</Text>
+        <TouchableOpacity testID="btn-ai-new" onPress={() => openAIEditor(null)} style={s.smallBtn}>
+          <Ionicons name="add" size={14} color={C.aiAccent} />
+          <Text style={[s.smallBtnText, { color: C.aiAccent }]}>new agent</Text>
+        </TouchableOpacity>
+      </View>
+      {aiProfilesList.map((p) => (
+        <View key={p.id} style={s.aiProfileBlock}>
+          <View style={{ flexDirection: "row", alignItems: "flex-start" }}>
+            <Text style={s.aiProfileIcon}>{p.icon || "🤖"}</Text>
+            <View style={{ flex: 1 }}>
+              <Text style={s.aiProfileName}>{p.name}</Text>
+              <Text style={s.aiProfileCmd} numberOfLines={1}>
+                {p.pre_command ? `${p.pre_command} && ` : ""}{p.command}
+              </Text>
+              {!!p.description && <Text style={s.aiProfileDesc} numberOfLines={2}>{p.description}</Text>}
+              <View style={{ flexDirection: "row", flexWrap: "wrap", marginTop: 4 }}>
+                <View style={[s.aiBadge, { borderColor: C.aiAccent }]}>
+                  <Text style={[s.aiBadgeText, { color: C.aiAccent }]}>view={p.view_mode || "xterm"}</Text>
+                </View>
+                <View style={[s.aiBadge, { borderColor: p.wrap_mode === "none" ? C.textDim : C.yellow }]}>
+                  <Text style={[s.aiBadgeText, { color: p.wrap_mode === "none" ? C.textDim : C.yellow }]}>
+                    wrap={p.wrap_mode || "none"}
+                  </Text>
+                </View>
+                {p.send_newline === false && (
+                  <View style={[s.aiBadge, { borderColor: C.magenta }]}>
+                    <Text style={[s.aiBadgeText, { color: C.magenta }]}>no-newline</Text>
+                  </View>
+                )}
+              </View>
+            </View>
+            <View style={{ flexDirection: "row" }}>
+              <TouchableOpacity testID={`btn-ai-edit-${p.id}`} onPress={() => openAIEditor(p)}
+                style={[s.iconBtn, { borderWidth: 1, borderColor: C.aiAccent, marginRight: 6 }]}>
+                <Ionicons name="create-outline" size={14} color={C.aiAccent} />
+              </TouchableOpacity>
+              <TouchableOpacity testID={`btn-ai-del-${p.id}`}
+                onPress={() => deleteAIProfile(p.id, p.name)}
+                style={[s.iconBtn, { borderWidth: 1, borderColor: C.red }]}>
+                <Ionicons name="trash" size={14} color={C.red} />
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      ))}
+      {aiProfilesList.length === 0 && (
+        <Text style={{ color: C.textDim, fontFamily: MONO, padding: 16, textAlign: "center" }}>
+          no agents yet — tap &quot;new agent&quot; to add one
+        </Text>
+      )}
+      <Text style={[s.helper, { marginTop: 16, textAlign: "center" }]}>
+        agents are launched from the AI tab.{"\n"}
+        edit here, run there.
+      </Text>
+    </ScrollView>
+  );
+
   return (
     <SafeAreaView style={s.safe} edges={["top", "bottom"]}>
       <StatusBar style="light" />
@@ -849,17 +1122,25 @@ export default function App() {
               apiBase={API}
             />
           )}
-          {tab === "profiles" && renderProfiles()}
+          {tab === "profiles" && (() => {
+            // Backwards-compat: an older app launch may have persisted
+            // tab="profiles" before we removed it as a top-level tab. Punt
+            // them into Settings > Profiles instead of showing a blank pane.
+            // Use a microtask so we don't update state during render.
+            setTimeout(() => { setSettingsSubTab("profiles"); setTab("settings"); }, 0);
+            return null;
+          })()}
           {tab === "settings" && renderSettings()}
         </View>
 
-        {/* TAB BAR */}
+        {/* TAB BAR — 5 slots fit comfortably on the S10+ in portrait. We
+            nested Profiles + AI Agents under Settings (sub-tabs) so the
+            bottom bar stays uncluttered. */}
         <View style={s.tabbar}>
           <TabBtn t="quick" cur={tab} icon="flash" label="quick" onPress={setTab} />
           <TabBtn t="terminal" cur={tab} icon="console" label="term" badge={logs.length} onPress={setTab} />
           <TabBtn t="live" cur={tab} icon="satellite-uplink" label="live" onPress={setTab} />
           <TabBtn t="ai" cur={tab} icon="robot-outline" label="ai" onPress={setTab} />
-          <TabBtn t="profiles" cur={tab} icon="bookmark-multiple" label="prof" badge={profiles.length} onPress={setTab} />
           <TabBtn t="settings" cur={tab} icon="cog" label="set" onPress={setTab} />
         </View>
 
@@ -892,6 +1173,170 @@ export default function App() {
                 <Ionicons name="save" size={16} color={C.bg} />
                 <Text style={s.bigBtnText}>SAVE</Text>
               </TouchableOpacity>
+            </View>
+          </View>
+        )}
+        {/* AI PROFILE EDITOR SHEET — full-screen overlay for adding/editing
+            an agent. Mirrors the save-profile sheet pattern. */}
+        {aiEditOpen && aiEditing && (
+          <View style={s.overlay}>
+            <View style={s.sheet}>
+              <View style={s.sheetHeader}>
+                <Text style={s.sheetTitle}>
+                  {aiEditing.id ? `// edit ${aiEditing.name || "agent"}` : "// new agent"}
+                </Text>
+                <TouchableOpacity onPress={closeAIEditor} testID="btn-close-ai-edit">
+                  <Ionicons name="close" size={22} color={C.green} />
+                </TouchableOpacity>
+              </View>
+              <ScrollView
+                style={{ maxHeight: 480 }}
+                contentContainerStyle={{ paddingBottom: 8 }}
+                keyboardShouldPersistTaps="handled"
+              >
+                <View style={s.field}>
+                  <Text style={s.fieldLabel}>name *</Text>
+                  <TextInput
+                    testID="input-ai-name"
+                    value={aiEditing.name}
+                    onChangeText={(t) => setAiEditing({ ...aiEditing, name: t })}
+                    style={s.fieldInput}
+                    placeholder="Hermes"
+                    placeholderTextColor={C.textDim}
+                    autoCapitalize="words"
+                    autoCorrect={false}
+                  />
+                </View>
+                <View style={[s.field, { marginTop: 8 }]}>
+                  <Text style={s.fieldLabel}>icon (emoji)</Text>
+                  <TextInput
+                    testID="input-ai-icon"
+                    value={aiEditing.icon || ""}
+                    onChangeText={(t) => setAiEditing({ ...aiEditing, icon: t })}
+                    style={s.fieldInput}
+                    placeholder="🤖"
+                    placeholderTextColor={C.textDim}
+                    maxLength={4}
+                  />
+                </View>
+                <View style={[s.field, { marginTop: 8 }]}>
+                  <Text style={s.fieldLabel}>launcher command *</Text>
+                  <TextInput
+                    testID="input-ai-command"
+                    value={aiEditing.command}
+                    onChangeText={(t) => setAiEditing({ ...aiEditing, command: t })}
+                    style={s.fieldInput}
+                    placeholder="hermes --cli"
+                    placeholderTextColor={C.textDim}
+                    autoCapitalize="none"
+                    autoCorrect={false}
+                  />
+                </View>
+                <View style={[s.field, { marginTop: 8 }]}>
+                  <Text style={s.fieldLabel}>description</Text>
+                  <TextInput
+                    testID="input-ai-desc"
+                    value={aiEditing.description || ""}
+                    onChangeText={(t) => setAiEditing({ ...aiEditing, description: t })}
+                    style={s.fieldInput}
+                    placeholder="optional"
+                    placeholderTextColor={C.textDim}
+                  />
+                </View>
+                <View style={[s.field, { marginTop: 8 }]}>
+                  <Text style={s.fieldLabel}>pre-command (run before launcher, joined with &amp;&amp;)</Text>
+                  <TextInput
+                    testID="input-ai-precmd"
+                    value={aiEditing.pre_command || ""}
+                    onChangeText={(t) => setAiEditing({ ...aiEditing, pre_command: t })}
+                    style={s.fieldInput}
+                    placeholder="source ~/.hermes/.env && cd ~/.hermes"
+                    placeholderTextColor={C.textDim}
+                    autoCapitalize="none"
+                    autoCorrect={false}
+                  />
+                </View>
+
+                {/* wrap_mode segmented */}
+                <Text style={[s.fieldLabel, { marginTop: 14 }]}>shell wrap</Text>
+                <View style={[s.segGroup, { marginTop: 4 }]}>
+                  {(["none", "pty", "unbuffered"] as const).map((m) => {
+                    const active = (aiEditing.wrap_mode || "none") === m;
+                    const color = m === "none" ? C.textDim : m === "pty" ? C.yellow : C.cyan;
+                    return (
+                      <TouchableOpacity
+                        key={m}
+                        testID={`btn-ai-wrap-${m}`}
+                        onPress={() => setAiEditing({ ...aiEditing, wrap_mode: m })}
+                        style={[s.segBtn, active && { backgroundColor: color, borderColor: color }]}
+                      >
+                        <Text style={[s.segBtnText, { color: active ? C.bg : color }]}>{m}</Text>
+                      </TouchableOpacity>
+                    );
+                  })}
+                </View>
+
+                {/* view_mode segmented */}
+                <Text style={[s.fieldLabel, { marginTop: 14 }]}>render mode</Text>
+                <View style={[s.segGroup, { marginTop: 4 }]}>
+                  {(["xterm", "scrollback"] as const).map((m) => {
+                    const active = (aiEditing.view_mode || "xterm") === m;
+                    const color = m === "xterm" ? C.aiAccent : C.textDim;
+                    return (
+                      <TouchableOpacity
+                        key={m}
+                        testID={`btn-ai-view-${m}`}
+                        onPress={() => setAiEditing({ ...aiEditing, view_mode: m })}
+                        style={[s.segBtn, active && { backgroundColor: color, borderColor: color }]}
+                      >
+                        <Text style={[s.segBtnText, { color: active ? C.bg : color }]}>
+                          {m === "xterm" ? "TUI (xterm.js)" : "scrollback"}
+                        </Text>
+                      </TouchableOpacity>
+                    );
+                  })}
+                </View>
+
+                {/* send_newline toggle */}
+                <TouchableOpacity
+                  testID="btn-ai-newline"
+                  onPress={() => setAiEditing({ ...aiEditing, send_newline: aiEditing.send_newline === false })}
+                  style={[s.row, { marginTop: 14, borderColor: (aiEditing.send_newline === false) ? C.magenta : C.greenDim }]}
+                >
+                  <MaterialCommunityIcons
+                    name={(aiEditing.send_newline === false) ? "keyboard-off-outline" : "keyboard-return"}
+                    size={16}
+                    color={(aiEditing.send_newline === false) ? C.magenta : C.green}
+                  />
+                  <Text style={[s.rowText, { color: (aiEditing.send_newline === false) ? C.magenta : C.green }]}>
+                    append newline on send: {(aiEditing.send_newline === false) ? "OFF" : "ON"}
+                  </Text>
+                </TouchableOpacity>
+                <Text style={s.helper}>
+                  most agents need newline = ON. turn OFF for raw-byte agents (rare).
+                </Text>
+              </ScrollView>
+
+              <View style={{ flexDirection: "row", marginTop: 14, gap: 8 }}>
+                <TouchableOpacity
+                  onPress={closeAIEditor}
+                  style={[s.bigBtn, { flex: 1, backgroundColor: "transparent", borderWidth: 1, borderColor: C.textDim }]}
+                  disabled={aiSaving}
+                >
+                  <Text style={[s.bigBtnText, { color: C.textDim }]}>CANCEL</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  testID="btn-ai-save"
+                  onPress={saveAIProfile}
+                  style={[s.bigBtn, { flex: 2 }, aiSaving && { opacity: 0.5 }]}
+                  disabled={aiSaving}
+                >
+                  {aiSaving
+                    ? <ActivityIndicator size="small" color={C.bg} />
+                    : <Ionicons name="save" size={16} color={C.bg} />}
+                  <Text style={s.bigBtnText}>{aiEditing.id ? "SAVE CHANGES" : "CREATE"}</Text>
+                </TouchableOpacity>
+              </View>
             </View>
           </View>
         )}
@@ -1001,6 +1446,41 @@ const s = StyleSheet.create({
     alignItems: "center", justifyContent: "center",
   },
   tabBadgeText: { color: C.bg, fontFamily: MONO, fontSize: 8, fontWeight: "800" },
+
+  // ─── Settings sub-tab bar ──────────────────────────────────────────────
+  // Sits right under the screen header at the top of the Settings tab.
+  // Cosmetically a row of pill-shaped buttons; the active one gets a
+  // green underline + brightened text so it reads similar to the bottom
+  // tab bar's active-state idiom.
+  subTabBar: {
+    flexDirection: "row",
+    backgroundColor: C.panel,
+    borderBottomWidth: 1, borderBottomColor: C.border,
+    paddingHorizontal: 8, paddingTop: 8, paddingBottom: 4,
+    gap: 6,
+  },
+  subTab: {
+    flex: 1, flexDirection: "row", alignItems: "center", justifyContent: "center",
+    paddingVertical: 8, paddingHorizontal: 8, gap: 6,
+    borderRadius: 4, borderWidth: 1, borderColor: C.border, backgroundColor: C.panel2,
+  },
+  subTabActive: { borderColor: C.green, backgroundColor: "#0a2010" },
+  subTabText: { fontFamily: MONO, fontSize: 11, color: C.textDim, letterSpacing: 0.5 },
+
+  // ─── AI agent rows (Settings > Agents sub-tab) ─────────────────────────
+  aiProfileBlock: {
+    backgroundColor: C.panel, borderWidth: 1, borderColor: C.border,
+    borderRadius: 4, padding: 12, marginBottom: 8,
+  },
+  aiProfileIcon: { fontSize: 22, marginRight: 10, marginTop: 2 },
+  aiProfileName: { color: C.text, fontFamily: MONO, fontSize: 14, fontWeight: "700" },
+  aiProfileCmd: { color: C.aiAccent, fontFamily: MONO, fontSize: 11, marginTop: 2 },
+  aiProfileDesc: { color: C.textDim, fontFamily: MONO, fontSize: 11, marginTop: 4 },
+  aiBadge: {
+    paddingHorizontal: 6, paddingVertical: 2,
+    borderWidth: 1, borderRadius: 3, marginRight: 4, marginTop: 2,
+  },
+  aiBadgeText: { fontFamily: MONO, fontSize: 9, letterSpacing: 0.5 },
 
   kvBlock: { backgroundColor: C.panel, borderWidth: 1, borderColor: C.border, borderRadius: 4, padding: 10 },
 
