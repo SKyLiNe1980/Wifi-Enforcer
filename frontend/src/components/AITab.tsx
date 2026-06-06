@@ -5,7 +5,8 @@ import {
 } from "react-native";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { sessionManager, SessionState } from "../lib/sessionManager";
-import { hasNativeStreaming, HAS_NATIVE_ROOT } from "../lib/rootShell";
+import { hasNativeStreaming, HAS_NATIVE_ROOT, writeStdin } from "../lib/rootShell";
+import XTermView from "./XTermView";
 
 // ─── Palette: keep unified with LiveTab / Settings / Terminal ─────────────
 const C = {
@@ -30,6 +31,16 @@ export type AIProfile = {
   send_initial: string | null;
   pre_command: string | null;
   icon: string;
+  /**
+   * How the AI tab should render this profile's session output.
+   *   - "xterm":      true TUI emulator (xterm.js in a WebView). Honors ANSI
+   *                   escapes, Rich/Textual widgets, readline editing.
+   *                   The default — Hermes & friends are TUIs.
+   *   - "scrollback": flat ANSI-stripped FlatList — lighter, simpler, good
+   *                   for non-TUI agents that only emit plain text.
+   * Older profiles in Mongo may not have this field; we default to "xterm".
+   */
+  view_mode?: "xterm" | "scrollback";
   created_at: string;
 };
 
@@ -68,6 +79,40 @@ function applyAIWrap(mode: AIProfile["wrap_mode"]): string {
     return `unbuffer ${loginShell}`;
   }
   return loginShell;
+}
+
+/**
+ * Strip ANSI escape sequences from a single line of streamed output. Hermes
+ * (and basically every modern Python CLI agent using Rich / prompt-toolkit /
+ * blessed / textual) emits cursor-positioning + color codes even in --cli
+ * "plain" mode, because the prompt input loop still uses readline-style
+ * editing. Our flat scrollback view can't honor cursor positioning, so we
+ * just rip the escapes out and render the leftover text.
+ *
+ * Covers:
+ *   - CSI sequences:   ESC [ params final-letter   (most common — colors, cursor)
+ *   - OSC sequences:   ESC ] ... BEL / ESC \\      (window title, hyperlinks)
+ *   - Lone \r without \n:  redraw-current-line — we drop the prefix
+ *   - ESC standalone or with single-char following  (less common)
+ */
+function cleanAnsi(line: string): string {
+  if (!line) return line;
+  let out = line
+    // CSI:  ESC [ ... final
+    .replace(/\x1b\[[\d;?]*[A-Za-z]/g, "")
+    // OSC:  ESC ] ... (BEL | ESC \)
+    .replace(/\x1b\][^\x07\x1b]*(\x07|\x1b\\)/g, "")
+    // Two-char ESC sequences: ESC followed by =, >, (, ), 7, 8 etc.
+    .replace(/\x1b[=>78\(\)][0-9A-Za-z]?/g, "")
+    // Any remaining bare ESC
+    .replace(/\x1b/g, "");
+  // Lone carriage returns: keep only what's after the last \r on the line,
+  // since that's what the terminal would display after the "redraw"
+  if (out.indexOf("\r") !== -1) {
+    const parts = out.split("\r");
+    out = parts[parts.length - 1];
+  }
+  return out;
 }
 
 // ─── Module-level state that survives tab unmounts ───────────────────────
@@ -173,6 +218,10 @@ export default function AITab(props: Props) {
     [profiles, selectedId],
   );
 
+  // Default to "xterm" when a profile from Mongo predates the view_mode field.
+  const viewMode: "xterm" | "scrollback" =
+    (selectedProfile?.view_mode as any) || "xterm";
+
   const isRunning = activeSession && (activeSession.status === "running" || activeSession.status === "starting");
   const canStart = !!selectedProfile && !isRunning;
   const canStop = !!activeSession && isRunning;
@@ -265,10 +314,15 @@ export default function AITab(props: Props) {
     const textToSend = inputText;
     setInputText("");
     try {
+      // In xterm mode the shell's own line discipline echoes the input back
+      // through stdout — xterm will render it. Adding a local "▸ " line on
+      // top of that would print every message twice. So we skip the echo.
+      const echo = (profile?.view_mode ?? "xterm") !== "xterm";
       await sessionManager.sendInput(
         activeSessionId,
         textToSend,
         profile?.send_newline ?? true,
+        echo,
       );
       // Log user input (fire-and-forget)
       fetch(`${props.apiBase}/ai-logs`, {
@@ -286,6 +340,40 @@ export default function AITab(props: Props) {
       setSending(false);
     }
   }, [activeSessionId, inputText, selectedProfile, props.apiBase]);
+
+  // ─── XTerm keystroke forwarder ──────────────────────────────────────────
+  // The xterm WebView emits raw bytes (already correctly encoded escape
+  // sequences for arrows / ctrl-c / fn-keys). Send them straight to the
+  // session's stdin with `appendNewline=false` — xterm itself emits "\r"
+  // on Enter, so we'd double-newline otherwise.
+  const handleXTermInput = useCallback(
+    (data: string) => {
+      if (!activeSessionId) return;
+      writeStdin(activeSessionId, data, false).catch(() => {});
+    },
+    [activeSessionId],
+  );
+
+  // ─── Toggle view_mode for the currently-selected profile ────────────────
+  // PATCHes Mongo and optimistically updates the local profiles list so the
+  // UI flips immediately. We re-key the XTermView (via the session id) so
+  // it remounts cleanly when the user switches mid-session.
+  const handleToggleViewMode = useCallback(async () => {
+    if (!selectedProfile) return;
+    const next: "xterm" | "scrollback" = viewMode === "xterm" ? "scrollback" : "xterm";
+    // Optimistic local update
+    setProfiles((prev) => prev.map((p) => (p.id === selectedProfile.id ? { ...p, view_mode: next } : p)));
+    try {
+      await fetch(`${props.apiBase}/ai-profiles/${selectedProfile.id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ view_mode: next }),
+      });
+    } catch {
+      // On failure, refetch to reconcile.
+      fetchProfiles();
+    }
+  }, [selectedProfile, viewMode, props.apiBase, fetchProfiles]);
 
   // ─── Clear current session output (local only) ───────────────────────────
   const handleClear = useCallback(() => {
@@ -349,6 +437,7 @@ export default function AITab(props: Props) {
             {selectedProfile.wrap_mode !== "none" && (
               <Text style={{ color: C.yellow }}>  · wrap={selectedProfile.wrap_mode}</Text>
             )}
+            <Text style={{ color: C.cyan }}>  · view={viewMode}</Text>
             {selectedProfile.description ? (
               <Text style={{ color: C.textDim }}>  · {selectedProfile.description}</Text>
             ) : null}
@@ -379,6 +468,30 @@ export default function AITab(props: Props) {
           <Text style={s.miniBtnText}>clear</Text>
         </TouchableOpacity>
 
+        {/* view-mode toggle: TUI (xterm.js) ↔ SCRL (flat ANSI-stripped list).
+            Disabled while no profile is selected; enabled even mid-session so
+            users can flip on the fly if a TUI agent is misbehaving. The
+            XTermView remounts (via key={sessionId+viewMode}) on flip and
+            replays the session ring buffer into the fresh terminal. */}
+        <TouchableOpacity
+          onPress={handleToggleViewMode}
+          disabled={!selectedProfile}
+          style={[
+            s.miniBtn,
+            viewMode === "xterm" && { borderColor: C.aiAccent, backgroundColor: "#1a1428" },
+            !selectedProfile && { opacity: 0.4 },
+          ]}
+        >
+          <MaterialCommunityIcons
+            name={viewMode === "xterm" ? "console-line" : "format-list-text"}
+            size={16}
+            color={viewMode === "xterm" ? C.aiAccent : C.textDim}
+          />
+          <Text style={[s.miniBtnText, viewMode === "xterm" && { color: C.aiAccent }]}>
+            {viewMode === "xterm" ? "tui" : "scrl"}
+          </Text>
+        </TouchableOpacity>
+
         {activeSession && (
           <View style={s.statusPill}>
             <Text style={[s.statusText, {
@@ -395,8 +508,22 @@ export default function AITab(props: Props) {
         )}
       </View>
 
-      {/* Transcript pane */}
-      {lines.length === 0 ? (
+      {/* Transcript pane — xterm.js for TUI mode, FlatList for scrollback */}
+      {viewMode === "xterm" ? (
+        // key includes both session id + mode so flipping the toggle (or
+        // switching session) cleanly remounts the WebView and replays the
+        // ring buffer into a fresh xterm. Without the key, swapping a
+        // running session into a stale terminal would interleave old +
+        // new bytes.
+        <View style={s.transcript}>
+          <XTermView
+            key={`${activeSessionId || "idle"}-${viewMode}`}
+            sessionId={activeSessionId}
+            onInput={handleXTermInput}
+            resetToken={activeSessionId || ""}
+          />
+        </View>
+      ) : lines.length === 0 ? (
         <ScrollView
           style={s.transcript}
           contentContainerStyle={{ padding: 8 }}
@@ -423,7 +550,8 @@ export default function AITab(props: Props) {
           extraData={activeSession?.lineCount}
           keyExtractor={(l, i) => `${l.line_no}-${i}`}
           renderItem={({ item: l }) => {
-            const isUserEcho = l.line.startsWith("▸ ");
+            const cleaned = cleanAnsi(l.line);
+            const isUserEcho = cleaned.startsWith("▸ ");
             const isStderr = l.stream === "stderr";
             return (
               <Text
@@ -434,7 +562,7 @@ export default function AITab(props: Props) {
                 ]}
                 selectable
               >
-                {l.line}
+                {cleaned}
               </Text>
             );
           }}
@@ -443,6 +571,13 @@ export default function AITab(props: Props) {
             const { contentOffset, contentSize, layoutMeasurement } = e.nativeEvent;
             const distance = contentSize.height - (contentOffset.y + layoutMeasurement.height);
             if (distance < 40) autoScrollRef.current = true;
+          }}
+          // Auto-scroll on new content: fires AFTER FlatList has measured the
+          // new items, unlike a useEffect on lineCount which races layout.
+          onContentSizeChange={() => {
+            if (autoScrollRef.current) {
+              scrollRef.current?.scrollToEnd({ animated: false });
+            }
           }}
           // Same virtualization tuning as LiveTab — keep dmesg-style bursts
           // from rendering thousands of <Text> simultaneously on the UI

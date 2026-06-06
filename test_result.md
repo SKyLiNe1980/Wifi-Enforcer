@@ -341,3 +341,150 @@ agent_communication:
       
       Status: BACKLOG — not blocking current work. Resume after streaming +
       PCAP-over-IP + airodump CSV parser + boot-time auto-apply phases.
+
+
+========================================================================
+2026-06-06 — AI TAB TUI VIA xterm.js (Phase 2 of AI Tab Finalization)
+========================================================================
+
+Implemented true terminal emulation for the AI tab, replacing the
+ANSI-stripping workaround with a real xterm.js terminal inside a
+react-native-webview. Hermes / CAI-Framework / pentestagent / etc. emit
+Rich + Textual + prompt-toolkit escape sequences (cursor positioning,
+hyperlinks, 256-color, alternate screen) — flat <Text> scrollback can't
+render any of that. xterm.js handles all of it natively.
+
+backend:
+  - task: "AIProfile.view_mode field + validation"
+    implemented: true
+    working: true
+    file: "backend/server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        - working: true
+          agent: "main"
+          comment: |
+            Added view_mode str field to AIProfile / AIProfileCreate /
+            AIProfileUpdate Pydantic models. Validates against VIEW_MODES =
+            {"xterm", "scrollback"}; defaults to "xterm" for new profiles
+            AND for existing Mongo docs that predate the field (Pydantic
+            applies default on read). Verified end-to-end with curl:
+              - GET /api/ai-profiles → returns view_mode=xterm for seeded profiles
+              - PUT /api/ai-profiles/{id} with {"view_mode":"scrollback"} → 200, persists
+              - PUT with {"view_mode":"bogus"} → 400 with correct error message
+
+frontend:
+  - task: "XTermView WebView component"
+    implemented: true
+    working: "needs-eas-build"
+    file: "frontend/src/components/XTermView.tsx"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        - working: "needs-eas-build"
+          agent: "main"
+          comment: |
+            Created XTermView component: react-native-webview hosting
+            xterm.js@5.5.0 + addon-fit@0.10.0 from jsDelivr. Theme matches
+            Enforcer's Kali green-on-black palette. Bidirectional bridge:
+              - RN→Web: injectJavaScript('window.termWrite(<json>)') with
+                fresh line batches from sessionManager subscription, joined
+                with \r\n. Replays existing ring buffer on mount.
+              - Web→RN: term.onData → postMessage → writeStdin(sessionId,
+                data, appendNewline=false) — xterm encodes Enter as \r,
+                we don't want to double-newline.
+            Pending writes are queued until the WebView signals 'ready'.
+            CDN failure surfaces a 'load_error' message; we log to console
+            (future: surface in RN UI). Works only in a real APK — RN
+            WebView is unsupported on web preview, which is fine since
+            the native RootShell module is also unavailable there.
+  - task: "AITab xterm/scrollback toggle + integration"
+    implemented: true
+    working: "needs-eas-build"
+    file: "frontend/src/components/AITab.tsx"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        - working: "needs-eas-build"
+          agent: "main"
+          comment: |
+            • Added 'tui'/'scrl' toggle button in the control bar (purple
+              when xterm). Toggling PUTs view_mode to backend + updates
+              local profiles list optimistically.
+            • Description row now displays 'view=xterm|scrollback'.
+            • Transcript pane branches: xterm renders <XTermView>, scrollback
+              renders the existing FlatList. XTermView is keyed by
+              `${sessionId}-${viewMode}` so flipping the toggle mid-session
+              cleanly remounts the WebView and replays the ring buffer.
+            • Scrollback path now actually applies cleanAnsi() (was dead
+              code before — explains the earlier garbled output in scrl mode).
+            • sessionManager.sendInput() gained an `echo` param. AITab passes
+              echo=false in xterm mode (the shell's line discipline echoes
+              naturally; the "▸ " local echo would cause duplicates).
+            • XTerm keystrokes route to writeStdin directly with
+              appendNewline=false; xterm sends "\r" on Enter already.
+
+  - task: "AITab scrollback ANSI rendering (existing bug fix)"
+    implemented: true
+    working: true
+    file: "frontend/src/components/AITab.tsx"
+    stuck_count: 0
+    priority: "low"
+    needs_retesting: false
+    status_history:
+        - working: true
+          agent: "main"
+          comment: |
+            renderItem now calls cleanAnsi() before rendering — previously
+            defined but never invoked. Scrollback mode is now usable as a
+            fallback for non-TUI agents.
+
+test_plan:
+  current_focus:
+    - "User EAS-builds the APK and validates xterm.js renders Hermes/CAI TUIs correctly"
+    - "User confirms toggle round-trip (xterm → scrollback → xterm) keeps profile state"
+  stuck_tasks: []
+  test_all: false
+  test_priority: "user_device_validation"
+
+agent_communication:
+    - agent: "main"
+      message: |
+        AI Tab xterm.js TUI implementation complete. Architecture summary
+        for the next agent / fork:
+
+        DATA FLOW (xterm mode):
+          native RootShell stdout/stderr stream
+            → SessionManager (ring buffer + backend flush)
+            → AITab subscribes via sessionManager.subscribe
+            → XTermView subscribes too, diffs by lastLineNoRef
+            → injectJavaScript('window.termWrite(<lines joined with \r\n>)')
+            → xterm.js renders ANSI escapes, cursor moves, colors, etc.
+
+        DATA FLOW (xterm keystrokes):
+          xterm.onData('q' / '\x1b[A' / '\r' / 'Ctrl-C \x03')
+            → postMessage → AITab.handleXTermInput
+            → writeStdin(sessionId, data, appendNewline=false)
+            → native fwrite() → agent's stdin
+
+        TOGGLE PERSISTENCE: view_mode is stored per-AIProfile in Mongo.
+        Switching at runtime PUTs to /api/ai-profiles/{id}; on next app
+        launch the preference comes back via GET /api/ai-profiles.
+
+        TESTING: Cannot validate xterm rendering in Expo Go or web preview
+        (react-native-webview is android/ios-only AND the native RootShell
+        module isn't available off-device). User must EAS-build a preview
+        APK and run on the Galaxy S10+. Verified via curl that backend
+        view_mode persists + validates correctly; verified via screenshot
+        that the toggle UI flips between modes and the description badge
+        updates.
+
+        WHAT'S NEXT (per user's session plan):
+          - Persistent shell for Terminal Tab (reuse xterm + writeStdin)
+          - Chroot wrap echo spam suppression
+          - Settings sub-tabs restructure
+          - Wifite2 PMKID one-tap profile

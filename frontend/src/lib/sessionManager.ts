@@ -262,12 +262,17 @@ class SessionManager {
    * the session's own line buffer (as a "stdout" record prefixed with "▸ ")
    * so the conversation reads top-to-bottom as a transcript. Returns the
    * number of bytes the native side wrote, or 0 on failure / non-native.
+   *
+   * When `echo` is false we skip the local "▸ " transcript line — used by
+   * the xterm.js view mode where the shell itself echoes input back via
+   * stdout, and a duplicated local echo would print every keystroke twice.
    */
-  async sendInput(id: string, text: string, appendNewline: boolean = true): Promise<number> {
+  async sendInput(id: string, text: string, appendNewline: boolean = true, echo: boolean = true): Promise<number> {
     const s = this.sessions.get(id);
     if (!s) return 0;
     if (s.status !== "running" && s.status !== "starting") return 0;
     const written = await writeStdin(id, text, appendNewline);
+    if (!echo) return written;
     // Echo locally so the UI shows what the user typed, even if the agent
     // doesn't echo it back itself. The leading "▸ " marker lets the
     // renderer style user-input differently from agent output.

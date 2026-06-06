@@ -573,6 +573,13 @@ async def sessions_history(limit: int = 50):
 # wifi command terminal scrollback.
 
 WRAP_MODES = {"none", "pty", "unbuffered"}
+# How the AI tab should render the session's stdout:
+#   - "xterm":      true TUI emulator (xterm.js in a WebView) — honors ANSI
+#                   escape codes, cursor positioning, Rich/Textual widgets,
+#                   readline editing, the works. Default for new profiles.
+#   - "scrollback": flat line-by-line FlatList with ANSI codes stripped —
+#                   simpler, lighter, good for non-TUI agents.
+VIEW_MODES = {"xterm", "scrollback"}
 
 
 class AIProfile(BaseModel):
@@ -589,6 +596,11 @@ class AIProfile(BaseModel):
     # Example: "source /root/.hermes/.env && cd /root/.hermes"
     pre_command: Optional[str] = None
     icon: str = "🤖"
+    # Rendering mode for the agent's stdout in the AI tab (see VIEW_MODES).
+    # Defaults to "xterm" so Hermes/CAI/etc. TUIs render correctly out of
+    # the box; users can switch a profile back to "scrollback" if they want
+    # the older flat log view.
+    view_mode: str = "xterm"
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
@@ -601,6 +613,7 @@ class AIProfileCreate(BaseModel):
     send_initial: Optional[str] = None
     pre_command: Optional[str] = None
     icon: str = "🤖"
+    view_mode: str = "xterm"
 
 
 class AIProfileUpdate(BaseModel):
@@ -612,6 +625,7 @@ class AIProfileUpdate(BaseModel):
     send_initial: Optional[str] = None
     pre_command: Optional[str] = None
     icon: Optional[str] = None
+    view_mode: Optional[str] = None
 
 
 class AILogEntry(BaseModel):
@@ -656,6 +670,8 @@ async def get_ai_profiles():
 async def create_ai_profile(p: AIProfileCreate):
     if p.wrap_mode not in WRAP_MODES:
         raise HTTPException(status_code=400, detail=f"wrap_mode must be one of {sorted(WRAP_MODES)}")
+    if p.view_mode not in VIEW_MODES:
+        raise HTTPException(status_code=400, detail=f"view_mode must be one of {sorted(VIEW_MODES)}")
     if not p.name.strip() or not p.command.strip():
         raise HTTPException(status_code=400, detail="name and command are required")
     prof = AIProfile(**p.dict())
@@ -671,6 +687,8 @@ async def update_ai_profile(profile_id: str, p: AIProfileUpdate):
     patch = {k: v for k, v in p.dict().items() if v is not None}
     if "wrap_mode" in patch and patch["wrap_mode"] not in WRAP_MODES:
         raise HTTPException(status_code=400, detail=f"wrap_mode must be one of {sorted(WRAP_MODES)}")
+    if "view_mode" in patch and patch["view_mode"] not in VIEW_MODES:
+        raise HTTPException(status_code=400, detail=f"view_mode must be one of {sorted(VIEW_MODES)}")
     if patch:
         await db.ai_profiles.update_one({"id": profile_id}, {"$set": patch})
     merged = {**existing, **patch}
