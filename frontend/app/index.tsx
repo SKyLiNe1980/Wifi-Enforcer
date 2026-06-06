@@ -1238,9 +1238,12 @@ export default function App() {
                     testID="input-ai-desc"
                     value={aiEditing.description || ""}
                     onChangeText={(t) => setAiEditing({ ...aiEditing, description: t })}
-                    style={s.fieldInput}
+                    style={[s.fieldInput, { minHeight: 56, textAlignVertical: "top", paddingTop: 8 }]}
                     placeholder="optional"
                     placeholderTextColor={C.textDim}
+                    multiline
+                    numberOfLines={2}
+                    scrollEnabled
                   />
                 </View>
                 <View style={[s.field, { marginTop: 8 }]}>
