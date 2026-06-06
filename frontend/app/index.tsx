@@ -1249,11 +1249,14 @@ export default function App() {
                     testID="input-ai-precmd"
                     value={aiEditing.pre_command || ""}
                     onChangeText={(t) => setAiEditing({ ...aiEditing, pre_command: t })}
-                    style={s.fieldInput}
+                    style={[s.fieldInput, { minHeight: 70, textAlignVertical: "top", paddingTop: 8 }]}
                     placeholder="source ~/.hermes/.env && cd ~/.hermes"
                     placeholderTextColor={C.textDim}
                     autoCapitalize="none"
                     autoCorrect={false}
+                    multiline
+                    numberOfLines={3}
+                    scrollEnabled
                   />
                 </View>
 
