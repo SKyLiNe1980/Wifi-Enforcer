@@ -1061,7 +1061,13 @@ export default function App() {
         </View>
       )}
 
-      <Text style={[s.sectionTitle, { marginTop: 24 }]}>// pcap endpoints ({pcapEndpointsList.length})</Text>
+      <View style={s.sectionRow}>
+        <Text style={s.sectionTitle}>// pcap endpoints ({pcapEndpointsList.length})</Text>
+        <TouchableOpacity testID="btn-pcap-new" onPress={() => openPcapEditor(null)} style={s.smallBtn}>
+          <Ionicons name="add" size={14} color={C.magenta} />
+          <Text style={[s.smallBtnText, { color: C.magenta }]}>add endpoint</Text>
+        </TouchableOpacity>
+      </View>
       <Text style={s.helper}>
         remote receivers for PCAP-over-IP streams. start a listener on the target:{"\n"}
         <Text style={{ color: C.cyan }}>nc -l -p 19000 | wireshark -k -i -</Text>{"\n"}
@@ -1092,11 +1098,6 @@ export default function App() {
           </View>
         </View>
       ))}
-      <TouchableOpacity testID="btn-pcap-new" onPress={() => openPcapEditor(null)}
-        style={[s.smallBtn, { alignSelf: "flex-start", marginTop: 8 }]}>
-        <Ionicons name="add" size={14} color={C.magenta} />
-        <Text style={[s.smallBtnText, { color: C.magenta }]}>add endpoint</Text>
-      </TouchableOpacity>
 
       <Text style={[s.sectionTitle, { marginTop: 24 }]}>// data</Text>
       <TouchableOpacity testID="btn-export" onPress={() => setExportOpen((v) => !v)} style={s.row}>
