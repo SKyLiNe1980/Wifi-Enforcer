@@ -372,6 +372,8 @@ async def seed():
         logger.info("Seeded %d new default profiles", inserted)
     # AI launcher profiles — Hermes + the rest of the agent zoo
     await _seed_ai_profiles_if_empty()
+    # Attack profiles for the Live tab cockpit (replaces hardcoded JS PRESETS)
+    await _seed_attack_profiles_if_empty()
 
 
 # ---------- Settings (key/value app preferences) ----------
@@ -780,6 +782,312 @@ async def _seed_ai_profiles_if_empty():
     for p in seeds:
         await db.ai_profiles.insert_one(p.dict())
     logger.info("seeded %d AI profiles", len(seeds))
+
+
+# ============================================================================
+# Attack Profiles + PCAP Endpoints (Live tab cockpit)
+# ============================================================================
+# Why a separate collection from `profiles` (the wifi enforcement ones)?
+#   1. UX clarity — offensive ops shouldn't visually mix with "set country
+#      to US" / "bring iface up" defensive setups.
+#   2. Different lifecycle — attack profiles are launched as STREAMING
+#      sessions (live tab), while wifi profiles run as one-shot batches.
+#   3. Reserved space for future EUEF (Enforcer Unified Exploit Framework)
+#      to share the same schema for its exploit launchers — `category` will
+#      then expand to include "exploit-local" / "exploit-remote" / "post".
+#
+# `command_template` uses {iface}, {host}, {port}, {file} placeholders that
+# the frontend substitutes at launch time based on the user's active iface
+# + selected PCAP endpoint + auto-generated capture path.
+# ============================================================================
+
+# Categories surface in the UI as filter tabs. Order is important — the UI
+# renders chips in this order so wifi recon sits before destructive attacks.
+ATTACK_CATEGORIES = ["recon", "attack", "trace", "pcap"]
+ATTACK_VIEW_MODES = {"xterm", "scrollback"}
+
+
+class AttackProfile(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    name: str
+    description: str = ""
+    icon: str = "rocket-launch"           # MaterialCommunityIcons name (NOT emoji)
+    category: str = "recon"               # see ATTACK_CATEGORIES
+    # Shell command with {iface}, {host}, {port}, {file} placeholders that
+    # the FE substitutes at launch. Joined to the active wrap (chroot / pty)
+    # by the existing sessionManager — we don't wrap here.
+    command_template: str
+    needs_iface: bool = True
+    needs_endpoint: bool = False          # if True, FE forces an endpoint pick before launch
+    needs_file: bool = False              # if True, FE generates a /sdcard/cap_<ts> path
+    # Per-profile rendering — wifite/airodump need TUI, dmesg/iw don't.
+    view_mode: str = "scrollback"
+    # Built-in seed profiles are flagged so the UI hides the delete button.
+    # User-created additions / clones default to false.
+    builtin: bool = False
+    sort_order: int = 0
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class AttackProfileCreate(BaseModel):
+    name: str
+    description: str = ""
+    icon: str = "rocket-launch"
+    category: str = "recon"
+    command_template: str
+    needs_iface: bool = True
+    needs_endpoint: bool = False
+    needs_file: bool = False
+    view_mode: str = "scrollback"
+    sort_order: int = 0
+
+
+class AttackProfileUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    icon: Optional[str] = None
+    category: Optional[str] = None
+    command_template: Optional[str] = None
+    needs_iface: Optional[bool] = None
+    needs_endpoint: Optional[bool] = None
+    needs_file: Optional[bool] = None
+    view_mode: Optional[str] = None
+    sort_order: Optional[int] = None
+
+
+class PcapEndpoint(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    name: str                              # human label, e.g. "Wireshark LAN"
+    host: str                              # IP or hostname
+    port: int                              # default 19000 for PCAP-over-IP convention
+    transport: str = "tcp"                 # "tcp" | "udp" — tcp for nc-based stream
+    notes: str = ""
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class PcapEndpointCreate(BaseModel):
+    name: str
+    host: str
+    port: int = 19000
+    transport: str = "tcp"
+    notes: str = ""
+
+
+class PcapEndpointUpdate(BaseModel):
+    name: Optional[str] = None
+    host: Optional[str] = None
+    port: Optional[int] = None
+    transport: Optional[str] = None
+    notes: Optional[str] = None
+
+
+# ---------- Attack profile endpoints ----------
+@api_router.get("/attack-profiles", response_model=List[AttackProfile])
+async def list_attack_profiles():
+    cur = db.attack_profiles.find({}, {"_id": 0}).sort([("sort_order", 1), ("name", 1)])
+    return [AttackProfile(**doc) async for doc in cur]
+
+
+@api_router.post("/attack-profiles", response_model=AttackProfile)
+async def create_attack_profile(p: AttackProfileCreate):
+    if p.category not in ATTACK_CATEGORIES:
+        raise HTTPException(400, f"category must be one of {ATTACK_CATEGORIES}")
+    if p.view_mode not in ATTACK_VIEW_MODES:
+        raise HTTPException(400, f"view_mode must be one of {sorted(ATTACK_VIEW_MODES)}")
+    if not p.name.strip() or not p.command_template.strip():
+        raise HTTPException(400, "name and command_template are required")
+    prof = AttackProfile(**p.dict(), builtin=False)
+    await db.attack_profiles.insert_one(prof.dict())
+    return prof
+
+
+@api_router.put("/attack-profiles/{pid}", response_model=AttackProfile)
+async def update_attack_profile(pid: str, p: AttackProfileUpdate):
+    existing = await db.attack_profiles.find_one({"id": pid}, {"_id": 0})
+    if not existing:
+        raise HTTPException(404, "profile not found")
+    patch = {k: v for k, v in p.dict().items() if v is not None}
+    if "category" in patch and patch["category"] not in ATTACK_CATEGORIES:
+        raise HTTPException(400, f"category must be one of {ATTACK_CATEGORIES}")
+    if "view_mode" in patch and patch["view_mode"] not in ATTACK_VIEW_MODES:
+        raise HTTPException(400, f"view_mode must be one of {sorted(ATTACK_VIEW_MODES)}")
+    if patch:
+        await db.attack_profiles.update_one({"id": pid}, {"$set": patch})
+    merged = {**existing, **patch}
+    return AttackProfile(**merged)
+
+
+@api_router.delete("/attack-profiles/{pid}")
+async def delete_attack_profile(pid: str):
+    # Built-in profiles can be deleted too — the user is operator-level and
+    # should be trusted; the seed will re-add them on next empty boot if
+    # they want them back via "reset attack profiles" (TODO).
+    res = await db.attack_profiles.delete_one({"id": pid})
+    return {"deleted": res.deleted_count}
+
+
+# ---------- PCAP endpoint CRUD ----------
+@api_router.get("/pcap-endpoints", response_model=List[PcapEndpoint])
+async def list_pcap_endpoints():
+    cur = db.pcap_endpoints.find({}, {"_id": 0}).sort("created_at", 1)
+    return [PcapEndpoint(**doc) async for doc in cur]
+
+
+@api_router.post("/pcap-endpoints", response_model=PcapEndpoint)
+async def create_pcap_endpoint(e: PcapEndpointCreate):
+    if not e.name.strip() or not e.host.strip():
+        raise HTTPException(400, "name and host are required")
+    if not (1 <= e.port <= 65535):
+        raise HTTPException(400, "port must be 1..65535")
+    if e.transport not in ("tcp", "udp"):
+        raise HTTPException(400, "transport must be tcp or udp")
+    ep = PcapEndpoint(**e.dict())
+    await db.pcap_endpoints.insert_one(ep.dict())
+    return ep
+
+
+@api_router.put("/pcap-endpoints/{eid}", response_model=PcapEndpoint)
+async def update_pcap_endpoint(eid: str, e: PcapEndpointUpdate):
+    existing = await db.pcap_endpoints.find_one({"id": eid}, {"_id": 0})
+    if not existing:
+        raise HTTPException(404, "endpoint not found")
+    patch = {k: v for k, v in e.dict().items() if v is not None}
+    if "port" in patch and not (1 <= patch["port"] <= 65535):
+        raise HTTPException(400, "port must be 1..65535")
+    if "transport" in patch and patch["transport"] not in ("tcp", "udp"):
+        raise HTTPException(400, "transport must be tcp or udp")
+    if patch:
+        await db.pcap_endpoints.update_one({"id": eid}, {"$set": patch})
+    merged = {**existing, **patch}
+    return PcapEndpoint(**merged)
+
+
+@api_router.delete("/pcap-endpoints/{eid}")
+async def delete_pcap_endpoint(eid: str):
+    res = await db.pcap_endpoints.delete_one({"id": eid})
+    return {"deleted": res.deleted_count}
+
+
+# ---------- Attack profile seeding ----------
+async def _seed_attack_profiles_if_empty():
+    """
+    Re-seeds the canonical wifi recon + attack starter set into the
+    attack_profiles collection if (and only if) it's empty. These mirror the
+    presets that used to live in LiveTab.tsx as hardcoded JS — moving them to
+    Mongo means the user (and Hermes via MCP later) can add/edit/clone them.
+
+    Each command_template uses {iface} / {host} / {port} / {file} for
+    runtime substitution. wifite/airodump get view_mode=xterm because they
+    emit Rich/curses TUIs that need xterm.js to render correctly; tcpdump
+    et al stay on scrollback since they're plain line-oriented output.
+    """
+    if await db.attack_profiles.count_documents({}) > 0:
+        return
+    seeds = [
+        AttackProfile(
+            name="airodump-ng",
+            description="live AP/STA scan — TUI table with signal strength, BSSIDs, channels",
+            icon="wifi-strength-4-alert",
+            category="recon",
+            command_template="airodump-ng {iface}",
+            needs_iface=True,
+            view_mode="xterm",
+            builtin=True, sort_order=10,
+        ),
+        AttackProfile(
+            name="airodump → CSV",
+            description="capture to /sdcard/cap_<ts>.{csv,pcap} for offline analysis",
+            icon="file-table",
+            category="recon",
+            command_template="airodump-ng -w {file} --output-format csv,pcap {iface}",
+            needs_iface=True, needs_file=True,
+            view_mode="scrollback",
+            builtin=True, sort_order=11,
+        ),
+        AttackProfile(
+            name="wifite PMKID",
+            description="PMKID hash grab (no clients harmed) — kills NetworkManager first",
+            icon="key-variant",
+            category="attack",
+            command_template="wifite --pmkid --no-deauths --kill -i {iface}",
+            needs_iface=True,
+            view_mode="xterm",
+            builtin=True, sort_order=20,
+        ),
+        AttackProfile(
+            name="wifite WPA",
+            description="full WPA handshake capture + auto-crack flow",
+            icon="shield-key",
+            category="attack",
+            command_template="wifite --wpa --kill -i {iface}",
+            needs_iface=True,
+            view_mode="xterm",
+            builtin=True, sort_order=21,
+        ),
+        AttackProfile(
+            name="hcxdumptool",
+            description="PMKID + EAPOL capture (modern, faster than aircrack tools)",
+            icon="database-export",
+            category="attack",
+            command_template="hcxdumptool -i {iface} -o {file}.pcapng --enable_status=1",
+            needs_iface=True, needs_file=True,
+            view_mode="scrollback",
+            builtin=True, sort_order=22,
+        ),
+        AttackProfile(
+            name="tcpdump → file",
+            description="full packet capture to local /sdcard/tcpdump_<ts>.pcap",
+            icon="content-save",
+            category="trace",
+            command_template="tcpdump -i {iface} -w {file}.pcap -U",
+            needs_iface=True, needs_file=True,
+            view_mode="scrollback",
+            builtin=True, sort_order=30,
+        ),
+        AttackProfile(
+            name="PCAP → remote",
+            description="stream live packets to a remote Wireshark/NetworkMiner via nc",
+            icon="cloud-upload",
+            category="pcap",
+            # `-U` flushes per packet (no buffering), -w - writes pcap to stdout.
+            # `nc -w 3` keeps the netcat from hanging on close. The remote side
+            # should be running e.g. `nc -l -p 19000 | wireshark -k -i -`
+            # (or just point Wireshark's "Capture from pipe" at the same port
+            # via socat/inetd).
+            command_template="tcpdump -i {iface} -U -w - | nc -w 3 {host} {port}",
+            needs_iface=True, needs_endpoint=True,
+            view_mode="scrollback",
+            builtin=True, sort_order=40,
+        ),
+        AttackProfile(
+            name="iw event",
+            description="kernel wireless events — assoc/disassoc/auth/scan",
+            icon="console-network",
+            category="trace",
+            command_template="iw event -t",
+            needs_iface=False,
+            view_mode="scrollback",
+            builtin=True, sort_order=50,
+        ),
+        AttackProfile(
+            name="dmesg -w",
+            description="follow kernel log — driver errors, firmware msgs",
+            icon="console-line",
+            category="trace",
+            command_template="dmesg -w",
+            needs_iface=False,
+            view_mode="scrollback",
+            builtin=True, sort_order=51,
+        ),
+    ]
+    for p in seeds:
+        await db.attack_profiles.insert_one(p.dict())
+    logger.info("seeded %d attack profiles", len(seeds))
+
+
+# Wire the new seeder into startup. We call it explicitly from the existing
+# `seed()` startup handler — see the @app.on_event("startup") block above
+# where we patched in `await _seed_attack_profiles_if_empty()`.
 
 
 app.include_router(api_router)
