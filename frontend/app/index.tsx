@@ -175,6 +175,15 @@ export default function App() {
   const [aiEditing, setAiEditing] = useState<any | null>(null);  // AIProfile | draft
   const [aiSaving, setAiSaving] = useState(false);
 
+  // ─── PCAP endpoints state ────────────────────────────────────────────────
+  // Endpoints for streaming live captures (tcpdump | nc) to remote
+  // Wireshark / NetworkMiner / packet broker. Edited inline in Settings →
+  // General, picked at launch time from Live tab's endpoint modal.
+  const [pcapEndpointsList, setPcapEndpointsList] = useState<any[]>([]);
+  const [pcapEditOpen, setPcapEditOpen] = useState(false);
+  const [pcapEditing, setPcapEditing] = useState<any | null>(null);
+  const [pcapSaving, setPcapSaving] = useState(false);
+
   const ctx: Ctx = { iface, country };
 
   // Resolve active interface(s) based on activeIface selector
@@ -330,6 +339,99 @@ export default function App() {
       ],
     );
   }, [fetchAIProfiles]);
+
+  // ─── PCAP endpoint CRUD ───────────────────────────────────────────────
+  // Pattern mirrors AI profile CRUD exactly — same idempotent fetch +
+  // open/close/save flow + delete-with-confirm. We could DRY these into a
+  // generic <CrudEditor /> helper later, but explicit copies are easier to
+  // tweak per-resource (PCAP endpoint forms need port validation, etc).
+  const fetchPcapEndpoints = useCallback(async () => {
+    try {
+      const r = await fetch(`${API}/pcap-endpoints`);
+      if (!r.ok) return;
+      const data = await r.json();
+      setPcapEndpointsList(data);
+    } catch { /* non-fatal */ }
+  }, []);
+
+  useEffect(() => { fetchPcapEndpoints(); }, [fetchPcapEndpoints]);
+
+  const openPcapEditor = useCallback((e: any | null) => {
+    setPcapEditing(
+      e
+        ? { ...e }
+        : { name: "", host: "", port: 19000, transport: "tcp", notes: "" },
+    );
+    setPcapEditOpen(true);
+  }, []);
+
+  const closePcapEditor = useCallback(() => {
+    setPcapEditOpen(false);
+    setTimeout(() => setPcapEditing(null), 200);
+  }, []);
+
+  const savePcapEndpoint = useCallback(async () => {
+    if (!pcapEditing) return;
+    const name = (pcapEditing.name || "").trim();
+    const host = (pcapEditing.host || "").trim();
+    const port = Number(pcapEditing.port);
+    if (!name || !host) {
+      Alert.alert("Required fields", "Name and host are required.");
+      return;
+    }
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      Alert.alert("Invalid port", "Port must be 1..65535.");
+      return;
+    }
+    setPcapSaving(true);
+    try {
+      const payload = {
+        name, host, port,
+        transport: pcapEditing.transport || "tcp",
+        notes: pcapEditing.notes || "",
+      };
+      const isUpdate = !!pcapEditing.id;
+      const url = isUpdate ? `${API}/pcap-endpoints/${pcapEditing.id}` : `${API}/pcap-endpoints`;
+      const method = isUpdate ? "PUT" : "POST";
+      const r = await fetch(url, {
+        method,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (!r.ok) {
+        const txt = await r.text();
+        throw new Error(`HTTP ${r.status}: ${txt}`);
+      }
+      await fetchPcapEndpoints();
+      closePcapEditor();
+    } catch (e: any) {
+      Alert.alert("Save failed", e?.message || "Unknown error");
+    } finally {
+      setPcapSaving(false);
+    }
+  }, [pcapEditing, fetchPcapEndpoints, closePcapEditor]);
+
+  const deletePcapEndpoint = useCallback((id: string, name: string) => {
+    Alert.alert(
+      "Delete endpoint?",
+      `Remove "${name}"? Running PCAP streams to this endpoint won't be affected.`,
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Delete",
+          style: "destructive",
+          onPress: async () => {
+            try {
+              await fetch(`${API}/pcap-endpoints/${id}`, { method: "DELETE" });
+              await fetchPcapEndpoints();
+            } catch {
+              Alert.alert("Delete failed", "Network error.");
+            }
+          },
+        },
+      ],
+    );
+  }, [fetchPcapEndpoints]);
 
   // Initialize streaming session manager with backend API base
   useEffect(() => { sessionManager.configure(API); }, []);
@@ -959,6 +1061,43 @@ export default function App() {
         </View>
       )}
 
+      <Text style={[s.sectionTitle, { marginTop: 24 }]}>// pcap endpoints ({pcapEndpointsList.length})</Text>
+      <Text style={s.helper}>
+        remote receivers for PCAP-over-IP streams. start a listener on the target:{"\n"}
+        <Text style={{ color: C.cyan }}>nc -l -p 19000 | wireshark -k -i -</Text>{"\n"}
+        then pick this endpoint when launching the &quot;PCAP → remote&quot; attack profile.
+      </Text>
+      {pcapEndpointsList.map((ep) => (
+        <View key={ep.id} style={s.aiProfileBlock}>
+          <View style={{ flexDirection: "row", alignItems: "center" }}>
+            <MaterialCommunityIcons name="cloud-upload" size={22} color={C.magenta} style={{ marginRight: 10 }} />
+            <View style={{ flex: 1 }}>
+              <Text style={s.aiProfileName}>{ep.name}</Text>
+              <Text style={[s.aiProfileCmd, { color: C.cyan }]}>
+                {ep.transport}://{ep.host}:{ep.port}
+              </Text>
+              {!!ep.notes && <Text style={s.aiProfileDesc} numberOfLines={1}>{ep.notes}</Text>}
+            </View>
+            <View style={{ flexDirection: "row" }}>
+              <TouchableOpacity testID={`btn-pcap-edit-${ep.id}`} onPress={() => openPcapEditor(ep)}
+                style={[s.iconBtn, { borderWidth: 1, borderColor: C.cyan, marginRight: 6 }]}>
+                <Ionicons name="create-outline" size={14} color={C.cyan} />
+              </TouchableOpacity>
+              <TouchableOpacity testID={`btn-pcap-del-${ep.id}`}
+                onPress={() => deletePcapEndpoint(ep.id, ep.name)}
+                style={[s.iconBtn, { borderWidth: 1, borderColor: C.red }]}>
+                <Ionicons name="trash" size={14} color={C.red} />
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      ))}
+      <TouchableOpacity testID="btn-pcap-new" onPress={() => openPcapEditor(null)}
+        style={[s.smallBtn, { alignSelf: "flex-start", marginTop: 8 }]}>
+        <Ionicons name="add" size={14} color={C.magenta} />
+        <Text style={[s.smallBtnText, { color: C.magenta }]}>add endpoint</Text>
+      </TouchableOpacity>
+
       <Text style={[s.sectionTitle, { marginTop: 24 }]}>// data</Text>
       <TouchableOpacity testID="btn-export" onPress={() => setExportOpen((v) => !v)} style={s.row}>
         <Ionicons name="download-outline" size={16} color={C.green} />
@@ -1113,6 +1252,7 @@ export default function App() {
               country={country}
               execMode={execMode}
               wrap={wrapForMode}
+              apiBase={API}
             />
           )}
           {tab === "ai" && (
@@ -1341,6 +1481,112 @@ export default function App() {
                     ? <ActivityIndicator size="small" color={C.bg} />
                     : <Ionicons name="save" size={16} color={C.bg} />}
                   <Text style={s.bigBtnText}>{aiEditing.id ? "SAVE CHANGES" : "CREATE"}</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+          </View>
+        )}
+
+        {/* PCAP ENDPOINT EDITOR SHEET — simpler than AI editor: just name,
+            host, port, transport, notes. Used from Settings → General. */}
+        {pcapEditOpen && pcapEditing && (
+          <View style={s.overlay}>
+            <View style={s.sheet}>
+              <View style={s.sheetHeader}>
+                <Text style={s.sheetTitle}>
+                  {pcapEditing.id ? `// edit ${pcapEditing.name || "endpoint"}` : "// new endpoint"}
+                </Text>
+                <TouchableOpacity onPress={closePcapEditor} testID="btn-close-pcap-edit">
+                  <Ionicons name="close" size={22} color={C.green} />
+                </TouchableOpacity>
+              </View>
+              <ScrollView style={{ maxHeight: 420 }} keyboardShouldPersistTaps="handled">
+                <View style={s.field}>
+                  <Text style={s.fieldLabel}>name *</Text>
+                  <TextInput testID="input-pcap-name"
+                    value={pcapEditing.name}
+                    onChangeText={(t) => setPcapEditing({ ...pcapEditing, name: t })}
+                    style={s.fieldInput}
+                    placeholder="Wireshark LAN"
+                    placeholderTextColor={C.textDim}
+                  />
+                </View>
+                <View style={[s.field, { marginTop: 8 }]}>
+                  <Text style={s.fieldLabel}>host * (IP or DNS)</Text>
+                  <TextInput testID="input-pcap-host"
+                    value={pcapEditing.host}
+                    onChangeText={(t) => setPcapEditing({ ...pcapEditing, host: t })}
+                    style={s.fieldInput}
+                    placeholder="192.168.1.50 or pentest-rig.tail-net.ts"
+                    placeholderTextColor={C.textDim}
+                    autoCapitalize="none"
+                    autoCorrect={false}
+                    keyboardType="url"
+                  />
+                </View>
+                <View style={[s.field, { marginTop: 8 }]}>
+                  <Text style={s.fieldLabel}>port * (1..65535)</Text>
+                  <TextInput testID="input-pcap-port"
+                    value={String(pcapEditing.port ?? "")}
+                    onChangeText={(t) => setPcapEditing({ ...pcapEditing, port: t.replace(/[^0-9]/g, "") })}
+                    style={s.fieldInput}
+                    placeholder="19000"
+                    placeholderTextColor={C.textDim}
+                    keyboardType="numeric"
+                    maxLength={5}
+                  />
+                </View>
+
+                <Text style={[s.fieldLabel, { marginTop: 14 }]}>transport</Text>
+                <View style={[s.segGroup, { marginTop: 4 }]}>
+                  {(["tcp", "udp"] as const).map((t) => {
+                    const active = (pcapEditing.transport || "tcp") === t;
+                    const color = t === "tcp" ? C.cyan : C.yellow;
+                    return (
+                      <TouchableOpacity
+                        key={t}
+                        testID={`btn-pcap-transport-${t}`}
+                        onPress={() => setPcapEditing({ ...pcapEditing, transport: t })}
+                        style={[s.segBtn, active && { backgroundColor: color, borderColor: color }]}
+                      >
+                        <Text style={[s.segBtnText, { color: active ? C.bg : color }]}>
+                          {t.toUpperCase()}
+                        </Text>
+                      </TouchableOpacity>
+                    );
+                  })}
+                </View>
+                <Text style={[s.helper, { marginTop: 4 }]}>
+                  TCP for nc + Wireshark; UDP for occasional broker setups (uncommon).
+                </Text>
+
+                <View style={[s.field, { marginTop: 12 }]}>
+                  <Text style={s.fieldLabel}>notes</Text>
+                  <TextInput testID="input-pcap-notes"
+                    value={pcapEditing.notes || ""}
+                    onChangeText={(t) => setPcapEditing({ ...pcapEditing, notes: t })}
+                    style={[s.fieldInput, { minHeight: 56, textAlignVertical: "top", paddingTop: 8 }]}
+                    placeholder="optional — e.g. 'remember to start nc -l on port first'"
+                    placeholderTextColor={C.textDim}
+                    multiline
+                    numberOfLines={2}
+                  />
+                </View>
+              </ScrollView>
+
+              <View style={{ flexDirection: "row", marginTop: 14, gap: 8 }}>
+                <TouchableOpacity onPress={closePcapEditor}
+                  style={[s.bigBtn, { flex: 1, backgroundColor: "transparent", borderWidth: 1, borderColor: C.textDim }]}
+                  disabled={pcapSaving}>
+                  <Text style={[s.bigBtnText, { color: C.textDim }]}>CANCEL</Text>
+                </TouchableOpacity>
+                <TouchableOpacity testID="btn-pcap-save" onPress={savePcapEndpoint}
+                  style={[s.bigBtn, { flex: 2 }, pcapSaving && { opacity: 0.5 }]}
+                  disabled={pcapSaving}>
+                  {pcapSaving
+                    ? <ActivityIndicator size="small" color={C.bg} />
+                    : <Ionicons name="save" size={16} color={C.bg} />}
+                  <Text style={s.bigBtnText}>{pcapEditing.id ? "SAVE CHANGES" : "CREATE"}</Text>
                 </TouchableOpacity>
               </View>
             </View>

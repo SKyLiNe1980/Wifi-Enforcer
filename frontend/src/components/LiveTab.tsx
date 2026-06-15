@@ -1,15 +1,51 @@
+/* eslint-disable react/jsx-no-comment-textnodes */
+// `// section` headings are intentional UI convention across this project,
+// see app/index.tsx for the same disable. They render as visible terminal-
+// style label text, not actual JS comments.
+/**
+ * LiveTab — the capture/attack cockpit.
+ *
+ * Streams output from long-running tools (airodump-ng, wifite, tcpdump,
+ * hcxdumptool, dmesg, …) via SessionManager. Each tool is defined as an
+ * AttackProfile in MongoDB rather than hardcoded JS — so the user (or
+ * Hermes via MCP later) can add/edit/clone them in Settings.
+ *
+ * Rendering pipeline per session:
+ *   - profile.view_mode === "xterm"  → XTermView (Rich/Textual/curses TUI)
+ *   - profile.view_mode === "scrollback" → FlatList (plain line stream)
+ *
+ * PCAP-over-IP: profiles with `needs_endpoint=true` (e.g. "PCAP → remote")
+ * pop an endpoint-picker modal at launch. The selected PcapEndpoint's
+ * host+port are substituted into the command_template alongside {iface}.
+ *
+ * Template placeholders:
+ *   {iface}  → primaryIface chosen by user in Quick tab
+ *   {host}   → selected endpoint.host
+ *   {port}   → selected endpoint.port
+ *   {file}   → auto-generated /sdcard/cap_<unix_ms> path (no extension —
+ *              templates add their own, e.g. {file}.pcapng)
+ */
 import React, { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import {
-  View, Text, StyleSheet, ScrollView, FlatList, TouchableOpacity, TextInput, Alert, Platform,
+  View, Text, StyleSheet, ScrollView, FlatList, TouchableOpacity, TextInput, Alert,
+  Platform, Modal,
 } from "react-native";
 import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
 import { sessionManager, SessionState } from "../lib/sessionManager";
 import { hasNativeStreaming, RootShell, HAS_NATIVE_ROOT } from "../lib/rootShell";
+import XTermView from "./XTermView";
 
 const C = {
   bg: "#04070a", panel: "#0a1116", panel2: "#0e1820", border: "#163041",
   green: "#00ff66", greenDim: "#0a8a3a", cyan: "#3ad7ff", red: "#ff3860",
   yellow: "#ffd400", magenta: "#ff5cdb", text: "#cfeadb", textDim: "#6c8a82",
+  // Category accents — used to color category chip filters in the drawer.
+  // Keep psychologically appropriate: recon=cyan (passive obs), attack=red
+  // (active offense), trace=yellow (diagnostic), pcap=magenta (network ops).
+  catRecon: "#3ad7ff",
+  catAttack: "#ff3860",
+  catTrace: "#ffd400",
+  catPcap: "#ff5cdb",
 };
 const MONO = Platform.select({ ios: "Menlo", android: "monospace", default: "monospace" });
 
@@ -21,59 +57,59 @@ type Props = {
   country: string;
   execMode: "mock" | "real" | "kali";
   wrap: (cmd: string) => string;   // wraps a command for current exec mode (kali chroot etc.)
+  /** Resolved API base (already includes /api). Passed from the App-level
+   *  shell so we don't duplicate process.env reads down here. */
+  apiBase: string;
 };
 
-// One-tap streaming presets — substitute $IFACE at use time
-const PRESETS: { label: string; icon: any; cmd: (iface: string) => string; desc: string }[] = [
-  {
-    label: "airodump-ng",
-    icon: "wifi-strength-4-alert",
-    cmd: (i) => `airodump-ng ${i}`,
-    desc: "live AP/STA scan",
-  },
-  {
-    label: "airodump → CSV",
-    icon: "file-table",
-    cmd: (i) => `airodump-ng -w /sdcard/cap_${Date.now()} --output-format csv,pcap ${i}`,
-    desc: "capture to /sdcard/cap_<ts>",
-  },
-  {
-    label: "wifite PMKID",
-    icon: "key-variant",
-    cmd: (i) => `wifite --pmkid --no-deauths --kill -i ${i}`,
-    desc: "PMKID hash grab (no clients harmed)",
-  },
-  {
-    label: "wifite WPA",
-    icon: "shield-key",
-    cmd: (i) => `wifite --wpa --kill -i ${i}`,
-    desc: "WPA handshake + crack",
-  },
-  {
-    label: "hcxdumptool",
-    icon: "database-export",
-    cmd: (i) => `hcxdumptool -i ${i} -o /sdcard/hcx_${Date.now()}.pcapng --enable_status=1`,
-    desc: "PMKID/EAPOL capture (modern)",
-  },
-  {
-    label: "tcpdump",
-    icon: "network",
-    cmd: (i) => `tcpdump -i ${i} -w /sdcard/tcpdump_${Date.now()}.pcap -U`,
-    desc: "full packet capture",
-  },
-  {
-    label: "iw event",
-    icon: "console-network",
-    cmd: () => "iw event -t",
-    desc: "kernel wireless events",
-  },
-  {
-    label: "dmesg -w",
-    icon: "console-line",
-    cmd: () => "dmesg -w",
-    desc: "live kernel log",
-  },
-];
+// ─── Server types ─────────────────────────────────────────────────────────
+type AttackProfile = {
+  id: string;
+  name: string;
+  description: string;
+  icon: string;
+  category: "recon" | "attack" | "trace" | "pcap";
+  command_template: string;
+  needs_iface: boolean;
+  needs_endpoint: boolean;
+  needs_file: boolean;
+  view_mode: "xterm" | "scrollback";
+  builtin: boolean;
+  sort_order: number;
+};
+
+type PcapEndpoint = {
+  id: string;
+  name: string;
+  host: string;
+  port: number;
+  transport: "tcp" | "udp";
+  notes: string;
+};
+
+const CAT_COLOR: Record<AttackProfile["category"], string> = {
+  recon: C.catRecon,
+  attack: C.catAttack,
+  trace: C.catTrace,
+  pcap: C.catPcap,
+};
+
+/**
+ * Substitute {iface}, {host}, {port}, {file} placeholders in a command_template.
+ * Anything we don't have a substitution for is left as-is (so a typo'd
+ * placeholder like {bssid} surfaces visibly in the rendered command,
+ * making the misconfiguration obvious instead of silently mangled).
+ */
+function resolveTemplate(
+  template: string,
+  ctx: { iface?: string; host?: string; port?: number; file?: string },
+): string {
+  return template
+    .replace(/\{iface\}/g, ctx.iface ?? "{iface}")
+    .replace(/\{host\}/g, ctx.host ?? "{host}")
+    .replace(/\{port\}/g, ctx.port !== undefined ? String(ctx.port) : "{port}")
+    .replace(/\{file\}/g, ctx.file ?? "{file}");
+}
 
 export default function LiveTab(props: Props) {
   const [, force] = useState(0);
@@ -84,9 +120,52 @@ export default function LiveTab(props: Props) {
   const [probeResult, setProbeResult] = useState<string>("");
   const outRef = useRef<FlatList | null>(null);
 
-  // Tap any method chip to call it — proves whether it's *truly* registered
-  // (typeof === 'function' is necessary but not sufficient if RN's proxy is
-  // misleading; actually calling reveals "no such method" errors)
+  // ─── Attack profiles (fetched from API, replaces hardcoded PRESETS) ────
+  const [attackProfiles, setAttackProfiles] = useState<AttackProfile[]>([]);
+  const [pcapEndpoints, setPcapEndpoints] = useState<PcapEndpoint[]>([]);
+  // category filter — null = show all
+  const [catFilter, setCatFilter] = useState<AttackProfile["category"] | null>(null);
+
+  // ─── Endpoint picker modal state ───────────────────────────────────────
+  // When a profile with `needs_endpoint=true` is tapped, we open this modal
+  // to let the user pick which PcapEndpoint to stream into. The profile is
+  // stashed in `pendingProfile` so the user can cancel without losing it.
+  const [endpointPickerOpen, setEndpointPickerOpen] = useState(false);
+  const [pendingProfile, setPendingProfile] = useState<AttackProfile | null>(null);
+
+  // ─── Map sessionId → view_mode ──────────────────────────────────────────
+  // Sessions only carry a label, not the originating profile's view_mode.
+  // We track it locally so the output renderer can pick xterm vs scrollback
+  // for the currently-selected session. Map (not useState) because we
+  // mutate it imperatively at session start time + want fresh reads.
+  const sessionViewModeRef = useRef<Map<string, "xterm" | "scrollback">>(new Map());
+
+  const fetchAttackProfiles = useCallback(async () => {
+    try {
+      const r = await fetch(`${props.apiBase}/attack-profiles`);
+      if (!r.ok) return;
+      const data: AttackProfile[] = await r.json();
+      setAttackProfiles(data);
+    } catch { /* non-fatal */ }
+  }, [props.apiBase]);
+
+  const fetchPcapEndpoints = useCallback(async () => {
+    try {
+      const r = await fetch(`${props.apiBase}/pcap-endpoints`);
+      if (!r.ok) return;
+      const data: PcapEndpoint[] = await r.json();
+      setPcapEndpoints(data);
+    } catch { /* non-fatal */ }
+  }, [props.apiBase]);
+
+  useEffect(() => { fetchAttackProfiles(); fetchPcapEndpoints(); },
+    [fetchAttackProfiles, fetchPcapEndpoints]);
+
+  // Re-fetch endpoints whenever the drawer is opened — the user may have
+  // added one in Settings between Live-tab visits.
+  useEffect(() => { if (presetOpen) fetchPcapEndpoints(); }, [presetOpen, fetchPcapEndpoints]);
+
+  // ─── Bridge diagnostic probe (debugging "stuck in mock" symptoms) ───────
   const probeMethod = useCallback(async (name: string) => {
     if (!RootShell) { setProbeResult("no native module"); return; }
     const m = (RootShell as any)[name];
@@ -127,31 +206,82 @@ export default function LiveTab(props: Props) {
     [sessions, selectedId],
   );
 
+  // The renderer needs to know which mode to use for the *currently
+  // selected* session. Default to scrollback for legacy sessions whose
+  // profile we don't know (e.g. spawned before we tracked viewMode).
+  const selectedViewMode: "xterm" | "scrollback" = useMemo(() => {
+    if (!selected) return "scrollback";
+    return sessionViewModeRef.current.get(selected.id) || "scrollback";
+  }, [selected]);
+
   useEffect(() => {
     if (!autoScroll || !selected) return;
+    if (selectedViewMode === "xterm") return;  // xterm auto-scrolls itself
     const t = setTimeout(() => outRef.current?.scrollToEnd({ animated: false }), 30);
     return () => clearTimeout(t);
-  }, [selected?.lines.length, selected?.status, autoScroll]);
+  }, [selected?.lines.length, selected?.status, autoScroll, selectedViewMode, selected]);
 
-  const startSession = useCallback(async (cmd: string, ifaceHint?: string) => {
+  // ─── Start a session ────────────────────────────────────────────────────
+  // Centralized so both attack-profile launches and the custom command box
+  // funnel through here. `viewMode` is recorded so the renderer picks the
+  // right component when this session becomes selected.
+  const startSession = useCallback(async (
+    cmd: string,
+    opts: { label?: string; viewMode?: "xterm" | "scrollback"; iface?: string } = {},
+  ) => {
     if (!cmd.trim()) return;
-    const ifaceForCmd = ifaceHint || props.primaryIface;
+    const ifaceForCmd = opts.iface || props.primaryIface;
     const wrapped = props.wrap(cmd);
     const id = await sessionManager.start({
       command: wrapped,
       iface: ifaceForCmd,
-      label: cmd.split(/\s+/)[0],
+      label: opts.label || cmd.split(/\s+/)[0],
       forceMock: props.execMode === "mock",
     });
+    sessionViewModeRef.current.set(id, opts.viewMode || "scrollback");
     setSelectedId(id);
     setCustomCmd("");
     setPresetOpen(false);
   }, [props.primaryIface, props.wrap, props.execMode]);
 
-  const runPreset = (p: typeof PRESETS[number]) => {
-    const cmd = p.cmd(props.primaryIface);
-    startSession(cmd, props.primaryIface);
-  };
+  // ─── Launch an AttackProfile ────────────────────────────────────────────
+  // 1. If needs_endpoint → open endpoint picker (modal), stash profile.
+  // 2. Otherwise substitute placeholders + launch immediately.
+  const launchAttackProfile = useCallback((p: AttackProfile, endpoint?: PcapEndpoint) => {
+    if (p.needs_endpoint && !endpoint) {
+      if (pcapEndpoints.length === 0) {
+        Alert.alert(
+          "No PCAP endpoints configured",
+          "Add one in Settings → General → // pcap endpoints first.",
+        );
+        return;
+      }
+      setPendingProfile(p);
+      setEndpointPickerOpen(true);
+      return;
+    }
+    const iface = p.needs_iface ? props.primaryIface : undefined;
+    const file = p.needs_file ? `/sdcard/cap_${Date.now()}` : undefined;
+    const cmd = resolveTemplate(p.command_template, {
+      iface,
+      host: endpoint?.host,
+      port: endpoint?.port,
+      file,
+    });
+    startSession(cmd, {
+      label: p.name.replace(/\s+→\s+/g, "→"),  // keep label short for chips
+      viewMode: p.view_mode,
+      iface,
+    });
+  }, [pcapEndpoints, props.primaryIface, startSession]);
+
+  // Endpoint picker confirm
+  const confirmEndpoint = useCallback((ep: PcapEndpoint) => {
+    const p = pendingProfile;
+    setEndpointPickerOpen(false);
+    setPendingProfile(null);
+    if (p) launchAttackProfile(p, ep);
+  }, [pendingProfile, launchAttackProfile]);
 
   const onStop = (s: SessionState) => sessionManager.kill(s.id, true);
   const onForceKill = (s: SessionState) =>
@@ -159,7 +289,10 @@ export default function LiveTab(props: Props) {
       { text: "Cancel" },
       { text: "SIGKILL", style: "destructive", onPress: () => sessionManager.kill(s.id, false) },
     ]);
-  const onRemove = (s: SessionState) => sessionManager.remove(s.id);
+  const onRemove = (s: SessionState) => {
+    sessionViewModeRef.current.delete(s.id);
+    sessionManager.remove(s.id);
+  };
 
   const statusColor = (st: SessionState["status"]) =>
     st === "running" ? C.green :
@@ -167,6 +300,12 @@ export default function LiveTab(props: Props) {
     st === "ended" ? C.greenDim :
     st === "killed" ? C.magenta :
     C.red;
+
+  // Filtered + grouped profile list for the drawer.
+  const visibleProfiles = useMemo(
+    () => catFilter ? attackProfiles.filter((p) => p.category === catFilter) : attackProfiles,
+    [attackProfiles, catFilter],
+  );
 
   return (
     <View style={{ flex: 1, backgroundColor: C.bg }}>
@@ -195,7 +334,6 @@ export default function LiveTab(props: Props) {
                 mode=<Text style={{ color: modeOk ? C.green : C.yellow }}>{props.execMode}</Text>{" · "}
                 keys={keys.length}
               </Text>
-              {/* Per-method status grid — tap any to call it directly */}
               <View style={{ flexDirection: "row", flexWrap: "wrap", marginTop: 4 }}>
                 {methodStatus.map((m) => (
                   <TouchableOpacity
@@ -262,25 +400,68 @@ export default function LiveTab(props: Props) {
         </TouchableOpacity>
       </View>
 
-      {/* Presets drawer */}
+      {/* Attack-profile drawer */}
       {presetOpen && (
         <View style={s.presetDrawer}>
-          <Text style={s.presetTitle}>// stream presets · iface={props.primaryIface}</Text>
+          {/* Category filter row */}
+          <View style={s.catRow}>
+            <TouchableOpacity
+              testID="cat-all"
+              onPress={() => setCatFilter(null)}
+              style={[s.catChip, !catFilter && { borderColor: C.green, backgroundColor: "#0a1f12" }]}
+            >
+              <Text style={[s.catChipText, !catFilter && { color: C.green }]}>all · {attackProfiles.length}</Text>
+            </TouchableOpacity>
+            {(["recon", "attack", "trace", "pcap"] as const).map((cat) => {
+              const n = attackProfiles.filter((p) => p.category === cat).length;
+              if (n === 0) return null;
+              const active = catFilter === cat;
+              return (
+                <TouchableOpacity
+                  key={cat}
+                  testID={`cat-${cat}`}
+                  onPress={() => setCatFilter(active ? null : cat)}
+                  style={[
+                    s.catChip,
+                    { borderColor: CAT_COLOR[cat] + (active ? "" : "55") },
+                    active && { backgroundColor: CAT_COLOR[cat] + "22" },
+                  ]}
+                >
+                  <Text style={[s.catChipText, { color: CAT_COLOR[cat] }]}>{cat} · {n}</Text>
+                </TouchableOpacity>
+              );
+            })}
+          </View>
+
+          <Text style={s.presetTitle}>// {visibleProfiles.length} profiles · iface={props.primaryIface || "—"}</Text>
           <View style={s.presetGrid}>
-            {PRESETS.map((p, i) => (
+            {visibleProfiles.map((p) => (
               <TouchableOpacity
-                key={i}
-                testID={`live-preset-${i}`}
-                onPress={() => runPreset(p)}
-                style={s.presetItem}
+                key={p.id}
+                testID={`live-preset-${p.id}`}
+                onPress={() => launchAttackProfile(p)}
+                style={[s.presetItem, { borderLeftColor: CAT_COLOR[p.category], borderLeftWidth: 3 }]}
               >
                 <View style={{ flexDirection: "row", alignItems: "center", marginBottom: 2 }}>
-                  <MaterialCommunityIcons name={p.icon} size={14} color={C.green} />
-                  <Text style={[s.presetLabel, { marginLeft: 4 }]}>{p.label}</Text>
+                  <MaterialCommunityIcons name={p.icon as any} size={14} color={CAT_COLOR[p.category]} />
+                  <Text style={[s.presetLabel, { marginLeft: 4 }]} numberOfLines={1}>{p.name}</Text>
+                  {p.view_mode === "xterm" && (
+                    <View style={s.tuiBadge}>
+                      <Text style={s.tuiBadgeText}>tui</Text>
+                    </View>
+                  )}
                 </View>
-                <Text style={s.presetDesc} numberOfLines={1}>{p.desc}</Text>
+                <Text style={s.presetDesc} numberOfLines={2}>{p.description}</Text>
+                {p.needs_endpoint && (
+                  <Text style={[s.presetDesc, { color: CAT_COLOR.pcap, marginTop: 2 }]}>↪ pick endpoint</Text>
+                )}
               </TouchableOpacity>
             ))}
+            {visibleProfiles.length === 0 && (
+              <Text style={[s.helper, { padding: 8 }]}>
+                no profiles in this category — add some in Settings → AI Agents (TODO: add attack-profile editor in Settings)
+              </Text>
+            )}
           </View>
           <View style={[s.cmdRow, { marginTop: 6 }]}>
             <Text style={{ color: C.greenDim, fontFamily: MONO, fontSize: 13 }}># </Text>
@@ -321,6 +502,7 @@ export default function LiveTab(props: Props) {
                 <Text style={{ color: statusColor(selected.status) }}>{selected.status.toUpperCase()}</Text>
                 {selected.pid ? <Text style={{ color: C.textDim }}> · pid={selected.pid}</Text> : null}
                 <Text style={{ color: C.textDim }}> · {selected.lineCount} lines</Text>
+                <Text style={{ color: C.textDim }}> · view={selectedViewMode}</Text>
                 {selected.exitCode !== undefined ? (
                   <Text style={{ color: selected.exitCode === 0 ? C.greenDim : C.red }}>
                     {" · exit="}{selected.exitCode}
@@ -329,13 +511,15 @@ export default function LiveTab(props: Props) {
               </Text>
             </View>
             <View style={{ flexDirection: "row" }}>
-              <TouchableOpacity
-                testID="btn-auto-scroll"
-                onPress={() => setAutoScroll((v) => !v)}
-                style={[s.headBtn, { borderColor: autoScroll ? C.green : C.border }]}
-              >
-                <MaterialCommunityIcons name={autoScroll ? "arrow-down-thin-circle-outline" : "pause"} size={14} color={autoScroll ? C.green : C.textDim} />
-              </TouchableOpacity>
+              {selectedViewMode !== "xterm" && (
+                <TouchableOpacity
+                  testID="btn-auto-scroll"
+                  onPress={() => setAutoScroll((v) => !v)}
+                  style={[s.headBtn, { borderColor: autoScroll ? C.green : C.border }]}
+                >
+                  <MaterialCommunityIcons name={autoScroll ? "arrow-down-thin-circle-outline" : "pause"} size={14} color={autoScroll ? C.green : C.textDim} />
+                </TouchableOpacity>
+              )}
               {(selected.status === "running" || selected.status === "starting") && (
                 <>
                   <TouchableOpacity
@@ -364,7 +548,19 @@ export default function LiveTab(props: Props) {
             </View>
           </View>
 
-          {selected.lines.length === 0 ? (
+          {/* Output: xterm OR FlatList, picked per-session */}
+          {selectedViewMode === "xterm" ? (
+            <View style={{ flex: 1 }}>
+              <XTermView
+                key={selected.id}
+                sessionId={selected.id}
+                // Live tab is one-way for now (no stdin into airodump/wifite via
+                // xterm) — but the wiring is there for free. Ignore inputs.
+                onInput={() => {}}
+                resetToken={selected.id}
+              />
+            </View>
+          ) : selected.lines.length === 0 ? (
             <View style={{ flex: 1, backgroundColor: "#02050a", padding: 10 }}>
               <Text style={s.helper}>(no output yet)</Text>
             </View>
@@ -384,14 +580,6 @@ export default function LiveTab(props: Props) {
                 </Text>
               )}
               onScrollBeginDrag={() => setAutoScroll(false)}
-              // Virtualization tuning for terminal-style streaming output:
-              //  * initialNumToRender: small — we always scroll to the bottom,
-              //    so showing the first N rendered immediately is wasteful.
-              //  * maxToRenderPerBatch / windowSize: keep render work bounded
-              //    even during dmesg-style bursts that previously ANR'd the
-              //    UI thread with thousands of <Text> mounted simultaneously.
-              //  * removeClippedSubviews: drops offscreen views from the
-              //    native hierarchy entirely on Android — single biggest win.
               initialNumToRender={30}
               maxToRenderPerBatch={20}
               windowSize={10}
@@ -409,13 +597,66 @@ export default function LiveTab(props: Props) {
           <MaterialCommunityIcons name="satellite-uplink" size={48} color={C.greenDim} />
           <Text style={[s.helper, { marginTop: 12, textAlign: "center" }]}>
             no active session — tap{" "}
-            <Text style={{ color: C.green }}>+</Text> to launch a streaming preset
+            <Text style={{ color: C.green }}>+</Text> to launch an attack profile
           </Text>
           <Text style={[s.helper, { marginTop: 4, textAlign: "center", color: C.textDim }]}>
-            airodump · wifite · tcpdump · hcxdumptool · ...
+            airodump · wifite · tcpdump · hcxdumptool · pcap→remote · …
           </Text>
         </View>
       )}
+
+      {/* ─── Endpoint picker modal (for needs_endpoint profiles) ───────── */}
+      <Modal
+        visible={endpointPickerOpen}
+        animationType="fade"
+        transparent
+        onRequestClose={() => { setEndpointPickerOpen(false); setPendingProfile(null); }}
+      >
+        <View style={s.modalBackdrop}>
+          <View style={s.modalSheet}>
+            <View style={s.modalHeader}>
+              <Text style={s.modalTitle}>
+                // pick endpoint for {pendingProfile?.name || "?"}
+              </Text>
+              <TouchableOpacity
+                onPress={() => { setEndpointPickerOpen(false); setPendingProfile(null); }}
+                testID="btn-ep-close"
+              >
+                <Ionicons name="close" size={20} color={C.green} />
+              </TouchableOpacity>
+            </View>
+            <Text style={[s.helper, { marginBottom: 8 }]}>
+              packets will stream live to the selected endpoint via{" "}
+              <Text style={{ color: C.cyan }}>tcpdump | nc</Text>
+            </Text>
+            <ScrollView style={{ maxHeight: 340 }}>
+              {pcapEndpoints.map((ep) => (
+                <TouchableOpacity
+                  key={ep.id}
+                  testID={`ep-pick-${ep.id}`}
+                  onPress={() => confirmEndpoint(ep)}
+                  style={s.epRow}
+                >
+                  <MaterialCommunityIcons name="cloud-upload" size={18} color={C.catPcap} />
+                  <View style={{ flex: 1, marginLeft: 10 }}>
+                    <Text style={s.epName}>{ep.name}</Text>
+                    <Text style={s.epHost}>
+                      {ep.transport}://{ep.host}:{ep.port}
+                      {ep.notes ? <Text style={{ color: C.textDim }}>  · {ep.notes}</Text> : null}
+                    </Text>
+                  </View>
+                  <Ionicons name="chevron-forward" size={16} color={C.textDim} />
+                </TouchableOpacity>
+              ))}
+              {pcapEndpoints.length === 0 && (
+                <Text style={[s.helper, { padding: 16, textAlign: "center" }]}>
+                  no endpoints — add one in Settings → General
+                </Text>
+              )}
+            </ScrollView>
+          </View>
+        </View>
+      </Modal>
     </View>
   );
 }
@@ -453,8 +694,23 @@ const s = StyleSheet.create({
     width: "48.5%", backgroundColor: C.panel2, borderWidth: 1, borderColor: C.border,
     borderRadius: 4, padding: 8, marginBottom: 6,
   },
-  presetLabel: { color: C.text, fontFamily: MONO, fontSize: 11, fontWeight: "700" },
+  presetLabel: { color: C.text, fontFamily: MONO, fontSize: 11, fontWeight: "700", flex: 1 },
   presetDesc: { color: C.textDim, fontFamily: MONO, fontSize: 9 },
+
+  // Category filter chips above the preset grid
+  catRow: { flexDirection: "row", flexWrap: "wrap", marginBottom: 8, gap: 4 },
+  catChip: {
+    paddingHorizontal: 8, paddingVertical: 4,
+    borderRadius: 3, borderWidth: 1, borderColor: C.border, backgroundColor: C.panel2,
+  },
+  catChipText: { fontFamily: MONO, fontSize: 10, color: C.textDim },
+
+  // "tui" mini-badge on profile cards that use xterm view mode
+  tuiBadge: {
+    paddingHorizontal: 4, paddingVertical: 1, marginLeft: 4,
+    backgroundColor: "#1a1428", borderWidth: 1, borderColor: "#b08aff", borderRadius: 2,
+  },
+  tuiBadgeText: { fontFamily: MONO, fontSize: 7, color: "#b08aff", letterSpacing: 0.5 },
 
   cmdRow: {
     flexDirection: "row", alignItems: "center",
@@ -482,4 +738,28 @@ const s = StyleSheet.create({
 
   outLine: { color: C.text, fontFamily: MONO, fontSize: 10, lineHeight: 13 },
   helper: { color: C.textDim, fontFamily: MONO, fontSize: 10 },
+
+  // Endpoint picker modal
+  modalBackdrop: {
+    flex: 1, backgroundColor: "rgba(0,0,0,0.7)",
+    justifyContent: "center", alignItems: "center", padding: 20,
+  },
+  modalSheet: {
+    width: "100%", maxWidth: 480,
+    backgroundColor: C.panel, borderWidth: 1, borderColor: C.border,
+    borderRadius: 6, padding: 14,
+  },
+  modalHeader: {
+    flexDirection: "row", justifyContent: "space-between", alignItems: "center",
+    marginBottom: 8, paddingBottom: 8, borderBottomWidth: 1, borderBottomColor: C.border,
+  },
+  modalTitle: { color: C.green, fontFamily: MONO, fontSize: 13, fontWeight: "700", flex: 1 },
+  epRow: {
+    flexDirection: "row", alignItems: "center",
+    paddingVertical: 10, paddingHorizontal: 8,
+    backgroundColor: C.panel2, borderWidth: 1, borderColor: C.border,
+    borderRadius: 4, marginBottom: 6,
+  },
+  epName: { color: C.text, fontFamily: MONO, fontSize: 12, fontWeight: "700" },
+  epHost: { color: C.cyan, fontFamily: MONO, fontSize: 10, marginTop: 2 },
 });

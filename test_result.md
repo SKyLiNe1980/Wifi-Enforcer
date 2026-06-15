@@ -618,3 +618,133 @@ agent_communication:
           - Wifite2 PMKID one-tap profile
           - Nodes Tab / swarm clustering
 
+
+========================================================================
+2026-06-15 — LIVE TAB WRAP-UP (ATTACK PROFILES + PCAP-OVER-IP)
+========================================================================
+
+Migrated the hardcoded Live-tab PRESETS array to MongoDB `attack_profiles`
+collection, added PCAP-over-IP endpoint CRUD + endpoint-picker modal,
+introduced per-profile view_mode (xterm.js for TUI tools, FlatList for
+plain). Bottom-tab bar untouched, all the change lives in the Live tab +
+Settings → General.
+
+backend:
+  - task: "AttackProfile + PcapEndpoint models, CRUD, seeding"
+    implemented: true
+    working: true
+    file: "backend/server.py"
+    status_history:
+        - working: true
+          agent: "main"
+          comment: |
+            New collections: `attack_profiles` (9 seeded built-ins) and
+            `pcap_endpoints` (user-defined). Both with full CRUD endpoints
+            under /api/attack-profiles/* and /api/pcap-endpoints/*.
+
+            AttackProfile.command_template uses placeholders {iface},
+            {host}, {port}, {file} that the frontend substitutes at launch.
+            Categories: recon / attack / trace / pcap — used as the FE
+            filter chips. `needs_endpoint=true` profiles force an endpoint
+            pick before launching (only "PCAP → remote" right now).
+
+            Seeded profiles cover: airodump-ng (xterm), airodump→CSV,
+            wifite PMKID (xterm), wifite WPA (xterm), hcxdumptool,
+            tcpdump→file, PCAP→remote (the new pcap-over-IP one), iw event,
+            dmesg -w. The xterm-flagged ones get TUI rendering via the
+            xterm.js component we built for AI tab — wifite/airodump emit
+            curses/Rich output that needed the proper terminal emulator.
+
+            PcapEndpoint validates port range 1..65535 + transport ∈ {tcp,
+            udp}. Verified end-to-end via curl: POST/GET/PUT/DELETE all
+            return 200 with proper validation 400s on bad input.
+
+frontend:
+  - task: "LiveTab refactor — dynamic attack profiles + xterm rendering + endpoint picker"
+    implemented: true
+    working: "needs-eas-build"
+    file: "frontend/src/components/LiveTab.tsx"
+    status_history:
+        - working: "needs-eas-build"
+          agent: "main"
+          comment: |
+            Major rewrite: fetches attack_profiles + pcap_endpoints on
+            mount. Category filter chips (all/recon/attack/trace/pcap)
+            with counts. Profile cards have a colored left-border tied to
+            category, a `[tui]` mini-badge for xterm profiles, and a
+            `↪ pick endpoint` hint for needs_endpoint ones.
+
+            New `sessionViewModeRef: Map<sessionId, view_mode>` tracks
+            which sessions render via XTermView vs FlatList. Selected
+            session's view mode determines the bottom-pane component.
+            xterm sessions get a re-keyed XTermView (no auto-scroll
+            button — xterm handles its own scrolling).
+
+            Endpoint picker is a centered Modal with a list of saved
+            PcapEndpoints; tapping one substitutes {host}/{port} into the
+            command_template and starts the session. Empty state shows
+            an Alert pointing users to Settings → General to add one.
+
+            Verified via web screenshot: drawer renders all 9 profiles
+            with correct categories, tui badges where expected, pcap
+            filter shows only the PCAP→remote profile, color accents on
+            cards. Native exec validation requires EAS build.
+
+  - task: "Settings → General PCAP endpoint CRUD section"
+    implemented: true
+    working: true
+    file: "frontend/app/index.tsx"
+    status_history:
+        - working: true
+          agent: "main"
+          comment: |
+            Added between execution-mode and data sections. Inline list of
+            endpoints + "+ add endpoint" button. Editor sheet has fields:
+            name, host (URL keyboard), port (numeric 1..65535), TCP/UDP
+            segmented control, multi-line notes.
+
+            Helper text includes the listener-side recipe:
+            `nc -l -p 19000 | wireshark -k -i -`
+            so users know how to set up the remote side.
+
+            Verified via screenshot: section renders, editor opens cleanly,
+            CRUD round-trips work via API.
+
+test_plan:
+  current_focus:
+    - "User EAS-builds the APK and validates xterm.js rendering of wifite/airodump TUIs in Live tab"
+    - "User validates PCAP→remote streaming to a listener (e.g., wireshark on lab PC)"
+    - "User validates category filtering + endpoint picker workflow"
+  stuck_tasks: []
+  test_priority: "user_device_validation"
+
+agent_communication:
+    - agent: "main"
+      message: |
+        Live tab is now the proper capture/attack cockpit. Key data flow:
+
+          User taps "PCAP → remote" profile
+            → needs_endpoint=true → modal opens with saved PcapEndpoints
+            → user picks "Wireshark LAN" (192.168.1.50:19000)
+            → resolveTemplate substitutes {host}/{port}/{iface} in:
+                "tcpdump -i {iface} -U -w - | nc -w 3 {host} {port}"
+            → resolved: "tcpdump -i wlan2 -U -w - | nc -w 3 192.168.1.50 19000"
+            → sessionManager.start(wrap(resolved))
+            → live FlatList of packet-count lines + remote Wireshark sees
+              the stream
+
+        Listener-side recipe (user runs on the receiving box):
+          nc -l -p 19000 | wireshark -k -i -
+        Or with proper PCAP-over-IP convention:
+          mkfifo /tmp/pcap.fifo
+          nc -l -p 19000 > /tmp/pcap.fifo &
+          wireshark -k -i /tmp/pcap.fifo
+
+        NEXT (per backlog):
+          - Chroot wrap echo spam suppression (small, cosmetic)
+          - Airodump-ng live table parser (parse CSV → RN table)
+          - Attack-profile editor UI in Settings (user-defined attacks)
+          - MCP bridge polish (existing scaffolding at github.com/.../mcp)
+          - Nodes tab + Tailscale swarm
+          - Voice command stack (when Rayneo arrives)
+
