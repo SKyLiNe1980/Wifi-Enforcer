@@ -94,7 +94,31 @@ async function fetchWithRetry(url: string, opts: FetchOpts = {}): Promise<Respon
   throw lastErr instanceof Error ? lastErr : new Error("fetchWithRetry: unknown failure");
 }
 
-// ─── DataLoadState — per-resource hydration status ───────────────────────
+// ─── fetchJSON helper ────────────────────────────────────────────────────
+// Layer on top of fetchWithRetry that handles the .json() parse and, on
+// failure, enriches the error with a preview of what came back. This
+// surfaces silent "I got HTML when I expected JSON" cases (captive portal,
+// Cloudflare challenge, Tailscale split-DNS hijack, proxy injection, etc.)
+// instead of leaving the user staring at "Unexpected character p".
+//
+// Throws Error with .message like:
+//   "HTTP 200 · text/html · body: <html><body><p>Please verify..."
+async function fetchJSON<T = any>(url: string, opts: FetchOpts = {}): Promise<T> {
+  const r = await fetchWithRetry(url, opts);
+  const ct = r.headers.get("content-type") || "";
+  // Slurp body once — we'll either JSON.parse it or include preview in error
+  const text = await r.text();
+  if (!r.ok) {
+    const preview = text.slice(0, 120).replace(/\s+/g, " ");
+    throw new Error(`HTTP ${r.status} · ${ct} · body: ${preview}`);
+  }
+  try {
+    return JSON.parse(text) as T;
+  } catch (e: any) {
+    const preview = text.slice(0, 120).replace(/\s+/g, " ");
+    throw new Error(`JSON parse fail · ${ct} · body: ${preview}`);
+  }
+}
 // Lives in App-level state so // system block can render the truth.
 // Each key tracks: "loading" | "ok" (with timestamp) | "error" (with msg).
 // When a value is "error", a refresh button in Settings → General → //
@@ -291,35 +315,20 @@ export default function App() {
   const fetchAll = useCallback(async () => {
     setResource("health", { kind: "loading" });
     setResource("profiles", { kind: "loading" });
-    // Run the three in parallel but track each one's status independently —
-    // a flake on /logs shouldn't make /profiles look broken too.
     const tasks = [
-      fetchWithRetry(`${API}/health`)
-        .then((r) => r.json())
-        .then((h) => {
-          setRootInfo(h);
-          setResource("health", { kind: "ok", at: Date.now() });
-        })
-        .catch((e) => {
-          setResource("health", { kind: "error", message: e?.message || "fetch failed", at: Date.now() });
-        }),
-      fetchWithRetry(`${API}/logs?limit=200`)
-        .then((r) => r.json())
+      fetchJSON<any>(`${API}/health`)
+        .then((h) => { setRootInfo(h); setResource("health", { kind: "ok", at: Date.now() }); })
+        .catch((e) => setResource("health", { kind: "error", message: e?.message || "fetch failed", at: Date.now() })),
+      fetchJSON<Log[]>(`${API}/logs?limit=200`)
         .then((lg) => {
-          const reversed = (lg as Log[]).slice().reverse();
+          const reversed = lg.slice().reverse();
           historicalCountRef.current = reversed.length;
           setLogs(reversed);
         })
-        .catch((e) => { /* eslint-disable-next-line no-console */ console.warn("logs fetch failed:", e?.message); }),
-      fetchWithRetry(`${API}/profiles`)
-        .then((r) => r.json())
-        .then((pf) => {
-          setProfiles(pf as Profile[]);
-          setResource("profiles", { kind: "ok", at: Date.now(), count: (pf as Profile[]).length });
-        })
-        .catch((e) => {
-          setResource("profiles", { kind: "error", message: e?.message || "fetch failed", at: Date.now() });
-        }),
+        .catch((e) => { console.warn("logs fetch failed:", e?.message); }),
+      fetchJSON<Profile[]>(`${API}/profiles`)
+        .then((pf) => { setProfiles(pf); setResource("profiles", { kind: "ok", at: Date.now(), count: pf.length }); })
+        .catch((e) => setResource("profiles", { kind: "error", message: e?.message || "fetch failed", at: Date.now() })),
     ];
     await Promise.allSettled(tasks);
   }, [setResource]);
@@ -334,9 +343,7 @@ export default function App() {
   const fetchAIProfiles = useCallback(async () => {
     setResource("aiProfiles", { kind: "loading" });
     try {
-      const r = await fetchWithRetry(`${API}/ai-profiles`);
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      const data = await r.json();
+      const data = await fetchJSON<any[]>(`${API}/ai-profiles`);
       setAiProfilesList(data);
       setResource("aiProfiles", { kind: "ok", at: Date.now(), count: data.length });
     } catch (e: any) {
@@ -448,15 +455,36 @@ export default function App() {
   const fetchPcapEndpoints = useCallback(async () => {
     setResource("pcapEndpoints", { kind: "loading" });
     try {
-      const r = await fetchWithRetry(`${API}/pcap-endpoints`);
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      const data = await r.json();
+      const data = await fetchJSON<any[]>(`${API}/pcap-endpoints`);
       setPcapEndpointsList(data);
       setResource("pcapEndpoints", { kind: "ok", at: Date.now(), count: data.length });
     } catch (e: any) {
       setResource("pcapEndpoints", { kind: "error", message: e?.message || "fetch failed", at: Date.now() });
     }
   }, [setResource]);
+
+  // ─── API ping diagnostic ────────────────────────────────────────────────
+  // Single-shot connectivity probe surfaced in Settings → // data status.
+  // Shows: HTTP code, content-type, response time, body preview. Handy for
+  // the multi-route scenario (Wi-Fi + mobile data + Tailscale) where one
+  // path gets hijacked by a captive portal / Cloudflare challenge / split
+  // DNS and returns junk that breaks the app silently.
+  const [apiPing, setApiPing] = useState<string>("");
+  const pingApi = useCallback(async () => {
+    setApiPing("pinging…");
+    const t0 = Date.now();
+    try {
+      const r = await fetch(`${API}/health`);
+      const dt = Date.now() - t0;
+      const ct = r.headers.get("content-type") || "?";
+      const text = await r.text();
+      const preview = text.slice(0, 80).replace(/\s+/g, " ");
+      setApiPing(`HTTP ${r.status} · ${dt}ms · ${ct} · ${preview}`);
+    } catch (e: any) {
+      const dt = Date.now() - t0;
+      setApiPing(`FAILED · ${dt}ms · ${e?.message || "network error"}`);
+    }
+  }, []);
 
   useEffect(() => { fetchPcapEndpoints(); }, [fetchPcapEndpoints]);
 
@@ -573,10 +601,7 @@ export default function App() {
   const reloadSettings = useCallback(async () => {
     setResource("settings", { kind: "loading" });
     try {
-      const r = await fetchWithRetry(`${API}/settings`);
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      const s = await r.json();
-      // eslint-disable-next-line no-console
+      const s = await fetchJSON<any>(`${API}/settings`);
       console.log(`[settings] GET → exec_mode=${s?.exec_mode} iface_a=${s?.iface_a}`);
       if (s.iface_a) setIface(s.iface_a);
       if (s.iface_b !== undefined) setIfaceB(s.iface_b);
@@ -586,26 +611,18 @@ export default function App() {
       if (s.chroot_path) {
         const legacy = [
           "bootkali", "bootkali_login", "bootkali_bash",
-          "bootkali custom_cmd",
-          "nethunter", "nh",
-          "echo | bootkali",
+          "bootkali custom_cmd", "nethunter", "nh", "echo | bootkali",
         ];
         const v = s.chroot_path.trim();
         setChrootPath(legacy.includes(v) ? NETHUNTER_CHROOT : v);
       }
       if (s.exec_mode === "real" || s.exec_mode === "kali" || s.exec_mode === "mock") {
-        // eslint-disable-next-line no-console
-        console.log(`[settings] applying exec_mode=${s.exec_mode}`);
         setExecMode(s.exec_mode);
-      } else {
-        // eslint-disable-next-line no-console
-        console.warn(`[settings] exec_mode rejected (value=${JSON.stringify(s.exec_mode)})`);
       }
       settingsLoaded.current = true;
       setResource("settings", { kind: "ok", at: Date.now() });
     } catch (e: any) {
-      // eslint-disable-next-line no-console
-      console.error("[settings] GET failed after retries:", e?.message);
+      console.error("[settings] GET failed:", e?.message);
       setResource("settings", { kind: "error", message: e?.message || "fetch failed", at: Date.now() });
     }
   }, [setResource]);
@@ -1074,15 +1091,28 @@ export default function App() {
           pcap-endpoints). ─── */}
       <View style={[s.sectionRow, { marginTop: 14 }]}>
         <Text style={s.sectionTitle}>// data status</Text>
-        <TouchableOpacity
-          testID="btn-reload-data"
-          onPress={() => { reloadSettings(); fetchAll(); fetchAIProfiles(); fetchPcapEndpoints(); }}
-          style={s.smallBtn}
-        >
-          <Ionicons name="refresh" size={14} color={C.green} />
-          <Text style={[s.smallBtnText, { color: C.green }]}>reload</Text>
-        </TouchableOpacity>
+        <View style={{ flexDirection: "row", gap: 6 }}>
+          <TouchableOpacity testID="btn-ping-api" onPress={pingApi} style={s.smallBtn}>
+            <MaterialCommunityIcons name="lan-pending" size={14} color={C.cyan} />
+            <Text style={[s.smallBtnText, { color: C.cyan }]}>ping</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            testID="btn-reload-data"
+            onPress={() => { reloadSettings(); fetchAll(); fetchAIProfiles(); fetchPcapEndpoints(); }}
+            style={s.smallBtn}
+          >
+            <Ionicons name="refresh" size={14} color={C.green} />
+            <Text style={[s.smallBtnText, { color: C.green }]}>reload</Text>
+          </TouchableOpacity>
+        </View>
       </View>
+      {!!apiPing && (
+        <View style={[s.kvBlock, { marginBottom: 6 }]}>
+          <Text style={[s.helper, { fontFamily: MONO, color: apiPing.startsWith("HTTP 2") ? C.green : C.yellow }]} selectable>
+            ping → {apiPing}
+          </Text>
+        </View>
+      )}
       <View style={s.kvBlock}>
         {(["settings", "health", "profiles", "aiProfiles", "pcapEndpoints"] as const).map((key) => {
           const st = dataState[key];

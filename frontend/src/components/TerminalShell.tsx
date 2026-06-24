@@ -20,6 +20,7 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { Alert, Platform, StyleSheet, Text, TouchableOpacity, View } from "react-native";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
+import * as Clipboard from "expo-clipboard";
 import { sessionManager, SessionState } from "../lib/sessionManager";
 import { hasNativeStreaming, HAS_NATIVE_ROOT, writeStdin } from "../lib/rootShell";
 import XTermView from "./XTermView";
@@ -145,6 +146,29 @@ export default function TerminalShell({ execMode, wrap, pendingInjection }: Prop
     writeStdin(sessionId, "\x0c", false).catch(() => {});
   }, [sessionId]);
 
+  // ─── Copy session scrollback to clipboard ────────────────────────────
+  // xterm.js + RN WebView don't easily expose long-press text-select on
+  // Android. This button grabs the session's line ring buffer (which
+  // mirrors what xterm just rendered) and dumps it to the system
+  // clipboard. Lossy w.r.t. ANSI escapes (sessionManager stored stripped
+  // lines), but for "I need to paste this curl output into a chat" the
+  // plain text is what you want anyway.
+  const handleCopy = useCallback(async () => {
+    if (!sessionId) return;
+    const s = sessionManager.sessions.get(sessionId);
+    if (!s || s.lines.length === 0) {
+      Alert.alert("Nothing to copy", "Session buffer is empty.");
+      return;
+    }
+    const text = s.lines.map((l) => l.line).join("\n");
+    try {
+      await Clipboard.setStringAsync(text);
+      Alert.alert("Copied", `${s.lines.length} lines (${text.length} chars) on clipboard.`);
+    } catch (e: any) {
+      Alert.alert("Copy failed", e?.message || "Unknown error");
+    }
+  }, [sessionId]);
+
   // ─── Input from xterm WebView ────────────────────────────────────────
   const handleXTermInput = useCallback(
     (data: string) => {
@@ -206,6 +230,18 @@ export default function TerminalShell({ execMode, wrap, pendingInjection }: Prop
         >
           <MaterialCommunityIcons name="broom" size={16} color={C.textDim} />
           <Text style={s.miniBtnText}>clear</Text>
+        </TouchableOpacity>
+
+        {/* Copy whole session scrollback to system clipboard — workaround
+            for xterm.js + Android WebView's painful text-selection UX. */}
+        <TouchableOpacity
+          testID="btn-term-copy"
+          onPress={handleCopy}
+          disabled={!session || session.lines.length === 0}
+          style={[s.miniBtn, (!session || session.lines.length === 0) && { opacity: 0.4 }]}
+        >
+          <MaterialCommunityIcons name="content-copy" size={16} color={C.cyan} />
+          <Text style={[s.miniBtnText, { color: C.cyan }]}>copy</Text>
         </TouchableOpacity>
 
         {session && (
