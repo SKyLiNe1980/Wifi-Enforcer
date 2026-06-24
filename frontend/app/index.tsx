@@ -17,6 +17,7 @@ import {
   Alert,
   ActivityIndicator,
   RefreshControl,
+  AppState,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { StatusBar } from "expo-status-bar";
@@ -50,6 +51,74 @@ const C = {
 };
 
 const MONO = Platform.select({ ios: "Menlo", android: "monospace", default: "monospace" });
+
+// ─── fetchWithRetry helper ───────────────────────────────────────────────
+// Wraps `fetch` with exponential backoff retry for transient errors. The
+// app's cold-boot path was previously **fatally fragile**: ONE network blip
+// (Wi-Fi not associated yet, captive portal not resolved, backend service
+// reloading) would cause settings GET to fail silently, leaving the UI on
+// initial defaults. Then any later user toggle would PUT those defaults
+// back to Mongo and clobber the real saved state. Symptoms: "exec_mode
+// stuck on mock", "AI tab empty", "Live attack profiles missing".
+//
+// Retry policy:
+//   - Network errors (TypeError) + 5xx + 429 → retry
+//   - 4xx other than 408/429 → DON'T retry (it's a real client bug)
+//   - Backoff: 300ms · 600ms · 1200ms · 2400ms (capped) — total ~4.5s
+//
+// On final failure, throws so callers can surface a visible error state
+// rather than silently swallowing.
+type FetchOpts = RequestInit & { retries?: number; baseDelay?: number };
+async function fetchWithRetry(url: string, opts: FetchOpts = {}): Promise<Response> {
+  const { retries = 4, baseDelay = 300, ...init } = opts;
+  let lastErr: unknown = null;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const r = await fetch(url, init);
+      // 408 Request Timeout / 429 Too Many Requests / 5xx are retry-worthy.
+      // Everything else (200, 4xx not in the retry list) is final.
+      if (r.ok || (r.status >= 400 && r.status < 500 && r.status !== 408 && r.status !== 429)) {
+        return r;
+      }
+      lastErr = new Error(`HTTP ${r.status}`);
+    } catch (e) {
+      // TypeError "Network request failed" lands here — exactly what we
+      // want to retry. Re-throw on the final attempt.
+      lastErr = e;
+    }
+    if (attempt < retries) {
+      const delay = Math.min(baseDelay * Math.pow(2, attempt), 5000);
+      await new Promise((res) => setTimeout(res, delay));
+    }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error("fetchWithRetry: unknown failure");
+}
+
+// ─── DataLoadState — per-resource hydration status ───────────────────────
+// Lives in App-level state so // system block can render the truth.
+// Each key tracks: "loading" | "ok" (with timestamp) | "error" (with msg).
+// When a value is "error", a refresh button in Settings → General → //
+// system lets the user force a re-fetch instead of having to kill the app.
+type ResourceStatus =
+  | { kind: "loading" }
+  | { kind: "ok"; at: number; count?: number }
+  | { kind: "error"; message: string; at: number };
+
+type DataLoadState = {
+  settings: ResourceStatus;
+  profiles: ResourceStatus;
+  aiProfiles: ResourceStatus;
+  pcapEndpoints: ResourceStatus;
+  health: ResourceStatus;
+};
+
+const INITIAL_DATA_STATE: DataLoadState = {
+  settings: { kind: "loading" },
+  profiles: { kind: "loading" },
+  aiProfiles: { kind: "loading" },
+  pcapEndpoints: { kind: "loading" },
+  health: { kind: "loading" },
+};
 
 const BANNER = `\
  _____ _   _ _____ ___  ____   ____ _____ ____  
@@ -184,6 +253,16 @@ export default function App() {
   const [pcapEditing, setPcapEditing] = useState<any | null>(null);
   const [pcapSaving, setPcapSaving] = useState(false);
 
+  // ─── Data load state — per-resource hydration tracking ──────────────────
+  // Surfaced in Settings → General → // system block. Lets the user see
+  // exactly which resources loaded vs. which are stuck, with a one-tap
+  // "Reload" button to retry. Replaces silent fetch-failure mode that was
+  // the root cause of "exec_mode stuck on mock" + "AI tab empty" etc.
+  const [dataState, setDataState] = useState<DataLoadState>(INITIAL_DATA_STATE);
+  const setResource = useCallback(<K extends keyof DataLoadState>(k: K, st: ResourceStatus) => {
+    setDataState((prev) => ({ ...prev, [k]: st }));
+  }, []);
+
   const ctx: Ctx = { iface, country };
 
   // Resolve active interface(s) based on activeIface selector
@@ -210,21 +289,40 @@ export default function App() {
   }, [execMode, chrootPath]);
 
   const fetchAll = useCallback(async () => {
-    try {
-      const [h, lg, pf] = await Promise.all([
-        fetch(`${API}/health`).then((r) => r.json()),
-        fetch(`${API}/logs?limit=200`).then((r) => r.json()),
-        fetch(`${API}/profiles`).then((r) => r.json()),
-      ]);
-      setRootInfo(h);
-      const reversed = (lg as Log[]).slice().reverse();
-      historicalCountRef.current = reversed.length;
-      setLogs(reversed);
-      setProfiles(pf as Profile[]);
-    } catch (e) {
-      console.warn("fetchAll error", e);
-    }
-  }, []);
+    setResource("health", { kind: "loading" });
+    setResource("profiles", { kind: "loading" });
+    // Run the three in parallel but track each one's status independently —
+    // a flake on /logs shouldn't make /profiles look broken too.
+    const tasks = [
+      fetchWithRetry(`${API}/health`)
+        .then((r) => r.json())
+        .then((h) => {
+          setRootInfo(h);
+          setResource("health", { kind: "ok", at: Date.now() });
+        })
+        .catch((e) => {
+          setResource("health", { kind: "error", message: e?.message || "fetch failed", at: Date.now() });
+        }),
+      fetchWithRetry(`${API}/logs?limit=200`)
+        .then((r) => r.json())
+        .then((lg) => {
+          const reversed = (lg as Log[]).slice().reverse();
+          historicalCountRef.current = reversed.length;
+          setLogs(reversed);
+        })
+        .catch((e) => { /* eslint-disable-next-line no-console */ console.warn("logs fetch failed:", e?.message); }),
+      fetchWithRetry(`${API}/profiles`)
+        .then((r) => r.json())
+        .then((pf) => {
+          setProfiles(pf as Profile[]);
+          setResource("profiles", { kind: "ok", at: Date.now(), count: (pf as Profile[]).length });
+        })
+        .catch((e) => {
+          setResource("profiles", { kind: "error", message: e?.message || "fetch failed", at: Date.now() });
+        }),
+    ];
+    await Promise.allSettled(tasks);
+  }, [setResource]);
 
   useEffect(() => { fetchAll(); }, [fetchAll]);
 
@@ -234,15 +332,17 @@ export default function App() {
   // Settings > AI Agents sub-tab can share a single source of truth.
   // We keep AITab's internal fetch too — they de-dupe via the backend.
   const fetchAIProfiles = useCallback(async () => {
+    setResource("aiProfiles", { kind: "loading" });
     try {
-      const r = await fetch(`${API}/ai-profiles`);
-      if (!r.ok) return;
+      const r = await fetchWithRetry(`${API}/ai-profiles`);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const data = await r.json();
       setAiProfilesList(data);
-    } catch {
-      /* non-fatal */
+      setResource("aiProfiles", { kind: "ok", at: Date.now(), count: data.length });
+    } catch (e: any) {
+      setResource("aiProfiles", { kind: "error", message: e?.message || "fetch failed", at: Date.now() });
     }
-  }, []);
+  }, [setResource]);
 
   useEffect(() => { fetchAIProfiles(); }, [fetchAIProfiles]);
 
@@ -346,13 +446,17 @@ export default function App() {
   // generic <CrudEditor /> helper later, but explicit copies are easier to
   // tweak per-resource (PCAP endpoint forms need port validation, etc).
   const fetchPcapEndpoints = useCallback(async () => {
+    setResource("pcapEndpoints", { kind: "loading" });
     try {
-      const r = await fetch(`${API}/pcap-endpoints`);
-      if (!r.ok) return;
+      const r = await fetchWithRetry(`${API}/pcap-endpoints`);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const data = await r.json();
       setPcapEndpointsList(data);
-    } catch { /* non-fatal */ }
-  }, []);
+      setResource("pcapEndpoints", { kind: "ok", at: Date.now(), count: data.length });
+    } catch (e: any) {
+      setResource("pcapEndpoints", { kind: "error", message: e?.message || "fetch failed", at: Date.now() });
+    }
+  }, [setResource]);
 
   useEffect(() => { fetchPcapEndpoints(); }, [fetchPcapEndpoints]);
 
@@ -464,57 +568,69 @@ export default function App() {
   // at full brightness below the divider.
   const historicalCountRef = useRef<number>(0);
 
-  // Load persisted settings on mount
-  useEffect(() => {
-    fetch(`${API}/settings`)
-      .then((r) => r.json())
-      .then((s) => {
-        // TEMPORARY DEBUG (remove after issue confirmed fixed): trace what
-        // GET /settings returned and what mode we're about to apply, so a
-        // LogFox capture can tell us whether the backend value is what
-        // we expect AND whether setExecMode actually runs.
+  // Settings GET extracted into its own callback so the // data status
+  // "reload" button can re-run it manually if the initial load failed.
+  const reloadSettings = useCallback(async () => {
+    setResource("settings", { kind: "loading" });
+    try {
+      const r = await fetchWithRetry(`${API}/settings`);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const s = await r.json();
+      // eslint-disable-next-line no-console
+      console.log(`[settings] GET → exec_mode=${s?.exec_mode} iface_a=${s?.iface_a}`);
+      if (s.iface_a) setIface(s.iface_a);
+      if (s.iface_b !== undefined) setIfaceB(s.iface_b);
+      if (s.iface_c !== undefined) setIfaceC(s.iface_c);
+      if (s.country) setCountry(s.country);
+      if (s.active_iface) setActiveIface(s.active_iface);
+      if (s.chroot_path) {
+        const legacy = [
+          "bootkali", "bootkali_login", "bootkali_bash",
+          "bootkali custom_cmd",
+          "nethunter", "nh",
+          "echo | bootkali",
+        ];
+        const v = s.chroot_path.trim();
+        setChrootPath(legacy.includes(v) ? NETHUNTER_CHROOT : v);
+      }
+      if (s.exec_mode === "real" || s.exec_mode === "kali" || s.exec_mode === "mock") {
         // eslint-disable-next-line no-console
-        console.log(`[settings] GET /settings → exec_mode=${s?.exec_mode} iface_a=${s?.iface_a} country=${s?.country}`);
-        if (s.iface_a) setIface(s.iface_a);
-        if (s.iface_b !== undefined) setIfaceB(s.iface_b);
-        if (s.iface_c !== undefined) setIfaceC(s.iface_c);
-        if (s.country) setCountry(s.country);
-        if (s.active_iface) setActiveIface(s.active_iface);
-        if (s.chroot_path) {
-          // Self-heal: legacy values that don't work due to Android data isolation get upgraded
-          // to the data_mirror chroot pattern (the one that actually works on OffSec NetHunter).
-          const legacy = [
-            "bootkali", "bootkali_login", "bootkali_bash",
-            "bootkali custom_cmd",
-            "nethunter", "nh",
-            "echo | bootkali",
-          ];
-          const v = s.chroot_path.trim();
-          setChrootPath(legacy.includes(v) ? NETHUNTER_CHROOT : v);
-        }
-        // Restore the last exec_mode used. Simple persistence — whatever mode
-        // you were in when you closed the app is what you boot into.
-        // (Removed the prior `default_exec_mode` split — see git history. The
-        // dual concept was confusing AND had a default-default bug where backend's
-        // implicit "mock" default would silently clobber a user's actual saved
-        // exec_mode on every cold start.)
-        if (s.exec_mode === "real" || s.exec_mode === "kali" || s.exec_mode === "mock") {
-          // eslint-disable-next-line no-console
-          console.log(`[settings] applying exec_mode=${s.exec_mode}`);
-          setExecMode(s.exec_mode);
-        } else {
-          // eslint-disable-next-line no-console
-          console.log(`[settings] exec_mode rejected (value="${s.exec_mode}", type=${typeof s.exec_mode}) — staying on initial mock`);
-        }
-      })
-      .catch(() => {})
-      .finally(() => {
-        // Allow writes only after we know what's persisted. Without this, the
-        // PUT below would race-clobber saved settings with the initial in-memory
-        // state on every cold start.
-        settingsLoaded.current = true;
-      });
-  }, []);
+        console.log(`[settings] applying exec_mode=${s.exec_mode}`);
+        setExecMode(s.exec_mode);
+      } else {
+        // eslint-disable-next-line no-console
+        console.warn(`[settings] exec_mode rejected (value=${JSON.stringify(s.exec_mode)})`);
+      }
+      settingsLoaded.current = true;
+      setResource("settings", { kind: "ok", at: Date.now() });
+    } catch (e: any) {
+      // eslint-disable-next-line no-console
+      console.error("[settings] GET failed after retries:", e?.message);
+      setResource("settings", { kind: "error", message: e?.message || "fetch failed", at: Date.now() });
+    }
+  }, [setResource]);
+
+  useEffect(() => { reloadSettings(); }, [reloadSettings]);
+
+  // ─── Refresh on app foreground ────────────────────────────────────────
+  // When the user backgrounds the app (locks phone, switches to another
+  // app) and comes back, re-run all GETs. Catches the case where Wi-Fi
+  // got dropped/changed in the meantime AND the cold-boot equivalent for
+  // long-suspended apps. Also catches transient backend restarts that
+  // happened while the app was in the background.
+  useEffect(() => {
+    const sub = AppState.addEventListener("change", (state) => {
+      if (state === "active") {
+        // eslint-disable-next-line no-console
+        console.log("[appstate] active — refreshing data");
+        reloadSettings();
+        fetchAll();
+        fetchAIProfiles();
+        fetchPcapEndpoints();
+      }
+    });
+    return () => sub.remove();
+  }, [reloadSettings, fetchAll, fetchAIProfiles, fetchPcapEndpoints]);
 
   // Save on change — but only AFTER initial load completes
   useEffect(() => {
@@ -950,6 +1066,50 @@ export default function App() {
         <KV k="api" v={API} vColor={C.textDim} />
       </View>
 
+      {/* ─── Data load status — visibility into the previously-silent
+          fetch-failure mode that caused "exec_mode stuck on mock" + "AI
+          tab empty" etc. Each row shows OK/loading/error + a count or
+          last-error message. Tap "reload" to force a re-fetch of
+          everything (settings, profiles, ai-profiles, attack-profiles,
+          pcap-endpoints). ─── */}
+      <View style={[s.sectionRow, { marginTop: 14 }]}>
+        <Text style={s.sectionTitle}>// data status</Text>
+        <TouchableOpacity
+          testID="btn-reload-data"
+          onPress={() => { reloadSettings(); fetchAll(); fetchAIProfiles(); fetchPcapEndpoints(); }}
+          style={s.smallBtn}
+        >
+          <Ionicons name="refresh" size={14} color={C.green} />
+          <Text style={[s.smallBtnText, { color: C.green }]}>reload</Text>
+        </TouchableOpacity>
+      </View>
+      <View style={s.kvBlock}>
+        {(["settings", "health", "profiles", "aiProfiles", "pcapEndpoints"] as const).map((key) => {
+          const st = dataState[key];
+          const label =
+            key === "settings" ? "settings" :
+            key === "health" ? "health" :
+            key === "profiles" ? "profiles" :
+            key === "aiProfiles" ? "ai-profiles" :
+            "pcap-endpoints";
+          let value: string;
+          let color: string;
+          if (st.kind === "loading") { value = "loading…"; color = C.yellow; }
+          else if (st.kind === "ok") {
+            value = st.count !== undefined ? `OK · ${st.count} item${st.count === 1 ? "" : "s"}` : "OK";
+            color = C.green;
+          }
+          else { value = `ERR · ${st.message}`; color = C.red; }
+          return <KV key={key} k={label} v={value} vColor={color} />;
+        })}
+        {!settingsLoaded.current && dataState.settings.kind === "error" && (
+          <Text style={[s.helper, { color: C.red, marginTop: 6 }]}>
+            ⚠ settings not loaded — writes BLOCKED to prevent clobbering backend.
+            Tap reload to retry; toggling exec mode won&apos;t persist until settings load.
+          </Text>
+        )}
+      </View>
+
       <Text style={[s.sectionTitle, { marginTop: 24 }]}>// execution mode</Text>
       <View style={s.segGroup}>
         {(["mock", "real", "kali"] as ExecMode[]).map((m) => {
@@ -1061,7 +1221,13 @@ export default function App() {
         </View>
       )}
 
-      <Text style={[s.sectionTitle, { marginTop: 24 }]}>// pcap endpoints ({pcapEndpointsList.length})</Text>
+      <View style={s.sectionRow}>
+        <Text style={s.sectionTitle}>// pcap endpoints ({pcapEndpointsList.length})</Text>
+        <TouchableOpacity testID="btn-pcap-new" onPress={() => openPcapEditor(null)} style={s.smallBtn}>
+          <Ionicons name="add" size={14} color={C.magenta} />
+          <Text style={[s.smallBtnText, { color: C.magenta }]}>add endpoint</Text>
+        </TouchableOpacity>
+      </View>
       <Text style={s.helper}>
         remote receivers for PCAP-over-IP streams. start a listener on the target:{"\n"}
         <Text style={{ color: C.cyan }}>nc -l -p 19000 | wireshark -k -i -</Text>{"\n"}
@@ -1092,11 +1258,6 @@ export default function App() {
           </View>
         </View>
       ))}
-      <TouchableOpacity testID="btn-pcap-new" onPress={() => openPcapEditor(null)}
-        style={[s.smallBtn, { alignSelf: "flex-start", marginTop: 8 }]}>
-        <Ionicons name="add" size={14} color={C.magenta} />
-        <Text style={[s.smallBtnText, { color: C.magenta }]}>add endpoint</Text>
-      </TouchableOpacity>
 
       <Text style={[s.sectionTitle, { marginTop: 24 }]}>// data</Text>
       <TouchableOpacity testID="btn-export" onPress={() => setExportOpen((v) => !v)} style={s.row}>
