@@ -70,20 +70,32 @@ const MONO = Platform.select({ ios: "Menlo", android: "monospace", default: "mon
 // rather than silently swallowing.
 type FetchOpts = RequestInit & { retries?: number; baseDelay?: number };
 async function fetchWithRetry(url: string, opts: FetchOpts = {}): Promise<Response> {
-  const { retries = 4, baseDelay = 300, ...init } = opts;
+  const { retries = 4, baseDelay = 300, headers: headersIn, ...init } = opts;
+  // Send browser-ish headers to dodge Cloudflare bot detection. RN's
+  // default fetch sends a very minimal request that CF / proxies often
+  // flag as "bot-like" → intermittent challenge pages / 4xx responses /
+  // junk HTML in place of JSON. Setting a clear User-Agent + Accept
+  // headers makes us look like a real app and tends to make CF's
+  // heuristics relax. (`__cf_bm` cookies still need to round-trip, but
+  // RN's fetch handles cookies automatically per-host.)
+  const baseHeaders: Record<string, string> = {
+    "User-Agent": "Enforcer/0.1 (Android; React-Native)",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
+  };
+  // Caller-provided headers override defaults (some endpoints set
+  // Content-Type, Authorization, etc.).
+  const headers = { ...baseHeaders, ...(headersIn as Record<string, string> || {}) };
   let lastErr: unknown = null;
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
-      const r = await fetch(url, init);
-      // 408 Request Timeout / 429 Too Many Requests / 5xx are retry-worthy.
-      // Everything else (200, 4xx not in the retry list) is final.
+      const r = await fetch(url, { ...init, headers });
       if (r.ok || (r.status >= 400 && r.status < 500 && r.status !== 408 && r.status !== 429)) {
         return r;
       }
       lastErr = new Error(`HTTP ${r.status}`);
     } catch (e) {
-      // TypeError "Network request failed" lands here — exactly what we
-      // want to retry. Re-throw on the final attempt.
       lastErr = e;
     }
     if (attempt < retries) {
