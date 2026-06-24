@@ -44,8 +44,7 @@
       ],
       "./plugins/withRootShell",
       "expo-web-browser",
-      "expo-font",
-      "expo-sqlite"
+      "expo-font"
     ],
     "experiments": {
       "typedRoutes": true
