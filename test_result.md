@@ -748,3 +748,116 @@ agent_communication:
           - Nodes tab + Tailscale swarm
           - Voice command stack (when Rayneo arrives)
 
+
+========================================================================
+2026-06-24 — MOCK-STICKINESS ROOT CAUSE FIX + DATA OBSERVABILITY
+========================================================================
+
+Eliminated the "exec_mode stuck on mock" / "AI tab empty" / "PCAP 404"
+silent-fetch-failure pattern by adding retry, gating writes on success,
+and surfacing per-resource load status in the UI.
+
+frontend:
+  - task: "fetchWithRetry helper + exponential backoff"
+    implemented: true
+    working: true
+    file: "frontend/app/index.tsx"
+    status_history:
+        - working: true
+          agent: "main"
+          comment: |
+            Wraps fetch with exponential backoff (300/600/1200/2400ms,
+            capped 5s, ~4.5s total). Retries on network errors + 5xx +
+            429/408. Does NOT retry on other 4xx (real client bugs).
+            Applied to all critical fetches: settings, profiles, logs,
+            ai-profiles, pcap-endpoints. Throws on final failure so
+            callers surface visible error state.
+
+  - task: "Settings GET — gate writes on success"
+    implemented: true
+    working: true
+    file: "frontend/app/index.tsx"
+    status_history:
+        - working: true
+          agent: "main"
+          comment: |
+            ROOT CAUSE NAILED: `settingsLoaded.current = true` was in
+            `.finally()`, so it flipped true even on fetch FAILURE. That
+            unlocked the PUT useEffect, which then race-clobbered the
+            backend with the in-memory defaults ("mock") on any user
+            interaction. Fix: settingsLoaded only flips true in `.then()`
+            (success path). Extracted into reloadSettings() callback so
+            the manual reload button can re-run it.
+
+  - task: "Data load status block in // system"
+    implemented: true
+    working: true
+    file: "frontend/app/index.tsx"
+    status_history:
+        - working: true
+          agent: "main"
+          comment: |
+            New `// data status` section in Settings → General shows each
+            critical resource's hydration state: loading / OK · N items /
+            ERR · message. "reload" button at top-right of the section
+            re-runs all GETs on demand. Warning banner appears when
+            settings failed to load with explicit note "writes BLOCKED
+            to prevent clobbering backend". User can now SEE exactly
+            what's broken instead of guessing.
+
+  - task: "AppState foreground refresh"
+    implemented: true
+    working: true
+    file: "frontend/app/index.tsx"
+    status_history:
+        - working: true
+          agent: "main"
+          comment: |
+            AppState listener triggers reload of all data when the app
+            comes back to "active" from background. Catches Wi-Fi changes,
+            backend restarts that happened while backgrounded, and the
+            long-suspended-app cold-boot equivalent.
+
+test_plan:
+  current_focus:
+    - "User EAS-builds the APK and validates exec_mode persists across cold boots"
+    - "User validates // data status block shows correct OK/ERR per resource"
+    - "User validates 'reload' button recovers stuck state without app restart"
+    - "User cold-boots in poor network conditions and observes retry behavior"
+  stuck_tasks: []
+
+agent_communication:
+    - agent: "main"
+      message: |
+        The mock-stickiness bug was caused by THREE compounding issues:
+
+        1. **Silent fetch failures** — `.catch(() => {})` swallowed errors,
+           UI stayed on initial defaults with zero visibility.
+        2. **`settingsLoaded` race** — `.finally()` flipped it true even
+           on failure, unlocking the PUT useEffect which would then
+           clobber backend with default values on any user toggle.
+        3. **No retry on cold boot** — first network call often happens
+           before Wi-Fi is fully associated; one TypeError = total loss.
+
+        Fix is layered:
+          - Retry with backoff masks transient flakes
+          - Gate writes on actual success masks the data corruption path
+          - Per-resource status surface tells the user what's actually
+            happening, with manual reload as a safety valve
+          - AppState foreground refresh catches the "phone slept, network
+            changed" scenario
+
+        WHAT TO TEST ON DEVICE:
+          1. Cold boot in KALI mode → should land on KALI (not mock)
+          2. Settings → General → // data status → all rows should say "OK"
+          3. Toggle airplane mode ON, wait, OFF → reload button restores
+          4. Background app for 30s, switch to mobile data, foreground →
+             auto-refresh should happen, data status stays OK
+          5. If anything ever shows "ERR", the warning banner appears
+             and writes are blocked (no clobber)
+
+        NEXT (per backlog):
+          - Cross-tab UX (Quick command output invisible in shell mode)
+          - Wifite PTY wrapping (ioctl errors)
+          - Chroot wrap echo spam suppression
+
