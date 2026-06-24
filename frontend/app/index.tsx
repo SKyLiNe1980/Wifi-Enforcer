@@ -27,6 +27,7 @@ import { sessionManager } from "../src/lib/sessionManager";
 import LiveTab from "../src/components/LiveTab";
 import AITab from "../src/components/AITab";
 import TerminalShell from "../src/components/TerminalShell";
+import { settingsLocal } from "../src/lib/localDb";
 
 const API = `${process.env.EXPO_PUBLIC_BACKEND_URL}/api`;
 
@@ -610,16 +611,22 @@ export default function App() {
 
   // Settings GET extracted into its own callback so the // data status
   // "reload" button can re-run it manually if the initial load failed.
+  // Settings GET — now reads from SQLite instead of /api/settings. Falls
+  // back to defaults on first run (sqlite empty). No network involvement
+  // means no retry, no cloudflare flakes, no "mock stickiness". Settings
+  // are simply *always* available, instantly. The reload button still
+  // works for symmetry (re-reads from sqlite — useful if another part
+  // of the app updated settings).
   const reloadSettings = useCallback(async () => {
     setResource("settings", { kind: "loading" });
     try {
-      const s = await fetchJSON<any>(`${API}/settings`);
-      console.log(`[settings] GET → exec_mode=${s?.exec_mode} iface_a=${s?.iface_a}`);
-      if (s.iface_a) setIface(s.iface_a);
-      if (s.iface_b !== undefined) setIfaceB(s.iface_b);
-      if (s.iface_c !== undefined) setIfaceC(s.iface_c);
-      if (s.country) setCountry(s.country);
-      if (s.active_iface) setActiveIface(s.active_iface);
+      const s = await settingsLocal.get();
+      console.log(`[settings] localDb → exec_mode=${s.exec_mode} iface_a=${s.iface_a}`);
+      setIface(s.iface_a);
+      setIfaceB(s.iface_b);
+      setIfaceC(s.iface_c);
+      setCountry(s.country);
+      setActiveIface(s.active_iface);
       if (s.chroot_path) {
         const legacy = [
           "bootkali", "bootkali_login", "bootkali_bash",
@@ -628,14 +635,12 @@ export default function App() {
         const v = s.chroot_path.trim();
         setChrootPath(legacy.includes(v) ? NETHUNTER_CHROOT : v);
       }
-      if (s.exec_mode === "real" || s.exec_mode === "kali" || s.exec_mode === "mock") {
-        setExecMode(s.exec_mode);
-      }
+      setExecMode(s.exec_mode);
       settingsLoaded.current = true;
       setResource("settings", { kind: "ok", at: Date.now() });
     } catch (e: any) {
-      console.error("[settings] GET failed:", e?.message);
-      setResource("settings", { kind: "error", message: e?.message || "fetch failed", at: Date.now() });
+      console.error("[settings] localDb read failed:", e?.message);
+      setResource("settings", { kind: "error", message: e?.message || "sqlite read failed", at: Date.now() });
     }
   }, [setResource]);
 
@@ -661,23 +666,26 @@ export default function App() {
     return () => sub.remove();
   }, [reloadSettings, fetchAll, fetchAIProfiles, fetchPcapEndpoints]);
 
-  // Save on change — but only AFTER initial load completes
+  // Save on change — writes to local SQLite. No network, no race condition,
+  // no possibility of stale fetch clobbering. Settings persist instantly
+  // and reliably across cold boots, airplane mode, network changes — full
+  // stop. The `settingsLoaded` gate is retained so the very first render
+  // pass (before reloadSettings completes) doesn't trample defaults onto
+  // existing sqlite data.
   useEffect(() => {
     if (!settingsLoaded.current) return;
     const t = setTimeout(() => {
-      fetch(`${API}/settings`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          exec_mode: execMode,
-          iface_a: iface,
-          iface_b: ifaceB,
-          iface_c: ifaceC,
-          country,
-          active_iface: activeIface,
-          chroot_path: chrootPath,
-        }),
-      }).catch(() => {});
+      settingsLocal.update({
+        exec_mode: execMode,
+        iface_a: iface,
+        iface_b: ifaceB,
+        iface_c: ifaceC,
+        country,
+        active_iface: activeIface,
+        chroot_path: chrootPath,
+      }).catch((e) => {
+        console.warn("[settings] localDb update failed:", e?.message);
+      });
     }, 500);
     return () => clearTimeout(t);
   }, [execMode, iface, ifaceB, ifaceC, country, activeIface, chrootPath]);
@@ -1129,7 +1137,7 @@ export default function App() {
         {(["settings", "health", "profiles", "aiProfiles", "pcapEndpoints"] as const).map((key) => {
           const st = dataState[key];
           const label =
-            key === "settings" ? "settings" :
+            key === "settings" ? "settings (local)" :
             key === "health" ? "health" :
             key === "profiles" ? "profiles" :
             key === "aiProfiles" ? "ai-profiles" :
