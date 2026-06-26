@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+audit.db
+audit.db-journal
+audit.db-wal
+audit.db-shm
+config.yaml
+# Keep config.yaml.example tracked; runtime config is private (has bearer token).

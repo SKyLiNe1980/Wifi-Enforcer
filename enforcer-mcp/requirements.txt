@@ -1,0 +1,10 @@
+# Enforcer-MCP server dependencies — pinned for reproducible deploys.
+# Tested against Python 3.11+ on Kali (NetHunter chroot).
+#
+# FastMCP 3.x is the actively-maintained standalone version (the older 1.x
+# was merged into the MCP Python SDK in 2024; we want the new one).
+fastmcp>=3.4.0,<4.0.0
+fastapi>=0.110,<1.0
+uvicorn[standard]>=0.27,<1.0
+pyyaml>=6.0,<7.0
+jsonschema>=4.21,<5.0

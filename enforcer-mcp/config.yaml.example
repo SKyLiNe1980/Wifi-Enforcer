@@ -1,0 +1,173 @@
+# Enforcer-MCP server config — copy to config.yaml and customize.
+#
+# IMPORTANT: bearer_token_hex must match the one in the cockpit's MCP tab
+# (// status → REGENERATE generates it; COPY copies it to clipboard).
+# Until 1B.2 wires automatic sync, you paste it in manually.
+#
+# bind: 127.0.0.1 = loopback only (same device).
+# bind: 0.0.0.0   = exposed to all interfaces (Tailscale-ready). Combine
+# with strong bearer_token + Tailscale ACLs for the swarm phase.
+
+server:
+  host: "127.0.0.1"
+  port: 8765
+  mcp_path: "/mcp"
+  bearer_token_hex: "REPLACE_WITH_64_HEX_CHARS_FROM_COCKPIT_MCP_TAB"
+  require_token: true
+  # Cap audit log to N most-recent entries. Server trims on every insert.
+  audit_max_entries: 2000
+  # Optional CORS allowlist for the /audit/since + /health endpoints when
+  # called from React Native Web. Leave empty for loopback-only deploys.
+  allowed_origins: []
+
+tools:
+  # ─── External tools (subprocess.run) ─────────────────────────────────
+  - name: exec_command
+    description: "Run a shell command on this node (root inside chroot)."
+    command_template: "{cmd}"
+    arg_schema_json: |
+      {
+        "type": "object",
+        "required": ["cmd"],
+        "properties": {
+          "cmd": {"type": "string", "description": "Command to execute"}
+        }
+      }
+    wrap_mode: none
+    timeout_sec: 60
+
+  - name: list_ifaces
+    description: "List wireless interfaces with mode (managed/monitor) and channel."
+    command_template: "iw dev | awk '/Interface|type|channel/ {print}'"
+    arg_schema_json: |
+      {"type": "object", "properties": {}}
+    wrap_mode: none
+    timeout_sec: 5
+
+  - name: set_monitor_mode
+    description: "Put a wireless interface into monitor mode via airmon-ng."
+    command_template: "airmon-ng start {iface}"
+    arg_schema_json: |
+      {
+        "type": "object",
+        "required": ["iface"],
+        "properties": {
+          "iface": {"type": "string", "description": "e.g. wlan2"}
+        }
+      }
+    wrap_mode: none
+    timeout_sec: 15
+
+  - name: set_channel
+    description: "Lock a monitor-mode interface to a specific channel (1..196)."
+    command_template: "iw dev {iface} set channel {channel}"
+    arg_schema_json: |
+      {
+        "type": "object",
+        "required": ["iface", "channel"],
+        "properties": {
+          "iface": {"type": "string"},
+          "channel": {"type": "integer", "minimum": 1, "maximum": 196}
+        }
+      }
+    wrap_mode: none
+    timeout_sec: 5
+
+  # ─── Internal tools (in-process Python handlers) ─────────────────────
+  - name: read_command_logs
+    description: "Read recent MCP server audit log entries (own log, not cockpit)."
+    command_template: "__internal:read_command_logs"
+    arg_schema_json: |
+      {
+        "type": "object",
+        "properties": {
+          "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50}
+        }
+      }
+    wrap_mode: none
+    timeout_sec: 5
+
+  - name: list_attack_profiles
+    description: "Return attack profiles available on this node."
+    command_template: "__internal:list_attack_profiles"
+    arg_schema_json: |
+      {"type": "object", "properties": {}}
+    wrap_mode: none
+    timeout_sec: 5
+
+  - name: run_attack_profile
+    description: "Run a named attack profile (stub in 1B)."
+    command_template: "__internal:run_attack_profile"
+    arg_schema_json: |
+      {
+        "type": "object",
+        "required": ["profile_name"],
+        "properties": {
+          "profile_name": {"type": "string"},
+          "iface": {"type": "string"},
+          "bssid": {"type": "string"},
+          "count": {"type": "integer"}
+        }
+      }
+    wrap_mode: none
+    timeout_sec: 600
+
+  - name: start_session
+    description: "Start a long-lived PTY session (stub in 1B)."
+    command_template: "__internal:start_session"
+    arg_schema_json: |
+      {
+        "type": "object",
+        "required": ["command"],
+        "properties": {
+          "command": {"type": "string"},
+          "label": {"type": "string"}
+        }
+      }
+    wrap_mode: none
+    timeout_sec: 10
+
+  - name: write_stdin
+    description: "Send bytes to a running session's stdin (stub in 1B)."
+    command_template: "__internal:write_stdin"
+    arg_schema_json: |
+      {
+        "type": "object",
+        "required": ["session_id", "data"],
+        "properties": {
+          "session_id": {"type": "string"},
+          "data": {"type": "string"},
+          "newline": {"type": "boolean", "default": true}
+        }
+      }
+    wrap_mode: none
+    timeout_sec: 5
+
+  - name: read_session
+    description: "Read recent output from a session ring buffer (stub in 1B)."
+    command_template: "__internal:read_session"
+    arg_schema_json: |
+      {
+        "type": "object",
+        "required": ["session_id"],
+        "properties": {
+          "session_id": {"type": "string"},
+          "tail_bytes": {"type": "integer", "default": 4096, "maximum": 65536}
+        }
+      }
+    wrap_mode: none
+    timeout_sec: 5
+
+  - name: stop_session
+    description: "Kill a running session by id (stub in 1B)."
+    command_template: "__internal:stop_session"
+    arg_schema_json: |
+      {
+        "type": "object",
+        "required": ["session_id"],
+        "properties": {
+          "session_id": {"type": "string"}
+        }
+      }
+    wrap_mode: none
+    timeout_sec: 5
