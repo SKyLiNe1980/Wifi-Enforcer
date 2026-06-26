@@ -5,6 +5,10 @@
  * as optional future sync target (swarm / MCP / backup) but the app no
  * longer DEPENDS on it for any core data path. Architecturally, the
  * "intermittent fetch fails → broken app" failure mode is eliminated.
+ *
+ * Phase 5 (current build) adds the MCP tab schema (mcp_config, mcp_tools,
+ * mcp_audit_log) — see migration v5 below. Crypto-secure bearer tokens
+ * generated via expo-crypto in the MCPTab UI.
  */
 
 import * as SQLite from "expo-sqlite";
