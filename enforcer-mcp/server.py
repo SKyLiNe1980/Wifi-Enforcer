@@ -24,6 +24,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import shlex
 import signal
 import sqlite3
@@ -188,17 +189,32 @@ def _summarize(s: str, n: int = 400) -> str:
 async def _exec_external(spec: ToolSpec, args: Dict[str, Any]) -> Dict[str, Any]:
     """Run a `command_template` filled with args via subprocess.run.
 
+    Substitution is regex-based, NOT Python's str.format. Reason: command
+    templates frequently contain shell braces that are NOT placeholders —
+    awk `{print}`, sed `{...}`, JSON `{}`, etc. `str.format` would explode
+    on those. Our regex only replaces `{name}` when `name` is a key in the
+    args dict (validated against the JSON Schema earlier). Everything else
+    passes through to the shell verbatim.
+
     Returns dict with output / exit_code / success / timed_out.
     """
-    try:
-        cmd_str = spec.command_template.format(**args)
-    except KeyError as e:
-        raise ValueError(f"Missing arg for command_template: {e}")
+    def _sub(match: "re.Match[str]") -> str:
+        key = match.group(1)
+        if key in args:
+            return str(args[key])
+        # Unknown key → leave the literal `{name}` in place. Schema
+        # validation already caught missing-required cases upstream; this
+        # branch protects shell idioms like `awk '{print $1}'`.
+        return match.group(0)
 
-    # wrap_mode is intentionally minimal in 1B — the chroot itself IS the
-    # Kali env, so "none" works for everything. 1C+ can layer su / nethunter
-    # wrappers when the cockpit federates exec across heterogenous nodes.
-    cmd_list = shlex.split(cmd_str)
+    cmd_str = re.sub(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}", _sub, spec.command_template)
+
+    # Run via `bash -c "<cmd>"` so pipelines, redirects, globs, and shell
+    # idioms (`awk '{print}'`, `iw dev | grep wlan`, etc.) all just work.
+    # shlex.split + argv-style exec would fail on `|`. Trade-off: callers
+    # must trust the *server config* (these templates), since args ARE
+    # validated by JSON Schema but the template itself is operator-supplied.
+    cmd_list = ["bash", "-c", cmd_str]
 
     log("info", "exec.external", tool=spec.name, cmd=cmd_str, timeout=spec.timeout_sec)
     try:
