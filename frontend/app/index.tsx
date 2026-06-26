@@ -799,6 +799,9 @@ export default function App() {
       for (const l of newLogs) {
         commandLogsLocal.append(l).catch(() => {});
       }
+      // Land on the classic terminal view so output is immediately visible —
+      // shell sub-tab would swallow these one-shot logs silently.
+      setTerminalMode("classic");
       setTab("terminal");
     } catch (e) { console.warn(e); }
     finally { setRunning(false); }
@@ -934,7 +937,15 @@ export default function App() {
           const cmd = q.cmd(ctxActive);
           return (
             <TouchableOpacity key={i} testID={`quick-${i}`} style={s.gridItem}
-              onPress={() => { execute(cmd); setTab("terminal"); }} disabled={running} activeOpacity={0.7}>
+              onPress={() => {
+                execute(cmd);
+                // Force Terminal into "classic" mode so the output is
+                // actually visible — previously, if the user had toggled
+                // to "shell" sub-tab the Quick command would fire silently
+                // into the void and confuse them.
+                setTerminalMode("classic");
+                setTab("terminal");
+              }} disabled={running} activeOpacity={0.7}>
               <View style={{ flexDirection: "row", alignItems: "center", marginBottom: 4 }}>
                 <MaterialCommunityIcons name={q.icon} size={16} color={C.green} />
                 <Text style={[s.gridLabel, { marginLeft: 6 }]}>{q.label}</Text>
@@ -946,7 +957,7 @@ export default function App() {
       </View>
 
       <Text style={[s.helper, { marginTop: 18 }]}>
-        tip: tapping any action runs it (mocked) & jumps to terminal.
+        tip: tapping any action runs it & jumps to the terminal&apos;s classic view.
       </Text>
     </ScrollView>
   );
@@ -1129,7 +1140,7 @@ export default function App() {
     <ScrollView contentContainerStyle={{ padding: 16, paddingBottom: 32 }}>
       <Text style={s.sectionTitle}>// system</Text>
       <View style={s.kvBlock}>
-        <KV k="exec mode" v={execMode === "kali" ? "KALI · chroot" : execMode === "real" ? "REAL · su -c" : "MOCK"} vColor={execMode === "mock" ? C.yellow : C.green} />
+        <KV k="exec mode" v={execMode === "kali" ? "KALI · chroot" : execMode === "real" ? "ANDROID · su -c" : "PREVIEW"} vColor={execMode === "mock" ? C.yellow : C.green} />
         <KV k="bridge" v={HAS_NATIVE_ROOT ? (bridgeRoot ? "loaded · root granted" : bridgeRoot === false ? "loaded · root denied" : "loaded · checking…") : "absent (Expo Go / web)"} vColor={HAS_NATIVE_ROOT ? (bridgeRoot ? C.green : C.red) : C.textDim} />
         <KV k="root" v={rootInfo?.root_granted ? "GRANTED" : "..."} vColor={rootInfo?.root_granted ? C.green : C.red} />
         <KV k="device" v={rootInfo?.device || "..."} vColor={C.cyan} />
@@ -1200,7 +1211,15 @@ export default function App() {
         {(["mock", "real", "kali"] as ExecMode[]).map((m) => {
           const active = execMode === m;
           const disabled = m !== "mock" && !HAS_NATIVE_ROOT;
+          // Hide "Preview" once the native bridge is confirmed present —
+          // it becomes a silent auto-fallback for Expo Go / web preview
+          // / cold boots before checkRoot() resolves. Operators on a real
+          // build never need to see a "MOCK" button cluttering the UI.
+          if (m === "mock" && HAS_NATIVE_ROOT && bridgeRoot === true) return null;
           const color = m === "mock" ? C.yellow : m === "real" ? C.green : C.magenta;
+          // Operator-brain labels: mock → Preview (auto-fallback),
+          // real → Android (raw su -c), kali → Kali (chroot wrap).
+          const label = m === "mock" ? "PREVIEW" : m === "real" ? "ANDROID" : "KALI";
           return (
             <TouchableOpacity
               key={m}
@@ -1249,12 +1268,12 @@ export default function App() {
               ]}
             >
               <MaterialCommunityIcons
-                name={m === "mock" ? "shield-outline" : m === "real" ? "shield-check" : "linux"}
+                name={m === "mock" ? "shield-outline" : m === "real" ? "android" : "linux"}
                 size={14}
                 color={active ? C.bg : color}
               />
               <Text style={[s.segBtnText, { color: active ? C.bg : color }]}>
-                {m === "mock" ? "MOCK" : m === "real" ? "REAL" : "KALI"}
+                {label}
               </Text>
             </TouchableOpacity>
           );
@@ -1262,10 +1281,10 @@ export default function App() {
       </View>
       <Text style={s.helper}>
         {execMode === "kali"
-          ? "commands wrapped: `nethunter -c '…'` — runs inside Kali chroot"
+          ? "commands wrapped via NetHunter chroot — runs inside Kali Linux"
           : execMode === "real"
-          ? "commands hit `su -c` directly on Android"
-          : "commands simulated by mock backend (no real exec)"}
+          ? "commands hit `su -c` directly on the Android host"
+          : "preview mode — no real exec, used when native bridge is unavailable"}
       </Text>
       {!HAS_NATIVE_ROOT && (
         <Text style={[s.helper, { marginTop: 4 }]}>
@@ -1475,7 +1494,7 @@ export default function App() {
             {running && <ActivityIndicator size="small" color={C.green} style={{ marginRight: 8 }} />}
             <View style={[s.badge, { borderColor: execMode === "kali" ? C.magenta : execMode === "real" ? C.green : C.yellow }]}>
               <Text style={[s.badgeText, { color: execMode === "kali" ? C.magenta : execMode === "real" ? C.green : C.yellow }]}>
-                {execMode === "kali" ? "KALI" : execMode === "real" ? "REAL" : "MOCK"}
+                {execMode === "kali" ? "KALI" : execMode === "real" ? "ANDROID" : "PREVIEW"}
               </Text>
             </View>
           </View>

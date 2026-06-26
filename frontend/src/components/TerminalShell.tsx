@@ -96,8 +96,8 @@ export default function TerminalShell({ execMode, wrap, pendingInjection }: Prop
     }
     if (execMode === "mock") {
       Alert.alert(
-        "Mock mode",
-        "Switch to REAL or KALI in Settings → execution mode to spawn a real persistent shell.",
+        "Preview mode",
+        "Switch to ANDROID or KALI in Settings → execution mode to spawn a real persistent shell.",
       );
       return;
     }
