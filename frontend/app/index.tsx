@@ -27,7 +27,13 @@ import { sessionManager } from "../src/lib/sessionManager";
 import LiveTab from "../src/components/LiveTab";
 import AITab from "../src/components/AITab";
 import TerminalShell from "../src/components/TerminalShell";
-import { settingsLocal } from "../src/lib/localDb";
+import {
+  settingsLocal,
+  profilesLocal,
+  aiProfilesLocal,
+  pcapEndpointsLocal,
+  commandLogsLocal,
+} from "../src/lib/localDb";
 
 const API = `${process.env.EXPO_PUBLIC_BACKEND_URL}/api`;
 
@@ -146,7 +152,7 @@ type DataLoadState = {
   profiles: ResourceStatus;
   aiProfiles: ResourceStatus;
   pcapEndpoints: ResourceStatus;
-  health: ResourceStatus;
+  logs: ResourceStatus;
 };
 
 const INITIAL_DATA_STATE: DataLoadState = {
@@ -154,7 +160,7 @@ const INITIAL_DATA_STATE: DataLoadState = {
   profiles: { kind: "loading" },
   aiProfiles: { kind: "loading" },
   pcapEndpoints: { kind: "loading" },
-  health: { kind: "loading" },
+  logs: { kind: "loading" },
 };
 
 const BANNER = `\
@@ -326,24 +332,26 @@ export default function App() {
   }, [execMode, chrootPath]);
 
   const fetchAll = useCallback(async () => {
-    setResource("health", { kind: "loading" });
     setResource("profiles", { kind: "loading" });
-    const tasks = [
-      fetchJSON<any>(`${API}/health`)
-        .then((h) => { setRootInfo(h); setResource("health", { kind: "ok", at: Date.now() }); })
-        .catch((e) => setResource("health", { kind: "error", message: e?.message || "fetch failed", at: Date.now() })),
-      fetchJSON<Log[]>(`${API}/logs?limit=200`)
-        .then((lg) => {
-          const reversed = lg.slice().reverse();
-          historicalCountRef.current = reversed.length;
-          setLogs(reversed);
-        })
-        .catch((e) => { console.warn("logs fetch failed:", e?.message); }),
-      fetchJSON<Profile[]>(`${API}/profiles`)
-        .then((pf) => { setProfiles(pf); setResource("profiles", { kind: "ok", at: Date.now(), count: pf.length }); })
-        .catch((e) => setResource("profiles", { kind: "error", message: e?.message || "fetch failed", at: Date.now() })),
-    ];
-    await Promise.allSettled(tasks);
+    setResource("logs", { kind: "loading" });
+    // Logs + profiles now read straight from local SQLite. Health/root
+    // info comes from the native bridge probe instead of a backend
+    // round-trip. No network = no flakes.
+    try {
+      const logs = await commandLogsLocal.list(200);
+      historicalCountRef.current = logs.length;
+      setLogs(logs);
+      setResource("logs", { kind: "ok", at: Date.now(), count: logs.length });
+    } catch (e: any) {
+      setResource("logs", { kind: "error", message: e?.message || "sqlite read failed", at: Date.now() });
+    }
+    try {
+      const pf = await profilesLocal.list();
+      setProfiles(pf);
+      setResource("profiles", { kind: "ok", at: Date.now(), count: pf.length });
+    } catch (e: any) {
+      setResource("profiles", { kind: "error", message: e?.message || "sqlite read failed", at: Date.now() });
+    }
   }, [setResource]);
 
   useEffect(() => { fetchAll(); }, [fetchAll]);
@@ -356,11 +364,11 @@ export default function App() {
   const fetchAIProfiles = useCallback(async () => {
     setResource("aiProfiles", { kind: "loading" });
     try {
-      const data = await fetchJSON<any[]>(`${API}/ai-profiles`);
+      const data = await aiProfilesLocal.list();
       setAiProfilesList(data);
       setResource("aiProfiles", { kind: "ok", at: Date.now(), count: data.length });
     } catch (e: any) {
-      setResource("aiProfiles", { kind: "error", message: e?.message || "fetch failed", at: Date.now() });
+      setResource("aiProfiles", { kind: "error", message: e?.message || "sqlite read failed", at: Date.now() });
     }
   }, [setResource]);
 
@@ -403,10 +411,10 @@ export default function App() {
     }
     setAiSaving(true);
     try {
-      // Build payload — null-out empty strings on optional fields so backend
-      // stores actual null instead of "". pre_command especially: an empty
-      // string would get joined with `&&` and fail the shell.
+      // Null-out empty optional strings so pre_command empty-string can't
+      // get joined with `&&` and break the launcher shell.
       const payload: any = {
+        id: aiEditing.id,
         name,
         command,
         description: aiEditing.description || "",
@@ -417,18 +425,7 @@ export default function App() {
         pre_command: aiEditing.pre_command && aiEditing.pre_command.trim() ? aiEditing.pre_command.trim() : null,
         icon: aiEditing.icon || "🤖",
       };
-      const isUpdate = !!aiEditing.id;
-      const url = isUpdate ? `${API}/ai-profiles/${aiEditing.id}` : `${API}/ai-profiles`;
-      const method = isUpdate ? "PUT" : "POST";
-      const r = await fetch(url, {
-        method,
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      if (!r.ok) {
-        const txt = await r.text();
-        throw new Error(`HTTP ${r.status}: ${txt}`);
-      }
+      await aiProfilesLocal.upsert(payload);
       await fetchAIProfiles();
       closeAIEditor();
     } catch (e: any) {
@@ -449,10 +446,10 @@ export default function App() {
           style: "destructive",
           onPress: async () => {
             try {
-              await fetch(`${API}/ai-profiles/${id}`, { method: "DELETE" });
+              await aiProfilesLocal.delete(id);
               await fetchAIProfiles();
-            } catch {
-              Alert.alert("Delete failed", "Network error.");
+            } catch (e: any) {
+              Alert.alert("Delete failed", e?.message || "sqlite error");
             }
           },
         },
@@ -468,11 +465,11 @@ export default function App() {
   const fetchPcapEndpoints = useCallback(async () => {
     setResource("pcapEndpoints", { kind: "loading" });
     try {
-      const data = await fetchJSON<any[]>(`${API}/pcap-endpoints`);
+      const data = await pcapEndpointsLocal.list();
       setPcapEndpointsList(data);
       setResource("pcapEndpoints", { kind: "ok", at: Date.now(), count: data.length });
     } catch (e: any) {
-      setResource("pcapEndpoints", { kind: "error", message: e?.message || "fetch failed", at: Date.now() });
+      setResource("pcapEndpoints", { kind: "error", message: e?.message || "sqlite read failed", at: Date.now() });
     }
   }, [setResource]);
 
@@ -530,23 +527,12 @@ export default function App() {
     }
     setPcapSaving(true);
     try {
-      const payload = {
+      await pcapEndpointsLocal.upsert({
+        id: pcapEditing.id,
         name, host, port,
         transport: pcapEditing.transport || "tcp",
         notes: pcapEditing.notes || "",
-      };
-      const isUpdate = !!pcapEditing.id;
-      const url = isUpdate ? `${API}/pcap-endpoints/${pcapEditing.id}` : `${API}/pcap-endpoints`;
-      const method = isUpdate ? "PUT" : "POST";
-      const r = await fetch(url, {
-        method,
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
       });
-      if (!r.ok) {
-        const txt = await r.text();
-        throw new Error(`HTTP ${r.status}: ${txt}`);
-      }
       await fetchPcapEndpoints();
       closePcapEditor();
     } catch (e: any) {
@@ -567,10 +553,10 @@ export default function App() {
           style: "destructive",
           onPress: async () => {
             try {
-              await fetch(`${API}/pcap-endpoints/${id}`, { method: "DELETE" });
+              await pcapEndpointsLocal.delete(id);
               await fetchPcapEndpoints();
-            } catch {
-              Alert.alert("Delete failed", "Network error.");
+            } catch (e: any) {
+              Alert.alert("Delete failed", e?.message || "sqlite error");
             }
           },
         },
@@ -581,11 +567,25 @@ export default function App() {
   // Initialize streaming session manager with backend API base
   useEffect(() => { sessionManager.configure(API); }, []);
 
-  // Detect native bridge & root status (only present in built APK; null in Expo Go/web)
+  // Detect native bridge & root status (only present in built APK; null in Expo Go/web).
+  // Also seeds rootInfo locally — previously this came from /api/health
+  // which is exactly the kind of "cold-boot network flake → blank UI" we
+  // killed by going local-first.
   useEffect(() => {
+    // Always set baseline so // system block isn't perpetually "..."
+    setRootInfo({
+      device: Platform.OS === "android" ? "android" : Platform.OS,
+      android_version: String(Platform.Version),
+      root_granted: bridgeRoot === true,
+    });
     if (!HAS_NATIVE_ROOT) return;
-    checkRoot().then(setBridgeRoot).catch(() => setBridgeRoot(false));
-  }, []);
+    checkRoot()
+      .then((ok) => {
+        setBridgeRoot(ok);
+        setRootInfo((prev: any) => ({ ...(prev || {}), root_granted: ok }));
+      })
+      .catch(() => setBridgeRoot(false));
+  }, []);  // eslint-disable-line react-hooks/exhaustive-deps
 
   // Note: We *don't* auto-force back to mock if HAS_NATIVE_ROOT is false.
   // HAS_NATIVE_ROOT is a snapshot at module-import time and can race the
@@ -626,7 +626,7 @@ export default function App() {
       setIfaceB(s.iface_b);
       setIfaceC(s.iface_c);
       setCountry(s.country);
-      setActiveIface(s.active_iface);
+      setActiveIface(s.active_iface as "A" | "B" | "C" | "ALL");
       if (s.chroot_path) {
         const legacy = [
           "bootkali", "bootkali_login", "bootkali_bash",
@@ -710,29 +710,44 @@ export default function App() {
       for (const ifname of targets) {
         const cmd = targets.length > 1 ? substIface(command, ifname) : command;
         const wrapped = wrapForMode(cmd);
+        let newLog: Log;
         if (isReal) {
+          const t0 = Date.now();
           const r = await execReal(wrapped);
-          setLogs((p) => [...p, {
+          newLog = {
             id: String(Date.now()) + Math.random(),
             timestamp: new Date().toISOString(),
-            ...r,
-            command: cmd,   // show un-wrapped command in terminal
-          } as Log]);
+            command: cmd,
+            output: r.output,
+            exit_code: r.exit_code,
+            duration_ms: r.duration_ms || (Date.now() - t0),
+            mocked: false,
+          };
         } else {
-          const res = await fetch(`${API}/execute`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ command: cmd }),
-          });
-          const data: Log = await res.json();
-          setLogs((p) => [...p, data]);
+          // Local "preview" exec — synthesizes a mock result without any
+          // backend round-trip. Keeps the UI working in Expo Go / web /
+          // air-gapped sessions when no native bridge is present.
+          newLog = {
+            id: String(Date.now()) + Math.random(),
+            timestamp: new Date().toISOString(),
+            command: cmd,
+            output: `[preview] ${cmd}\n(no native bridge — switch to KALI/REAL after installing APK)`,
+            exit_code: 0,
+            duration_ms: 0,
+            mocked: true,
+          };
         }
+        setLogs((p) => [...p, newLog]);
+        commandLogsLocal.append(newLog).catch((e) =>
+          console.warn("[logs] sqlite append failed:", e?.message));
       }
     } catch (e: any) {
-      setLogs((p) => [...p, {
+      const errLog: Log = {
         id: String(Date.now()), command, output: `[err] ${e?.message || e}`,
         exit_code: 1, duration_ms: 0, mocked: execMode === "mock", timestamp: new Date().toISOString(),
-      }]);
+      };
+      setLogs((p) => [...p, errLog]);
+      commandLogsLocal.append(errLog).catch(() => {});
     } finally { setRunning(false); }
   }, [running, execMode, activeIface, activeIfaces, primaryIface, iface, wrapForMode]);
 
@@ -741,27 +756,48 @@ export default function App() {
     const isReal = (execMode === "real" || execMode === "kali") && HAS_NATIVE_ROOT;
     const targets = activeIface === "ALL" ? activeIfaces : [primaryIface];
     try {
+      const newLogs: Log[] = [];
       if (isReal && RootShell) {
         // Fan out commands across target ifaces, all wrapped for chroot if needed
-        const flatCmds: string[] = [];
+        const flatCmds: { display: string; wrapped: string }[] = [];
         for (const ifname of targets) {
           for (const c of p.commands) {
             const subbed = targets.length > 1 ? substIface(c, ifname) : c;
-            flatCmds.push(wrapForMode(subbed));
+            flatCmds.push({ display: subbed, wrapped: wrapForMode(subbed) });
           }
         }
-        const data = await RootShell.execBatch(flatCmds);
-        const mapped: Log[] = data.logs.map((l: any, i: number) => ({
-          id: String(Date.now()) + Math.random() + i,
-          command: l.command, output: l.stdout || l.stderr || "",
-          exit_code: l.exit_code, duration_ms: 0, mocked: false,
-          timestamp: new Date().toISOString(),
-        }));
-        setLogs((prev) => [...prev, ...mapped]);
+        const data = await RootShell.execBatch(flatCmds.map((x) => x.wrapped));
+        data.logs.forEach((l: any, i: number) => {
+          newLogs.push({
+            id: String(Date.now()) + Math.random() + i,
+            command: flatCmds[i]?.display || l.command,
+            output: l.stdout || l.stderr || "",
+            exit_code: l.exit_code,
+            duration_ms: 0,
+            mocked: false,
+            timestamp: new Date().toISOString(),
+          });
+        });
       } else {
-        const res = await fetch(`${API}/profiles/${p.id}/run`, { method: "POST" });
-        const data = await res.json();
-        setLogs((prev) => [...prev, ...(data.logs as Log[])]);
+        // Local preview — synthesize an entry per command, no backend.
+        for (const ifname of targets) {
+          for (const c of p.commands) {
+            const subbed = targets.length > 1 ? substIface(c, ifname) : c;
+            newLogs.push({
+              id: String(Date.now()) + Math.random(),
+              command: subbed,
+              output: `[preview] ${subbed}`,
+              exit_code: 0,
+              duration_ms: 0,
+              mocked: true,
+              timestamp: new Date().toISOString(),
+            });
+          }
+        }
+      }
+      setLogs((prev) => [...prev, ...newLogs]);
+      for (const l of newLogs) {
+        commandLogsLocal.append(l).catch(() => {});
       }
       setTab("terminal");
     } catch (e) { console.warn(e); }
@@ -769,12 +805,12 @@ export default function App() {
   }, [execMode, activeIface, activeIfaces, primaryIface, iface, wrapForMode]);
 
   const deleteProfile = useCallback(async (id: string) => {
-    await fetch(`${API}/profiles/${id}`, { method: "DELETE" });
+    await profilesLocal.delete(id);
     fetchAll();
   }, [fetchAll]);
 
   const clearLogs = useCallback(async () => {
-    await fetch(`${API}/logs`, { method: "DELETE" });
+    await commandLogsLocal.clear();
     historicalCountRef.current = 0;
     setLogs([]);
   }, []);
@@ -782,12 +818,13 @@ export default function App() {
   const saveCurrentAsProfile = useCallback(async () => {
     if (!newProfileName.trim()) { Alert.alert("Name required"); return; }
     const cmds = QUICK_COMMANDS.map((q) => q.cmd(ctxActive));
-    await fetch(`${API}/profiles`, {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: newProfileName.trim(), description: newProfileDesc.trim(), commands: cmds }),
+    await profilesLocal.create({
+      name: newProfileName.trim(),
+      description: newProfileDesc.trim(),
+      commands: cmds,
     });
     setSaveOpen(false); setNewProfileName(""); setNewProfileDesc(""); fetchAll();
-  }, [newProfileName, newProfileDesc, ctx, fetchAll]);
+  }, [newProfileName, newProfileDesc, ctxActive, fetchAll]);
 
   const exportJson = useMemo(() => JSON.stringify(
     profiles.map(({ id, created_at, ...rest }) => rest), null, 2
@@ -800,12 +837,10 @@ export default function App() {
       let added = 0;
       for (const p of arr) {
         if (!p?.name || !Array.isArray(p?.commands)) continue;
-        await fetch(`${API}/profiles`, {
-          method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            name: String(p.name), description: String(p.description || ""),
-            commands: p.commands.map(String),
-          }),
+        await profilesLocal.create({
+          name: String(p.name),
+          description: String(p.description || ""),
+          commands: p.commands.map(String),
         });
         added++;
       }
@@ -1134,14 +1169,14 @@ export default function App() {
         </View>
       )}
       <View style={s.kvBlock}>
-        {(["settings", "health", "profiles", "aiProfiles", "pcapEndpoints"] as const).map((key) => {
+        {(["settings", "logs", "profiles", "aiProfiles", "pcapEndpoints"] as const).map((key) => {
           const st = dataState[key];
           const label =
             key === "settings" ? "settings (local)" :
-            key === "health" ? "health" :
-            key === "profiles" ? "profiles" :
-            key === "aiProfiles" ? "ai-profiles" :
-            "pcap-endpoints";
+            key === "logs" ? "command logs (local)" :
+            key === "profiles" ? "profiles (local)" :
+            key === "aiProfiles" ? "ai-profiles (local)" :
+            "pcap-endpoints (local)";
           let value: string;
           let color: string;
           if (st.kind === "loading") { value = "loading…"; color = C.yellow; }
@@ -1192,24 +1227,20 @@ export default function App() {
                   checkRoot().then(setBridgeRoot).catch(() => setBridgeRoot(false));
                 }
                 setExecMode(m);
-                // Fire-and-forget direct PUT bypassing the debounced useEffect.
-                // The debounce/race kept losing mode changes on real devices, so
-                // we now write through immediately on every mode tap. This is the
-                // single source of truth for mode persistence — useEffect-based
-                // save still exists for OTHER settings (iface, country, etc.).
-                fetch(`${API}/settings`, {
-                  method: "PUT",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({
-                    exec_mode: m,
-                    iface_a: iface,
-                    iface_b: ifaceB,
-                    iface_c: ifaceC,
-                    country,
-                    active_iface: activeIface,
-                    chroot_path: chrootPath,
-                  }),
-                }).catch(() => {});
+                // Fire-and-forget IMMEDIATE local SQLite write — bypasses
+                // the debounced useEffect so the mode change is durably
+                // persisted even if the user instantly kills the app. The
+                // debounced effect still saves other settings (iface,
+                // country, etc).
+                settingsLocal.update({
+                  exec_mode: m,
+                  iface_a: iface,
+                  iface_b: ifaceB,
+                  iface_c: ifaceC,
+                  country,
+                  active_iface: activeIface,
+                  chroot_path: chrootPath,
+                }).catch((e) => console.warn("[settings] mode write failed:", e?.message));
               }}
               style={[
                 s.segBtn,

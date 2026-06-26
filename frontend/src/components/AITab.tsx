@@ -6,6 +6,7 @@ import {
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { sessionManager, SessionState } from "../lib/sessionManager";
 import { hasNativeStreaming, HAS_NATIVE_ROOT, writeStdin } from "../lib/rootShell";
+import { aiProfilesLocal } from "../lib/localDb";
 import XTermView from "./XTermView";
 
 // ─── Palette: keep unified with LiveTab / Settings / Terminal ─────────────
@@ -220,18 +221,17 @@ export default function AITab(props: Props) {
     return unsub;
   }, []);
 
-  // Load AI profiles
+  // Load AI profiles — now from local SQLite. No more flaky cold-boot
+  // network calls. (Backend `/api/ai-profiles` is officially deprecated.)
   const fetchProfiles = useCallback(async () => {
     try {
-      const r = await fetch(`${props.apiBase}/ai-profiles`);
-      if (!r.ok) return;
-      const data = await r.json();
-      setProfiles(data);
+      const data = await aiProfilesLocal.list();
+      setProfiles(data as any);
       if (!selectedId && data.length) setSelectedId(data[0].id);
-    } catch {
-      // network failure is non-fatal in this tab
+    } catch (e) {
+      console.warn("[AITab] localDb read failed:", e);
     }
-  }, [props.apiBase, selectedId]);
+  }, [selectedId]);
 
   useEffect(() => { fetchProfiles(); }, [fetchProfiles]);
 
@@ -280,18 +280,7 @@ export default function AITab(props: Props) {
       });
       setActiveSessionId(id);
       force((n) => n + 1);
-      // Log session start
-      fetch(`${props.apiBase}/ai-logs`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          profile_id: selectedProfile.id,
-          profile_name: selectedProfile.name,
-          session_id: id,
-          kind: "system",
-          content: `session started · shell=${shellInvocation} · launcher=${selectedProfile.command}`,
-        }),
-      }).catch(() => {});
+      // (ai-logs telemetry to backend deprecated — local-first migration.)
 
       // Step 2: send the launcher command (and optional pre_command) into the
       // login shell's stdin. Wait ~800ms so bash has time to source its rc
@@ -354,22 +343,11 @@ export default function AITab(props: Props) {
         profile?.send_newline ?? true,
         echo,
       );
-      // Log user input (fire-and-forget)
-      fetch(`${props.apiBase}/ai-logs`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          profile_id: profile?.id,
-          profile_name: profile?.name ?? "",
-          session_id: activeSessionId,
-          kind: "user",
-          content: textToSend,
-        }),
-      }).catch(() => {});
+      // (ai-logs telemetry to backend deprecated — local-first migration.)
     } finally {
       setSending(false);
     }
-  }, [activeSessionId, inputText, selectedProfile, props.apiBase]);
+  }, [activeSessionId, inputText, selectedProfile]);
 
   // ─── XTerm keystroke forwarder ──────────────────────────────────────────
   // The xterm WebView emits raw bytes (already correctly encoded escape
@@ -391,19 +369,20 @@ export default function AITab(props: Props) {
   const handleToggleViewMode = useCallback(async () => {
     if (!selectedProfile) return;
     const next: "xterm" | "scrollback" = viewMode === "xterm" ? "scrollback" : "xterm";
-    // Optimistic local update
+    // Optimistic local update — UI flips instantly
     setProfiles((prev) => prev.map((p) => (p.id === selectedProfile.id ? { ...p, view_mode: next } : p)));
     try {
-      await fetch(`${props.apiBase}/ai-profiles/${selectedProfile.id}`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ view_mode: next }),
+      await aiProfilesLocal.upsert({
+        id: selectedProfile.id,
+        name: selectedProfile.name,
+        command: selectedProfile.command,
+        view_mode: next,
       });
     } catch {
       // On failure, refetch to reconcile.
       fetchProfiles();
     }
-  }, [selectedProfile, viewMode, props.apiBase, fetchProfiles]);
+  }, [selectedProfile, viewMode, fetchProfiles]);
 
   // ─── Clear current session output (local only) ───────────────────────────
   const handleClear = useCallback(() => {
