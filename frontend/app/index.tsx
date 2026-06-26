@@ -26,6 +26,7 @@ import { HAS_NATIVE_ROOT, checkRoot, execReal, RootShell } from "../src/lib/root
 import { sessionManager } from "../src/lib/sessionManager";
 import LiveTab from "../src/components/LiveTab";
 import AITab from "../src/components/AITab";
+import MCPTab from "../src/components/MCPTab";
 import TerminalShell from "../src/components/TerminalShell";
 import {
   settingsLocal,
@@ -240,7 +241,7 @@ function HighlightedCmd({ cmd }: { cmd: string }) {
 
 // ============================================================
 export default function App() {
-  const [tab, setTab] = useState<"quick" | "terminal" | "live" | "ai" | "profiles" | "settings">("quick");
+  const [tab, setTab] = useState<"quick" | "terminal" | "live" | "ai" | "mcp" | "profiles" | "settings">("quick");
   const [iface, setIface] = useState("wlan2");
   const [ifaceB, setIfaceB] = useState("");
   const [ifaceC, setIfaceC] = useState("");
@@ -1523,6 +1524,7 @@ export default function App() {
               apiBase={API}
             />
           )}
+          {tab === "mcp" && <MCPTab />}
           {tab === "profiles" && (() => {
             // Backwards-compat: an older app launch may have persisted
             // tab="profiles" before we removed it as a top-level tab. Punt
@@ -1534,14 +1536,15 @@ export default function App() {
           {tab === "settings" && renderSettings()}
         </View>
 
-        {/* TAB BAR — 5 slots fit comfortably on the S10+ in portrait. We
-            nested Profiles + AI Agents under Settings (sub-tabs) so the
-            bottom bar stays uncluttered. */}
+        {/* TAB BAR — 6 slots: quick, term, live, ai, mcp, settings.
+            Profiles + AI agents stay nested under Settings sub-tabs so we
+            don't blow past the comfortable tap-target width on the S10+. */}
         <View style={s.tabbar}>
           <TabBtn t="quick" cur={tab} icon="flash" label="quick" onPress={setTab} />
           <TabBtn t="terminal" cur={tab} icon="console" label="term" badge={logs.length} onPress={setTab} />
           <TabBtn t="live" cur={tab} icon="satellite-uplink" label="live" onPress={setTab} />
           <TabBtn t="ai" cur={tab} icon="robot-outline" label="ai" onPress={setTab} />
+          <TabBtn t="mcp" cur={tab} icon="hub" label="mcp" onPress={setTab} />
           <TabBtn t="settings" cur={tab} icon="cog" label="set" onPress={setTab} />
         </View>
 

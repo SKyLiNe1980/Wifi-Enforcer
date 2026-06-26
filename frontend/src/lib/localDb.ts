@@ -17,7 +17,7 @@ let _db: SQLite.SQLiteDatabase | null = null;
 // pre-migration → re-run the seed → insert 9 attack + 5 AI profiles AGAIN.
 // With 8 concurrent callers that produced 72 attack profiles. Fun.
 let _dbPromise: Promise<SQLite.SQLiteDatabase> | null = null;
-const TARGET_VERSION = 4;
+const TARGET_VERSION = 5;
 
 export async function openLocalDb(): Promise<SQLite.SQLiteDatabase> {
   if (_db) return _db;
@@ -145,6 +145,54 @@ async function runMigrations(db: SQLite.SQLiteDatabase) {
           );
         `);
         console.log(`[localDb] deduped profiles by name`);
+        break;
+      case 5:
+        // MCP (Model Context Protocol) — Phase 1A scaffold.
+        // Three tables: config (singleton row), tools registry,
+        // audit log of every tool call (capped to 2000 entries via
+        // append-time trim, like command_logs).
+        //
+        // Transport locked to HTTP+SSE; auth is bearer token.
+        // server_enabled stays 0 until the user explicitly flips it —
+        // we never want the cockpit to auto-expose an MCP endpoint.
+        await db.execAsync(`
+          CREATE TABLE IF NOT EXISTS mcp_config (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            server_enabled INTEGER DEFAULT 0,
+            port INTEGER DEFAULT 8765,
+            bind_host TEXT DEFAULT '127.0.0.1',
+            bearer_token TEXT DEFAULT '',
+            transport TEXT DEFAULT 'http_sse',
+            require_token INTEGER DEFAULT 1,
+            updated_at TEXT NOT NULL
+          );
+          CREATE TABLE IF NOT EXISTS mcp_tools (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE,
+            description TEXT DEFAULT '',
+            command_template TEXT NOT NULL,
+            arg_schema_json TEXT DEFAULT '{}',
+            wrap_mode TEXT DEFAULT 'auto',
+            timeout_sec INTEGER DEFAULT 60,
+            enabled INTEGER DEFAULT 1,
+            built_in INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL
+          );
+          CREATE TABLE IF NOT EXISTS mcp_audit_log (
+            id TEXT PRIMARY KEY,
+            ts TEXT NOT NULL,
+            tool_name TEXT NOT NULL,
+            args_json TEXT DEFAULT '{}',
+            result_summary TEXT DEFAULT '',
+            client_id TEXT DEFAULT '',
+            duration_ms INTEGER DEFAULT 0,
+            exit_code INTEGER DEFAULT 0,
+            success INTEGER DEFAULT 1
+          );
+          CREATE INDEX IF NOT EXISTS idx_mcp_audit_ts ON mcp_audit_log(ts);
+          CREATE INDEX IF NOT EXISTS idx_mcp_audit_tool ON mcp_audit_log(tool_name);
+        `);
+        await seedMcpDefaults(db);
         break;
       default:
         throw new Error(`[localDb] no migration for version ${next}`);
@@ -411,6 +459,158 @@ async function seedDefaultsIfEmpty(db: SQLite.SQLiteDatabase) {
   }
 }
 
+// ─── MCP Defaults ───────────────────────────────────────────────────────
+// Seeds the singleton mcp_config row + an initial built-in tool registry
+// matching the cockpit's existing primitives. Token starts EMPTY — the
+// MCP tab UI generates one on first server enable to make sure we never
+// ship a default-token APK that gets pwned. server_enabled also starts 0.
+async function seedMcpDefaults(db: SQLite.SQLiteDatabase) {
+  const cfgRow = await db.getFirstAsync<{ c: number }>("SELECT COUNT(*) as c FROM mcp_config");
+  if ((cfgRow?.c ?? 0) === 0) {
+    await db.runAsync(
+      `INSERT INTO mcp_config (id, server_enabled, port, bind_host, bearer_token, transport, require_token, updated_at)
+       VALUES (1, 0, 8765, '127.0.0.1', '', 'http_sse', 1, ?)`,
+      [nowIso()],
+    );
+  }
+  const toolCount = await db.getFirstAsync<{ c: number }>("SELECT COUNT(*) as c FROM mcp_tools");
+  if ((toolCount?.c ?? 0) === 0) {
+    // Built-in tool catalog — these become available to the MCP server
+    // once Phase 1B lands. `command_template` uses {placeholder} tokens
+    // that the server resolves from JSON-Schema-validated args. `wrap_mode:
+    // auto` means the server picks chroot/su based on current exec_mode.
+    const seeds = [
+      {
+        name: "exec_command",
+        description: "Run a shell command on the cockpit host (root). Honors current exec_mode (Android su / Kali chroot).",
+        command_template: "{cmd}",
+        arg_schema_json: JSON.stringify({
+          type: "object", required: ["cmd"],
+          properties: { cmd: { type: "string", description: "Command line to execute" } },
+        }),
+        wrap_mode: "auto", timeout_sec: 60, built_in: 1,
+      },
+      {
+        name: "read_command_logs",
+        description: "Return the most recent command_logs entries from local SQLite (limit ≤ 200).",
+        command_template: "__internal:read_command_logs",
+        arg_schema_json: JSON.stringify({
+          type: "object",
+          properties: { limit: { type: "integer", minimum: 1, maximum: 200, default: 50 } },
+        }),
+        wrap_mode: "none", timeout_sec: 5, built_in: 1,
+      },
+      {
+        name: "list_ifaces",
+        description: "List wireless interfaces and their current mode (managed/monitor) + channel.",
+        command_template: "iw dev | awk '/Interface|type|channel/ {print}'",
+        arg_schema_json: JSON.stringify({ type: "object", properties: {} }),
+        wrap_mode: "auto", timeout_sec: 5, built_in: 1,
+      },
+      {
+        name: "set_monitor_mode",
+        description: "Put an interface into monitor mode via airmon-ng (use list_ifaces first to discover names).",
+        command_template: "airmon-ng start {iface}",
+        arg_schema_json: JSON.stringify({
+          type: "object", required: ["iface"],
+          properties: { iface: { type: "string", description: "Interface name e.g. wlan2" } },
+        }),
+        wrap_mode: "auto", timeout_sec: 15, built_in: 1,
+      },
+      {
+        name: "set_channel",
+        description: "Lock a monitor-mode interface to a specific channel.",
+        command_template: "iw dev {iface} set channel {channel}",
+        arg_schema_json: JSON.stringify({
+          type: "object", required: ["iface", "channel"],
+          properties: {
+            iface: { type: "string" },
+            channel: { type: "integer", minimum: 1, maximum: 196 },
+          },
+        }),
+        wrap_mode: "auto", timeout_sec: 5, built_in: 1,
+      },
+      {
+        name: "list_attack_profiles",
+        description: "Return all attack profiles defined in the cockpit (name, description, command template).",
+        command_template: "__internal:list_attack_profiles",
+        arg_schema_json: JSON.stringify({ type: "object", properties: {} }),
+        wrap_mode: "none", timeout_sec: 5, built_in: 1,
+      },
+      {
+        name: "run_attack_profile",
+        description: "Run a named attack profile against an iface (and optional file/endpoint args).",
+        command_template: "__internal:run_attack_profile",
+        arg_schema_json: JSON.stringify({
+          type: "object", required: ["profile_name"],
+          properties: {
+            profile_name: { type: "string" },
+            iface: { type: "string" },
+            file: { type: "string" },
+            host: { type: "string" }, port: { type: "integer" },
+          },
+        }),
+        wrap_mode: "none", timeout_sec: 600, built_in: 1,
+      },
+      {
+        name: "start_session",
+        description: "Start a long-lived PTY session (e.g. Hermes, persistent shell). Returns session_id.",
+        command_template: "__internal:start_session",
+        arg_schema_json: JSON.stringify({
+          type: "object", required: ["command"],
+          properties: { command: { type: "string" }, label: { type: "string" } },
+        }),
+        wrap_mode: "none", timeout_sec: 10, built_in: 1,
+      },
+      {
+        name: "write_stdin",
+        description: "Send bytes to a running session's stdin (line by default ends with \\n).",
+        command_template: "__internal:write_stdin",
+        arg_schema_json: JSON.stringify({
+          type: "object", required: ["session_id", "data"],
+          properties: {
+            session_id: { type: "string" },
+            data: { type: "string" },
+            newline: { type: "boolean", default: true },
+          },
+        }),
+        wrap_mode: "none", timeout_sec: 5, built_in: 1,
+      },
+      {
+        name: "read_session",
+        description: "Read recent output from a session's ring buffer.",
+        command_template: "__internal:read_session",
+        arg_schema_json: JSON.stringify({
+          type: "object", required: ["session_id"],
+          properties: {
+            session_id: { type: "string" },
+            tail_bytes: { type: "integer", default: 4096, maximum: 65536 },
+          },
+        }),
+        wrap_mode: "none", timeout_sec: 5, built_in: 1,
+      },
+      {
+        name: "stop_session",
+        description: "Kill a running session by id.",
+        command_template: "__internal:stop_session",
+        arg_schema_json: JSON.stringify({
+          type: "object", required: ["session_id"],
+          properties: { session_id: { type: "string" } },
+        }),
+        wrap_mode: "none", timeout_sec: 5, built_in: 1,
+      },
+    ];
+    for (const t of seeds) {
+      await db.runAsync(
+        `INSERT INTO mcp_tools (id, name, description, command_template, arg_schema_json, wrap_mode, timeout_sec, enabled, built_in, created_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?)`,
+        [uuid(), t.name, t.description, t.command_template, t.arg_schema_json, t.wrap_mode, t.timeout_sec, 1, t.built_in, nowIso()],
+      );
+    }
+    console.log(`[localDb] seeded ${seeds.length} MCP tools`);
+  }
+}
+
 // ─── Command Logs ───────────────────────────────────────────────────────
 // Persisted history of every shell command executed via the Quick tab,
 // runProfile(), or Terminal-classic input box. Replaces the obsolete
@@ -456,6 +656,162 @@ export const commandLogsLocal = {
   async clear(): Promise<void> {
     const db = await openLocalDb();
     await db.runAsync("DELETE FROM command_logs");
+  },
+};
+
+// ─── MCP (Model Context Protocol) ──────────────────────────────────────
+// Cockpit-side data layer for the upcoming MCP server (Phase 1B).
+// Phase 1A only wires the UI + persistence — the actual chroot-side
+// FastMCP process gets spawned later. Everything is local SQLite so the
+// MCP tab works offline / cold-boot just like the rest of the app.
+export type MCPConfig = {
+  server_enabled: boolean; port: number; bind_host: string;
+  bearer_token: string; transport: "http_sse" | "stdio";
+  require_token: boolean; updated_at: string;
+};
+export type MCPTool = {
+  id: string; name: string; description: string;
+  command_template: string; arg_schema_json: string;
+  wrap_mode: "auto" | "kali" | "android" | "none";
+  timeout_sec: number; enabled: boolean; built_in: boolean; created_at: string;
+};
+export type MCPAuditEntry = {
+  id: string; ts: string; tool_name: string; args_json: string;
+  result_summary: string; client_id: string; duration_ms: number;
+  exit_code: number; success: boolean;
+};
+const MCP_AUDIT_CAP = 2000;
+
+export const mcpLocal = {
+  async getConfig(): Promise<MCPConfig> {
+    const db = await openLocalDb();
+    const row = await db.getFirstAsync<any>("SELECT * FROM mcp_config WHERE id = 1");
+    if (!row) {
+      // Should never happen post-migration but defensive
+      await db.runAsync(
+        `INSERT INTO mcp_config (id, server_enabled, port, bind_host, bearer_token, transport, require_token, updated_at)
+         VALUES (1, 0, 8765, '127.0.0.1', '', 'http_sse', 1, ?)`,
+        [nowIso()],
+      );
+      return await this.getConfig();
+    }
+    return {
+      ...row,
+      server_enabled: !!row.server_enabled,
+      require_token: !!row.require_token,
+    };
+  },
+  async updateConfig(patch: Partial<MCPConfig>): Promise<MCPConfig> {
+    const db = await openLocalDb();
+    const cur = await this.getConfig();
+    const merged: MCPConfig = { ...cur, ...patch, updated_at: nowIso() };
+    await db.runAsync(
+      `UPDATE mcp_config SET server_enabled=?, port=?, bind_host=?, bearer_token=?,
+        transport=?, require_token=?, updated_at=? WHERE id = 1`,
+      [
+        merged.server_enabled ? 1 : 0,
+        merged.port,
+        merged.bind_host,
+        merged.bearer_token,
+        merged.transport,
+        merged.require_token ? 1 : 0,
+        merged.updated_at,
+      ],
+    );
+    return merged;
+  },
+
+  async listTools(): Promise<MCPTool[]> {
+    const db = await openLocalDb();
+    const rows = await db.getAllAsync<any>(
+      "SELECT * FROM mcp_tools ORDER BY built_in DESC, name ASC",
+    );
+    return rows.map((r) => ({
+      ...r,
+      enabled: !!r.enabled,
+      built_in: !!r.built_in,
+    }));
+  },
+  async upsertTool(t: Partial<MCPTool> & { name: string; command_template: string }): Promise<MCPTool> {
+    const db = await openLocalDb();
+    if (t.id) {
+      const cur = await db.getFirstAsync<any>("SELECT * FROM mcp_tools WHERE id = ?", [t.id]);
+      if (cur) {
+        const merged = { ...cur, ...t };
+        await db.runAsync(
+          `UPDATE mcp_tools SET name=?, description=?, command_template=?, arg_schema_json=?,
+            wrap_mode=?, timeout_sec=?, enabled=? WHERE id=?`,
+          [merged.name, merged.description || "", merged.command_template,
+           merged.arg_schema_json || "{}", merged.wrap_mode || "auto",
+           merged.timeout_sec ?? 60, merged.enabled !== false ? 1 : 0, t.id],
+        );
+        return { ...merged, enabled: !!merged.enabled, built_in: !!merged.built_in };
+      }
+    }
+    const id = t.id || uuid();
+    const row: MCPTool = {
+      id,
+      name: t.name,
+      description: t.description || "",
+      command_template: t.command_template,
+      arg_schema_json: t.arg_schema_json || "{}",
+      wrap_mode: (t.wrap_mode as any) || "auto",
+      timeout_sec: t.timeout_sec ?? 60,
+      enabled: t.enabled !== false,
+      built_in: !!t.built_in,
+      created_at: nowIso(),
+    };
+    await db.runAsync(
+      `INSERT INTO mcp_tools (id, name, description, command_template, arg_schema_json, wrap_mode, timeout_sec, enabled, built_in, created_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?)`,
+      [row.id, row.name, row.description, row.command_template, row.arg_schema_json,
+       row.wrap_mode, row.timeout_sec, row.enabled ? 1 : 0, row.built_in ? 1 : 0, row.created_at],
+    );
+    return row;
+  },
+  async deleteTool(id: string): Promise<void> {
+    const db = await openLocalDb();
+    // Built-in tools can be disabled but not deleted — keeps the
+    // restore-default path simple.
+    await db.runAsync("DELETE FROM mcp_tools WHERE id = ? AND built_in = 0", [id]);
+  },
+
+  async listAudit(limit = 200): Promise<MCPAuditEntry[]> {
+    const db = await openLocalDb();
+    const rows = await db.getAllAsync<any>(
+      "SELECT * FROM mcp_audit_log ORDER BY ts DESC LIMIT ?", [limit],
+    );
+    return rows.map((r) => ({ ...r, success: !!r.success }));
+  },
+  async appendAudit(e: Omit<MCPAuditEntry, "id" | "ts"> & { id?: string; ts?: string }): Promise<MCPAuditEntry> {
+    const db = await openLocalDb();
+    const row: MCPAuditEntry = {
+      id: e.id || uuid(),
+      ts: e.ts || nowIso(),
+      tool_name: e.tool_name,
+      args_json: e.args_json || "{}",
+      result_summary: e.result_summary || "",
+      client_id: e.client_id || "",
+      duration_ms: e.duration_ms ?? 0,
+      exit_code: e.exit_code ?? 0,
+      success: !!e.success,
+    };
+    await db.runAsync(
+      `INSERT INTO mcp_audit_log (id, ts, tool_name, args_json, result_summary, client_id, duration_ms, exit_code, success)
+       VALUES (?,?,?,?,?,?,?,?,?)`,
+      [row.id, row.ts, row.tool_name, row.args_json, row.result_summary,
+       row.client_id, row.duration_ms, row.exit_code, row.success ? 1 : 0],
+    );
+    await db.runAsync(
+      `DELETE FROM mcp_audit_log WHERE id NOT IN (
+         SELECT id FROM mcp_audit_log ORDER BY ts DESC LIMIT ?
+       )`, [MCP_AUDIT_CAP],
+    );
+    return row;
+  },
+  async clearAudit(): Promise<void> {
+    const db = await openLocalDb();
+    await db.runAsync("DELETE FROM mcp_audit_log");
   },
 };
 
