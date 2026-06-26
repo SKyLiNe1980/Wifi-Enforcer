@@ -33,6 +33,7 @@ import {
 import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
 import { sessionManager, SessionState } from "../lib/sessionManager";
 import { hasNativeStreaming, RootShell, HAS_NATIVE_ROOT } from "../lib/rootShell";
+import { attackProfilesLocal, pcapEndpointsLocal } from "../lib/localDb";
 import XTermView from "./XTermView";
 
 const C = {
@@ -142,21 +143,17 @@ export default function LiveTab(props: Props) {
 
   const fetchAttackProfiles = useCallback(async () => {
     try {
-      const r = await fetch(`${props.apiBase}/attack-profiles`);
-      if (!r.ok) return;
-      const data: AttackProfile[] = await r.json();
-      setAttackProfiles(data);
-    } catch { /* non-fatal */ }
-  }, [props.apiBase]);
+      const data = await attackProfilesLocal.list();
+      setAttackProfiles(data as any);
+    } catch (e) { console.warn("[LiveTab] attack profiles read failed:", e); }
+  }, []);
 
   const fetchPcapEndpoints = useCallback(async () => {
     try {
-      const r = await fetch(`${props.apiBase}/pcap-endpoints`);
-      if (!r.ok) return;
-      const data: PcapEndpoint[] = await r.json();
-      setPcapEndpoints(data);
-    } catch { /* non-fatal */ }
-  }, [props.apiBase]);
+      const data = await pcapEndpointsLocal.list();
+      setPcapEndpoints(data as any);
+    } catch (e) { console.warn("[LiveTab] pcap endpoints read failed:", e); }
+  }, []);
 
   useEffect(() => { fetchAttackProfiles(); fetchPcapEndpoints(); },
     [fetchAttackProfiles, fetchPcapEndpoints]);

@@ -861,3 +861,59 @@ agent_communication:
           - Wifite PTY wrapping (ioctl errors)
           - Chroot wrap echo spam suppression
 
+
+
+        ─────────────────────────────────────────────────────────
+        UPDATE 2026-06-26: Phase 4 complete — full local-first migration
+        ─────────────────────────────────────────────────────────
+
+        File: /app/frontend/src/lib/localDb.ts (+ AITab.tsx, LiveTab.tsx, index.tsx)
+
+        WHAT CHANGED:
+          - localDb.ts migration v3 adds `command_logs` table
+            (caps to 500 rows, indexed by timestamp)
+          - New `commandLogsLocal` API (list/append/clear)
+          - index.tsx — ALL of these now use local SQLite:
+            • fetchAll() → profiles + command logs from localDb
+            • fetchAIProfiles() → aiProfilesLocal.list()
+            • fetchPcapEndpoints() → pcapEndpointsLocal.list()
+            • execute()/runProfile() append logs locally (works
+              for REAL/KALI native exec too, which previously
+              never wrote anywhere — first time we get persistent
+              transcripts on actual root commands!)
+            • saveAIProfile/deleteAIProfile/savePcapEndpoint/
+              deletePcapEndpoint/saveCurrentAsProfile/deleteProfile/
+              importProfiles/clearLogs → all local
+            • exec_mode segmented control → direct settingsLocal.update()
+              (was a fetch() to /api/settings — race-prone)
+            • rootInfo seeded from Platform constants instead of
+              /api/health (Platform.OS, Platform.Version, bridgeRoot)
+          - AITab.tsx:
+            • fetchProfiles → aiProfilesLocal.list()
+            • view_mode toggle → aiProfilesLocal.upsert()
+            • Dropped /api/ai-logs POSTs entirely
+          - LiveTab.tsx:
+            • Attack profiles + PCAP endpoints loaded from localDb
+        
+        DataLoadState renamed `health` → `logs`, all 5 rows in
+        // data status now read from local SQLite. The whole UI is
+        functionally offline.
+
+        BACKEND NOT REMOVED YET — endpoints still exist but the app
+        never calls them for core data (only diagnostic ping retained).
+        Backend can later be repurposed as MCP/swarm sync target.
+
+        WHAT TO TEST ON DEVICE (next EAS build):
+          1. Cold boot → KALI mode sticks
+          2. All // data status rows say "OK · N items (local)"
+          3. Toggle airplane mode → everything stays green
+          4. Add AI profile, restart app → still there
+          5. Add PCAP endpoint, restart → still there
+          6. Save profile from Quick → restart → still there
+          7. Run commands in KALI mode → terminal logs persist across restart
+          8. Delete logs → empty terminal after restart
+
+        NEXT (per backlog):
+          - Cross-tab UX (Quick command output invisible in shell mode)
+          - Wifite PTY wrapping (ioctl errors)
+          - Mode rename (mock→preview, real→Android, kali→Kali)
