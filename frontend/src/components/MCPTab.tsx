@@ -68,9 +68,26 @@ export default function MCPTab() {
   // Local form state — committed to SQLite via debounced updateConfig().
   const [portInput, setPortInput] = useState("8765");
   const [bindInput, setBindInput] = useState("127.0.0.1");
+  const [probeInput, setProbeInput] = useState("127.0.0.1");
 
   // Tool editor modal — null = closed, else current draft.
   const [editingTool, setEditingTool] = useState<Partial<MCPTool> | null>(null);
+
+  // ─── Live link to chroot server ───────────────────────────────────────
+  // serverHealth = "unknown" (initial / disarmed)
+  //              | "probing"
+  //              | "running"        (last /health returned 200)
+  //              | "unreachable"    (network error / connection refused)
+  //              | "auth_failed"    (401/403 from /audit/since — bearer mismatch)
+  //              | "error"          (5xx / unexpected shape)
+  type Health = "unknown" | "probing" | "running" | "unreachable" | "auth_failed" | "error";
+  const [serverHealth, setServerHealth] = useState<Health>("unknown");
+  const [serverInfo, setServerInfo] = useState<any>(null);
+  const [lastProbeAt, setLastProbeAt] = useState<number | null>(null);
+  const [probeError, setProbeError] = useState<string | null>(null);
+  const [auditSyncCount, setAuditSyncCount] = useState(0);
+  // Tick every second to refresh "Xs ago" labels without re-firing polls
+  const [, setTick] = useState(0);
 
   const refresh = useCallback(async () => {
     const [c, t, a] = await Promise.all([
@@ -83,11 +100,129 @@ export default function MCPTab() {
     setAudit(a);
     setPortInput(String(c.port));
     setBindInput(c.bind_host);
+    setProbeInput(c.cockpit_probe_host || "127.0.0.1");
   }, []);
 
   useEffect(() => {
     refresh().catch((e) => console.warn("[MCPTab] refresh failed:", e));
   }, [refresh]);
+
+  // ─── Health probe + audit sync loop ────────────────────────────────────
+  // Runs only while the MCP tab is mounted (index.tsx renders us
+  // conditionally on tab === "mcp"). When the user leaves the tab the
+  // component unmounts, the cleanup fires, and battery thanks us.
+  //
+  // Cadence:
+  //   • Every 5s: GET {probe_host}:{port}/health  → status pill
+  //   • Every 3s, only when serverHealth === "running":
+  //       GET {probe_host}:{port}/audit/since?ts=<latest local ts>
+  //       Bulk-ingest via mcpLocal.syncAuditFromServer() → // audit fills live
+  useEffect(() => {
+    if (!config) return;
+    if (!config.server_enabled) {
+      setServerHealth("unknown");
+      setServerInfo(null);
+      return;
+    }
+    const probeHost = (config.cockpit_probe_host || "127.0.0.1").trim();
+    const port = config.port;
+    const token = config.bearer_token;
+    const base = `http://${probeHost}:${port}`;
+    let cancelled = false;
+
+    const tryFetch = async (path: string, useAuth: boolean): Promise<Response> => {
+      const ctl = new AbortController();
+      const timer = setTimeout(() => ctl.abort(), 3500);
+      try {
+        const headers: Record<string, string> = { Accept: "application/json" };
+        if (useAuth && token) headers.Authorization = `Bearer ${token}`;
+        return await fetch(`${base}${path}`, { headers, signal: ctl.signal });
+      } finally {
+        clearTimeout(timer);
+      }
+    };
+
+    const probeHealth = async () => {
+      setServerHealth((prev) => prev === "unknown" ? "probing" : prev);
+      try {
+        // /health is intentionally public — works even if bearer is empty/wrong
+        const r = await tryFetch("/health", false);
+        if (cancelled) return;
+        if (!r.ok) {
+          setServerHealth("error");
+          setProbeError(`HTTP ${r.status}`);
+          return;
+        }
+        const info = await r.json();
+        if (cancelled) return;
+        setServerInfo(info);
+        setProbeError(null);
+        setLastProbeAt(Date.now());
+        setServerHealth("running");
+      } catch (e: any) {
+        if (cancelled) return;
+        const msg = e?.message || String(e);
+        // Network-level failure ≠ server bug. AbortError = our 3.5s timeout.
+        if (msg.includes("Network") || msg.includes("aborted") ||
+            msg.includes("Failed to fetch") || msg.includes("ECONNREFUSED") ||
+            msg.includes("connect")) {
+          setServerHealth("unreachable");
+        } else {
+          setServerHealth("error");
+        }
+        setProbeError(msg);
+        setLastProbeAt(Date.now());
+      }
+    };
+
+    const syncAudit = async () => {
+      try {
+        const cursor = await mcpLocal.getMaxAuditTs();
+        const q = cursor ? `?ts=${encodeURIComponent(cursor)}` : "";
+        const r = await tryFetch(`/audit/since${q}`, true);
+        if (cancelled) return;
+        if (r.status === 401 || r.status === 403) {
+          setServerHealth("auth_failed");
+          setProbeError(`audit poll ${r.status} — bearer token mismatch with server config.yaml`);
+          return;
+        }
+        if (!r.ok) return;
+        const data = await r.json();
+        if (cancelled) return;
+        const events = (data?.events || []) as any[];
+        if (events.length === 0) return;
+        const inserted = await mcpLocal.syncAuditFromServer(events);
+        if (inserted > 0) {
+          setAuditSyncCount((c) => c + inserted);
+          // Refresh the visible audit list
+          const list = await mcpLocal.listAudit(200);
+          if (!cancelled) setAudit(list);
+        }
+      } catch {
+        // Silent — health loop reports connection status; audit just no-ops
+      }
+    };
+
+    // Fire immediately, then on intervals
+    probeHealth();
+    const healthTimer = setInterval(probeHealth, 5000);
+    const auditTimer = setInterval(() => {
+      // Only poll audit when server is confirmed reachable to avoid
+      // duplicating "unreachable" noise across two loops.
+      setServerHealth((cur) => {
+        if (cur === "running") syncAudit();
+        return cur;
+      });
+    }, 3000);
+    const tickTimer = setInterval(() => setTick((t) => t + 1), 1000);
+
+    return () => {
+      cancelled = true;
+      clearInterval(healthTimer);
+      clearInterval(auditTimer);
+      clearInterval(tickTimer);
+    };
+  }, [config?.server_enabled, config?.cockpit_probe_host, config?.port, config?.bearer_token]);  // eslint-disable-line react-hooks/exhaustive-deps
 
   // ─── Config writes ──────────────────────────────────────────────────────
   const patchConfig = useCallback(async (patch: Partial<MCPConfig>) => {
@@ -104,25 +239,14 @@ export default function MCPTab() {
     if (next && (!config?.bearer_token || config.bearer_token.length < 16) && config?.require_token) {
       Alert.alert(
         "Generate a token first",
-        "Server is set to require a bearer token but none is set. Generate one before enabling the server.",
+        "Server is set to require a bearer token but none is set. Generate one before enabling.",
       );
       return;
     }
-    if (next) {
-      // Server doesn't exist yet — this is Phase 1A. We let the user "arm"
-      // the config (server_enabled=1) so it auto-starts once Phase 1B
-      // lands, but warn them it's not actually serving today.
-      Alert.alert(
-        "MCP server not yet built",
-        "Phase 1A only persists config. The chroot-side FastMCP process arrives in the next build. Flip on now to pre-arm; nothing exposes a port today.",
-        [
-          { text: "Cancel", style: "cancel" },
-          { text: "Pre-arm anyway", onPress: () => patchConfig({ server_enabled: true }) },
-        ],
-      );
-      return;
-    }
-    patchConfig({ server_enabled: false });
+    // Phase 1B.2a: server IS real now (you scp/git-pull'd it into the
+    // chroot and ran it manually). Toggle just controls cockpit-side
+    // probing + audit sync. Auto-spawn comes in 1B.2b.
+    await patchConfig({ server_enabled: next });
   }, [config, patchConfig]);
 
   const handleRegenerateToken = useCallback(async () => {
@@ -213,10 +337,28 @@ export default function MCPTab() {
   const statusInfo = useMemo(() => {
     if (!config) return { label: "loading", color: C.textDim };
     if (!config.server_enabled) return { label: "DISARMED", color: C.textDim };
-    // Phase 1A: armed but no server. In 1B this branch differentiates
-    // "armed but unreachable" vs "running".
-    return { label: "ARMED (server not yet built)", color: C.yellow };
-  }, [config]);
+    switch (serverHealth) {
+      case "running":
+        return { label: "RUNNING", color: C.green };
+      case "probing":
+      case "unknown":
+        return { label: "ARMED · PROBING…", color: C.yellow };
+      case "unreachable":
+        return { label: "ARMED · UNREACHABLE", color: C.yellow };
+      case "auth_failed":
+        return { label: "ARMED · TOKEN MISMATCH", color: C.red };
+      case "error":
+        return { label: "ARMED · ERROR", color: C.red };
+      default:
+        return { label: "ARMED", color: C.yellow };
+    }
+  }, [config, serverHealth]);
+
+  const probeAgeStr = useMemo(() => {
+    if (!lastProbeAt) return "—";
+    const dt = Math.max(0, Math.floor((Date.now() - lastProbeAt) / 1000));
+    return `${dt}s ago`;
+  }, [lastProbeAt]);
 
   // ─── Render ─────────────────────────────────────────────────────────────
   if (!config) {
@@ -272,7 +414,7 @@ export default function MCPTab() {
 
           <Text style={[s.sectionTitle, { marginTop: 20 }]}>{"// network"}</Text>
           <View style={s.card}>
-            <Text style={s.kvLabel}>bind host</Text>
+            <Text style={s.kvLabel}>server bind host</Text>
             <TextInput
               style={s.input}
               value={bindInput}
@@ -285,7 +427,24 @@ export default function MCPTab() {
               keyboardType="numbers-and-punctuation"
             />
             <Text style={[s.helperFine, { marginTop: 4 }]}>
-              loopback for local-only · 0.0.0.0 for Tailscale mesh (Phase 2)
+              loopback for local-only · 0.0.0.0 for Tailscale mesh · or a specific iface IP
+            </Text>
+
+            <Text style={[s.kvLabel, { marginTop: 14 }]}>cockpit probe host</Text>
+            <TextInput
+              style={s.input}
+              value={probeInput}
+              onChangeText={setProbeInput}
+              onBlur={() => probeInput !== config.cockpit_probe_host && patchConfig({ cockpit_probe_host: probeInput.trim() || "127.0.0.1" })}
+              placeholder="127.0.0.1 (default — works for bind 0.0.0.0 or loopback)"
+              placeholderTextColor={C.textDim}
+              autoCapitalize="none"
+              autoCorrect={false}
+              keyboardType="numbers-and-punctuation"
+            />
+            <Text style={[s.helperFine, { marginTop: 4 }]}>
+              where THIS cockpit connects to probe /health + /audit. set to your tailnet
+              hostname (e.g. s10-nethunter) if the server binds only to that iface.
             </Text>
 
             <Text style={[s.kvLabel, { marginTop: 14 }]}>port</Text>
@@ -307,6 +466,39 @@ export default function MCPTab() {
               keyboardType="number-pad"
             />
           </View>
+
+          {/* LIVE CONNECTIVITY CARD — only meaningful when server_enabled */}
+          {config.server_enabled && (
+            <>
+              <Text style={[s.sectionTitle, { marginTop: 20 }]}>{"// connectivity"}</Text>
+              <View style={s.card}>
+                <Text style={s.helper}>
+                  endpoint: <Text style={{ color: C.cyan }}>
+                    http://{(config.cockpit_probe_host || "127.0.0.1")}:{config.port}
+                  </Text>
+                </Text>
+                <Text style={[s.helperFine, { marginTop: 6 }]}>
+                  last health probe: <Text style={{ color: C.cyan }}>{probeAgeStr}</Text>
+                  {"  ·  "}
+                  audit events synced this session: <Text style={{ color: C.cyan }}>{auditSyncCount}</Text>
+                </Text>
+                {serverInfo && (
+                  <Text style={[s.helperFine, { marginTop: 4 }]}>
+                    server: <Text style={{ color: C.cyan }}>{serverInfo.service}@{serverInfo.version}</Text>
+                    {"  ·  "}tools: <Text style={{ color: C.cyan }}>{serverInfo.tools}</Text>
+                    {"  ·  "}require_token: <Text style={{ color: serverInfo.require_token ? C.green : C.yellow }}>
+                      {String(!!serverInfo.require_token)}
+                    </Text>
+                  </Text>
+                )}
+                {probeError && serverHealth !== "running" && (
+                  <Text style={[s.helperFine, { marginTop: 6, color: C.red }]}>
+                    err: {probeError}
+                  </Text>
+                )}
+              </View>
+            </>
+          )}
 
           <Text style={[s.sectionTitle, { marginTop: 20 }]}>{"// auth · bearer token"}</Text>
           <View style={s.card}>
@@ -363,11 +555,13 @@ export default function MCPTab() {
           <Text style={[s.sectionTitle, { marginTop: 20 }]}>{"// roadmap"}</Text>
           <View style={s.card}>
             <Text style={s.helper}>
-              <Text style={{ color: C.green }}>✓</Text> 1A · UI + persistence (this build){"\n"}
-              <Text style={{ color: C.yellow }}>·</Text> 1B · FastMCP server in Kali chroot{"\n"}
-              <Text style={{ color: C.textDim }}>·</Text> 1C · tool registry hot-reload{"\n"}
-              <Text style={{ color: C.textDim }}>·</Text> 1D · local Hermes ↔ local MCP loop{"\n"}
-              <Text style={{ color: C.textDim }}>·</Text> 2  · Tailscale bridge + Nodes tab
+              <Text style={{ color: C.green }}>✓</Text> 1A  · UI + persistence{"\n"}
+              <Text style={{ color: C.green }}>✓</Text> 1B.1 · FastMCP server (chroot){"\n"}
+              <Text style={{ color: C.green }}>✓</Text> 1B.2a · live probe + audit sync (this build){"\n"}
+              <Text style={{ color: C.yellow }}>·</Text> 1B.2b · cockpit auto-spawn the server{"\n"}
+              <Text style={{ color: C.textDim }}>·</Text> 1C  · real session handlers (PTY){"\n"}
+              <Text style={{ color: C.textDim }}>·</Text> 1D  · local Hermes ↔ local MCP loop{"\n"}
+              <Text style={{ color: C.textDim }}>·</Text> 2   · Tailscale bridge + Nodes tab + enforcer-node .deb
             </Text>
           </View>
         </ScrollView>
@@ -458,7 +652,7 @@ export default function MCPTab() {
           {audit.length === 0 ? (
             <View style={s.card}>
               <Text style={s.helper}>
-                {"// no tool calls yet. when the chroot MCP server (Phase 1B) starts accepting connections, every tool invocation will land here in real time with timing, exit code, and a result summary."}
+                {"// no tool calls yet. enable the server in // status, then make a tool call (e.g. via Postman, curl, or Hermes). this list refreshes every 3s when the server is reachable."}
               </Text>
             </View>
           ) : (

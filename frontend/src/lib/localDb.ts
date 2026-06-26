@@ -21,7 +21,7 @@ let _db: SQLite.SQLiteDatabase | null = null;
 // pre-migration → re-run the seed → insert 9 attack + 5 AI profiles AGAIN.
 // With 8 concurrent callers that produced 72 attack profiles. Fun.
 let _dbPromise: Promise<SQLite.SQLiteDatabase> | null = null;
-const TARGET_VERSION = 5;
+const TARGET_VERSION = 6;
 
 export async function openLocalDb(): Promise<SQLite.SQLiteDatabase> {
   if (_db) return _db;
@@ -197,6 +197,24 @@ async function runMigrations(db: SQLite.SQLiteDatabase) {
           CREATE INDEX IF NOT EXISTS idx_mcp_audit_tool ON mcp_audit_log(tool_name);
         `);
         await seedMcpDefaults(db);
+        break;
+      case 6:
+        // 1B.2a wiring: cockpit polls the chroot MCP server's /health
+        // + /audit/since endpoints. Two schema additions:
+        //   1. cockpit_probe_host on mcp_config — separate from bind_host
+        //      because if the server binds ONLY to a tailnet IP (not 0.0.0.0
+        //      or 127.0.0.1), loopback probes from the cockpit fail. This
+        //      lets the operator override per-deploy.
+        //   2. server_id on mcp_audit_log — the server's autoincrement
+        //      integer id, used for dedupe when the cockpit polls
+        //      /audit/since and gets overlapping rows. UUID id stays the
+        //      primary key (cockpit-side identity).
+        await db.execAsync(`
+          ALTER TABLE mcp_config ADD COLUMN cockpit_probe_host TEXT DEFAULT '127.0.0.1';
+          ALTER TABLE mcp_audit_log ADD COLUMN server_id INTEGER;
+          CREATE INDEX IF NOT EXISTS idx_mcp_audit_server_id
+            ON mcp_audit_log(server_id);
+        `);
         break;
       default:
         throw new Error(`[localDb] no migration for version ${next}`);
@@ -670,6 +688,7 @@ export const commandLogsLocal = {
 // MCP tab works offline / cold-boot just like the rest of the app.
 export type MCPConfig = {
   server_enabled: boolean; port: number; bind_host: string;
+  cockpit_probe_host: string;
   bearer_token: string; transport: "http_sse" | "stdio";
   require_token: boolean; updated_at: string;
 };
@@ -683,6 +702,7 @@ export type MCPAuditEntry = {
   id: string; ts: string; tool_name: string; args_json: string;
   result_summary: string; client_id: string; duration_ms: number;
   exit_code: number; success: boolean;
+  server_id?: number | null;
 };
 const MCP_AUDIT_CAP = 2000;
 
@@ -701,6 +721,7 @@ export const mcpLocal = {
     }
     return {
       ...row,
+      cockpit_probe_host: row.cockpit_probe_host || "127.0.0.1",
       server_enabled: !!row.server_enabled,
       require_token: !!row.require_token,
     };
@@ -710,12 +731,13 @@ export const mcpLocal = {
     const cur = await this.getConfig();
     const merged: MCPConfig = { ...cur, ...patch, updated_at: nowIso() };
     await db.runAsync(
-      `UPDATE mcp_config SET server_enabled=?, port=?, bind_host=?, bearer_token=?,
-        transport=?, require_token=?, updated_at=? WHERE id = 1`,
+      `UPDATE mcp_config SET server_enabled=?, port=?, bind_host=?, cockpit_probe_host=?,
+        bearer_token=?, transport=?, require_token=?, updated_at=? WHERE id = 1`,
       [
         merged.server_enabled ? 1 : 0,
         merged.port,
         merged.bind_host,
+        merged.cockpit_probe_host || "127.0.0.1",
         merged.bearer_token,
         merged.transport,
         merged.require_token ? 1 : 0,
@@ -799,12 +821,14 @@ export const mcpLocal = {
       duration_ms: e.duration_ms ?? 0,
       exit_code: e.exit_code ?? 0,
       success: !!e.success,
+      server_id: e.server_id ?? null,
     };
     await db.runAsync(
-      `INSERT INTO mcp_audit_log (id, ts, tool_name, args_json, result_summary, client_id, duration_ms, exit_code, success)
-       VALUES (?,?,?,?,?,?,?,?,?)`,
+      `INSERT INTO mcp_audit_log (id, ts, tool_name, args_json, result_summary, client_id, duration_ms, exit_code, success, server_id)
+       VALUES (?,?,?,?,?,?,?,?,?,?)`,
       [row.id, row.ts, row.tool_name, row.args_json, row.result_summary,
-       row.client_id, row.duration_ms, row.exit_code, row.success ? 1 : 0],
+       row.client_id, row.duration_ms, row.exit_code, row.success ? 1 : 0,
+       row.server_id ?? null],
     );
     await db.runAsync(
       `DELETE FROM mcp_audit_log WHERE id NOT IN (
@@ -816,6 +840,77 @@ export const mcpLocal = {
   async clearAudit(): Promise<void> {
     const db = await openLocalDb();
     await db.runAsync("DELETE FROM mcp_audit_log");
+  },
+
+  /**
+   * Largest server_id we've already mirrored locally. Used as the cursor
+   * for /audit/since polls — server returns rows with ts > cursor, but the
+   * ts cursor alone has a millisecond-collision risk under burst load, so
+   * we additionally filter inserts by server_id presence.
+   */
+  async getMaxServerAuditId(): Promise<number | null> {
+    const db = await openLocalDb();
+    const row = await db.getFirstAsync<{ max_id: number | null }>(
+      "SELECT MAX(server_id) as max_id FROM mcp_audit_log WHERE server_id IS NOT NULL",
+    );
+    return row?.max_id ?? null;
+  },
+  async getMaxAuditTs(): Promise<string | null> {
+    const db = await openLocalDb();
+    const row = await db.getFirstAsync<{ max_ts: string | null }>(
+      "SELECT MAX(ts) as max_ts FROM mcp_audit_log",
+    );
+    return row?.max_ts ?? null;
+  },
+
+  /**
+   * Bulk-ingest events pulled from /audit/since. Each event must carry a
+   * numeric `id` (server-side autoincrement) which we store as `server_id`
+   * to dedupe across repeated polls. Returns count of NEWLY inserted rows.
+   */
+  async syncAuditFromServer(events: Array<{
+    id: number; ts: string; tool_name: string;
+    args?: any; args_json?: string;
+    result_summary?: string; client_id?: string;
+    duration_ms?: number; exit_code?: number; success?: boolean;
+  }>): Promise<number> {
+    if (!events.length) return 0;
+    const db = await openLocalDb();
+    // Pre-fetch already-known server_ids to skip duplicates without
+    // hammering the unique constraint with INSERT-then-rollback churn.
+    const ids = events.map((e) => e.id).filter((n) => typeof n === "number");
+    if (ids.length === 0) return 0;
+    const placeholders = ids.map(() => "?").join(",");
+    const known = await db.getAllAsync<{ server_id: number }>(
+      `SELECT server_id FROM mcp_audit_log WHERE server_id IN (${placeholders})`,
+      ids,
+    );
+    const knownSet = new Set(known.map((k) => k.server_id));
+    let inserted = 0;
+    for (const e of events) {
+      if (knownSet.has(e.id)) continue;
+      const args_json = e.args_json ?? JSON.stringify(e.args ?? {});
+      await db.runAsync(
+        `INSERT INTO mcp_audit_log (id, ts, tool_name, args_json, result_summary, client_id, duration_ms, exit_code, success, server_id)
+         VALUES (?,?,?,?,?,?,?,?,?,?)`,
+        [
+          uuid(), e.ts, e.tool_name, args_json,
+          e.result_summary || "", e.client_id || "",
+          e.duration_ms ?? 0, e.exit_code ?? 0,
+          e.success === false ? 0 : 1, e.id,
+        ],
+      );
+      inserted++;
+    }
+    if (inserted > 0) {
+      // Trim to cap once after the batch insert
+      await db.runAsync(
+        `DELETE FROM mcp_audit_log WHERE id NOT IN (
+           SELECT id FROM mcp_audit_log ORDER BY ts DESC LIMIT ?
+         )`, [MCP_AUDIT_CAP],
+      );
+    }
+    return inserted;
   },
 };
 
