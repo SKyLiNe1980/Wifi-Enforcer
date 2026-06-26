@@ -10,15 +10,32 @@
 import * as SQLite from "expo-sqlite";
 
 let _db: SQLite.SQLiteDatabase | null = null;
-const TARGET_VERSION = 3;
+// ⚡ Single-flight promise — prevents the race where multiple callers
+// (index.tsx, AITab, LiveTab all fire openLocalDb() during boot) each
+// run the migration concurrently. Before this guard, every concurrent
+// caller would: see _db===null → open a fresh handle → see user_version
+// pre-migration → re-run the seed → insert 9 attack + 5 AI profiles AGAIN.
+// With 8 concurrent callers that produced 72 attack profiles. Fun.
+let _dbPromise: Promise<SQLite.SQLiteDatabase> | null = null;
+const TARGET_VERSION = 4;
 
 export async function openLocalDb(): Promise<SQLite.SQLiteDatabase> {
   if (_db) return _db;
-  const db = await SQLite.openDatabaseAsync("enforcer.db");
-  await db.execAsync(`PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;`);
-  await runMigrations(db);
-  _db = db;
-  return db;
+  if (_dbPromise) return _dbPromise;
+  _dbPromise = (async () => {
+    const db = await SQLite.openDatabaseAsync("enforcer.db");
+    await db.execAsync(`PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;`);
+    await runMigrations(db);
+    _db = db;
+    return db;
+  })();
+  try {
+    return await _dbPromise;
+  } catch (e) {
+    // Reset so a subsequent call can retry instead of getting a poisoned promise.
+    _dbPromise = null;
+    throw e;
+  }
 }
 
 async function runMigrations(db: SQLite.SQLiteDatabase) {
@@ -106,6 +123,28 @@ async function runMigrations(db: SQLite.SQLiteDatabase) {
           );
           CREATE INDEX IF NOT EXISTS idx_command_logs_ts ON command_logs(timestamp);
         `);
+        break;
+      case 4:
+        // One-shot dedupe for users hit by the openLocalDb race (pre-fix
+        // boots spawned N concurrent migrations, each seeding 9 attack +
+        // 5 AI profiles, compounding on every cold launch). Keep the
+        // oldest rowid per name; nuke the rest. Safe to run even on
+        // pristine installs (no-op).
+        await db.execAsync(`
+          DELETE FROM attack_profiles WHERE rowid NOT IN (
+            SELECT MIN(rowid) FROM attack_profiles GROUP BY name
+          );
+          DELETE FROM ai_profiles WHERE rowid NOT IN (
+            SELECT MIN(rowid) FROM ai_profiles GROUP BY name
+          );
+          DELETE FROM profiles WHERE rowid NOT IN (
+            SELECT MIN(rowid) FROM profiles GROUP BY name
+          );
+          DELETE FROM pcap_endpoints WHERE rowid NOT IN (
+            SELECT MIN(rowid) FROM pcap_endpoints GROUP BY name
+          );
+        `);
+        console.log(`[localDb] deduped profiles by name`);
         break;
       default:
         throw new Error(`[localDb] no migration for version ${next}`);
