@@ -255,6 +255,41 @@ export default function MCPTab() {
     Alert.alert("New bearer token generated", "Copy it now — it's the only way external MCP clients can connect.");
   }, [patchConfig]);
 
+  const handleImportToken = useCallback(async () => {
+    try {
+      const pasted = (await Clipboard.getStringAsync()).trim();
+      // Validate: 64 hex chars (256-bit token from generateBearerToken)
+      // or at least 16 chars (allows shorter custom tokens too).
+      if (!pasted) {
+        Alert.alert("Clipboard empty", "Copy a token first (long-press in any text field → Copy), then tap IMPORT.");
+        return;
+      }
+      if (!/^[0-9a-f]+$/i.test(pasted) || pasted.length < 16) {
+        Alert.alert(
+          "Doesn't look like a bearer token",
+          `Got "${pasted.slice(0, 24)}${pasted.length > 24 ? "…" : ""}" (${pasted.length} chars). Expected hex chars only, ≥16 long.`,
+        );
+        return;
+      }
+      Alert.alert(
+        "Import this token?",
+        `Paste from clipboard:\n${pasted.slice(0, 8)}…${pasted.slice(-4)} (${pasted.length} chars)\n\nThis will REPLACE the current token. Make sure it matches the one in /etc/enforcer-mcp/config.yaml on the chroot server.`,
+        [
+          { text: "Cancel", style: "cancel" },
+          {
+            text: "Import",
+            onPress: async () => {
+              await patchConfig({ bearer_token: pasted.toLowerCase() });
+              Alert.alert("Token imported", "Cockpit will use this for /audit/since polls. If status pill still shows TOKEN MISMATCH, verify the chroot's config.yaml has the SAME value.");
+            },
+          },
+        ],
+      );
+    } catch (e: any) {
+      Alert.alert("Import failed", e?.message || "clipboard read error");
+    }
+  }, [patchConfig]);
+
   const handleCopyToken = useCallback(async () => {
     if (!config?.bearer_token) return;
     await Clipboard.setStringAsync(config.bearer_token);
@@ -545,16 +580,16 @@ export default function MCPTab() {
                   : tokenVisible ? config.bearer_token : shortToken(config.bearer_token)}
               </Text>
             </View>
-            <View style={[s.row, { marginTop: 10, gap: 8 }]}>
+            <View style={[s.row, { marginTop: 10, gap: 6 }]}>
               <TouchableOpacity
-                style={[s.btn, { flex: 1, backgroundColor: C.panel2 }]}
+                style={[s.btn, { flex: 0.9, backgroundColor: C.panel2 }]}
                 onPress={() => setTokenVisible((v) => !v)}
               >
                 <MaterialCommunityIcons name={tokenVisible ? "eye-off" : "eye"} size={14} color={C.cyan} />
                 <Text style={[s.btnText, { color: C.cyan }]}>{tokenVisible ? "HIDE" : "REVEAL"}</Text>
               </TouchableOpacity>
               <TouchableOpacity
-                style={[s.btn, { flex: 1, backgroundColor: C.panel2 }]}
+                style={[s.btn, { flex: 0.9, backgroundColor: C.panel2 }]}
                 onPress={handleCopyToken}
                 disabled={!config.bearer_token}
               >
@@ -562,11 +597,18 @@ export default function MCPTab() {
                 <Text style={[s.btnText, { color: C.green }]}>COPY</Text>
               </TouchableOpacity>
               <TouchableOpacity
-                style={[s.btn, { flex: 1.2, backgroundColor: C.panel2, borderColor: C.magenta }]}
+                style={[s.btn, { flex: 0.9, backgroundColor: C.panel2, borderColor: C.cyan }]}
+                onPress={handleImportToken}
+              >
+                <MaterialCommunityIcons name="content-paste" size={14} color={C.cyan} />
+                <Text style={[s.btnText, { color: C.cyan }]}>IMPORT</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[s.btn, { flex: 1.1, backgroundColor: C.panel2, borderColor: C.magenta }]}
                 onPress={handleRegenerateToken}
               >
                 <MaterialCommunityIcons name="key-change" size={14} color={C.magenta} />
-                <Text style={[s.btnText, { color: C.magenta }]}>REGENERATE</Text>
+                <Text style={[s.btnText, { color: C.magenta }]}>REGEN</Text>
               </TouchableOpacity>
             </View>
             <Text style={[s.helperFine, { marginTop: 10 }]}>

@@ -171,3 +171,67 @@ tools:
       }
     wrap_mode: none
     timeout_sec: 5
+
+  # ─── wpa-sec.stanev.org integration ───────────────────────────────────────
+  # Three-tool wrapper around the wpasec-upload CLI helper. wpa-sec only
+  # accepts PMKIDs (not 4-way handshakes) AND only files with radiotap
+  # headers — airodump-ng output usually fails on both counts. The helper
+  # auto-converts .22000 → .cap (which wpa-sec WILL accept despite the
+  # name suggesting otherwise) and uploads via curl.
+  #
+  # Common Hermes flow:
+  #   1. capture PMKIDs with hcxdumptool → /tmp/cap.pcapng
+  #   2. wpasec_preview {file:/tmp/cap.pcapng}  → confirms parseable
+  #   3. wpasec_upload  {file:/tmp/cap.pcapng}  → submits to community
+
+  - name: wpasec_preview
+    description: "DRY-RUN a wpa-sec.stanev.org upload — shows what hashes would be submitted without actually uploading. No API key required. Auto-converts .22000/.pcapng/.cap inputs."
+    command_template: "wpasec-upload -n {file}"
+    arg_schema_json: |
+      {
+        "type": "object",
+        "required": ["file"],
+        "properties": {
+          "file": {
+            "type": "string",
+            "description": "Absolute path to a .cap, .pcap, .pcapng, or .22000 file containing PMKIDs"
+          }
+        }
+      }
+    wrap_mode: none
+    timeout_sec: 30
+
+  - name: wpasec_upload
+    description: "Upload a WPA capture to wpa-sec.stanev.org for community-distributed PMKID cracking. Reads API key from ~/.wpasec (set via wpasec_save_key once). Auto-converts .22000 → .cap. PMKID-only — 4-way handshakes are ignored by wpa-sec."
+    command_template: "wpasec-upload {file}"
+    arg_schema_json: |
+      {
+        "type": "object",
+        "required": ["file"],
+        "properties": {
+          "file": {
+            "type": "string",
+            "description": "Absolute path to the capture file"
+          }
+        }
+      }
+    wrap_mode: none
+    timeout_sec: 120
+
+  - name: wpasec_save_key
+    description: "Persist the wpa-sec.stanev.org API key (32-char hex, from your account page) to ~/.wpasec. Subsequent wpasec_upload calls will use it automatically. One-time setup per node."
+    command_template: "wpasec-upload -k {key} -s"
+    arg_schema_json: |
+      {
+        "type": "object",
+        "required": ["key"],
+        "properties": {
+          "key": {
+            "type": "string",
+            "pattern": "^[a-fA-F0-9]{32}$",
+            "description": "32 hex characters from your wpa-sec.stanev.org account dashboard"
+          }
+        }
+      }
+    wrap_mode: none
+    timeout_sec: 5
