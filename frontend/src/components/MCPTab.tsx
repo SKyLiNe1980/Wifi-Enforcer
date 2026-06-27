@@ -397,8 +397,13 @@ export default function MCPTab() {
               <Text style={[s.statusText, { color: statusInfo.color }]}>{statusInfo.label}</Text>
             </View>
             <Text style={s.helper}>
-              Transport: <Text style={{ color: C.cyan }}>HTTP + SSE</Text>{" "}
-              · Endpoint: <Text style={{ color: C.cyan }}>http://{config.bind_host}:{config.port}/mcp</Text>
+              {"Transport: "}<Text style={{ color: C.cyan }}>HTTP + SSE</Text>
+            </Text>
+            <Text style={[s.helperFine, { marginTop: 4 }]}>
+              {"client endpoint (Postman/Hermes use this):"}
+            </Text>
+            <Text style={[s.helperFine, { marginTop: 2 }]}>
+              <Text style={{ color: C.cyan }}>http://{config.bind_host}:{config.port}/mcp</Text>
             </Text>
             <View style={[s.row, { marginTop: 10 }]}>
               <Text style={s.kvLabel}>enable server</Text>
@@ -435,7 +440,20 @@ export default function MCPTab() {
               style={s.input}
               value={probeInput}
               onChangeText={setProbeInput}
-              onBlur={() => probeInput !== config.cockpit_probe_host && patchConfig({ cockpit_probe_host: probeInput.trim() || "127.0.0.1" })}
+              onBlur={() => {
+                // Strip anything that isn't a bare host. We construct
+                // `http://{host}:{port}/...` ourselves, so a paste of
+                // `http://s10-nethunter:8765/mcp` should yield just
+                // `s10-nethunter`. This prevents the "/mcp got lost between
+                // host and port" confusion.
+                let v = (probeInput || "").trim();
+                v = v.replace(/^https?:\/\//i, "");
+                v = v.split("/")[0];   // drop path
+                v = v.split(":")[0];   // drop port
+                v = v || "127.0.0.1";
+                if (v !== probeInput) setProbeInput(v);
+                if (v !== config.cockpit_probe_host) patchConfig({ cockpit_probe_host: v });
+              }}
               placeholder="127.0.0.1 (default — works for bind 0.0.0.0 or loopback)"
               placeholderTextColor={C.textDim}
               autoCapitalize="none"
@@ -443,8 +461,9 @@ export default function MCPTab() {
               keyboardType="numbers-and-punctuation"
             />
             <Text style={[s.helperFine, { marginTop: 4 }]}>
-              where THIS cockpit connects to probe /health + /audit. set to your tailnet
-              hostname (e.g. s10-nethunter) if the server binds only to that iface.
+              where THIS cockpit connects to probe /health + /audit. host only — no scheme,
+              no port, no path. set to the tailnet IP (e.g. 100.x.y.z) if MagicDNS
+              hostnames don&apos;t resolve on Android.
             </Text>
 
             <Text style={[s.kvLabel, { marginTop: 14 }]}>port</Text>
@@ -472,8 +491,11 @@ export default function MCPTab() {
             <>
               <Text style={[s.sectionTitle, { marginTop: 20 }]}>{"// connectivity"}</Text>
               <View style={s.card}>
-                <Text style={s.helper}>
-                  endpoint: <Text style={{ color: C.cyan }}>
+                <Text style={[s.helperFine]}>
+                  {"this cockpit's probe target:"}
+                </Text>
+                <Text style={[s.helperFine, { marginTop: 2 }]}>
+                  <Text style={{ color: C.cyan }}>
                     http://{(config.cockpit_probe_host || "127.0.0.1")}:{config.port}
                   </Text>
                 </Text>
