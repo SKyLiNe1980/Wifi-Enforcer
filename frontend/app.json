@@ -19,6 +19,7 @@
         "backgroundColor": "#04070a"
       },
       "edgeToEdgeEnabled": true,
+      "usesCleartextTraffic": true,
       "permissions": [
         "android.permission.INTERNET",
         "android.permission.ACCESS_WIFI_STATE",
