@@ -45,8 +45,7 @@
       "./plugins/withRootShell",
       "./plugins/withCleartextTraffic",
       "expo-web-browser",
-      "expo-font",
-      "expo-secure-store"
+      "expo-font"
     ],
     "experiments": {
       "typedRoutes": true
