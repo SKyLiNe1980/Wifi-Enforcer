@@ -19,6 +19,12 @@ sudo chown $(whoami) /opt/enforcer-mcp /etc/enforcer-mcp
 # Copy code into place — adjust path to wherever you scp'd the dir
 cp -r ./enforcer-mcp/* /opt/enforcer-mcp/
 
+# Install the wpa-sec helper scripts into $PATH so the tools can shell them
+# out. They live in `scripts/` in this repo; the YAML tool templates call
+# them by bare name (`wpasec-upload`, `capcheck`).
+sudo install -m 0755 /opt/enforcer-mcp/scripts/wpasec-upload /usr/bin/wpasec-upload
+sudo install -m 0755 /opt/enforcer-mcp/scripts/capcheck      /usr/bin/capcheck
+
 # Build a virtualenv (no system-package pollution)
 cd /opt/enforcer-mcp
 python3 -m venv .venv
@@ -111,6 +117,13 @@ curl -i $BASE/health                          # → 200 (always public)
   handlers/
     __init__.py
     internal.py         ← __internal:* tool handlers
+    sessions.py         ← PTY-backed SessionManager (Phase 1C)
+  scripts/
+    wpasec-upload       ← wpa-sec.stanev.org community PMKID uploader
+    capcheck            ← capture-file sanity / triage helper
+  tests/
+    test_sessions.py    ← unit tests for SessionManager (5 cases)
+    test_mcp_e2e.py     ← end-to-end MCP transport roundtrip
   requirements.txt
   README.md
   config.yaml.example   ← copy to /etc/enforcer-mcp/config.yaml
@@ -118,26 +131,106 @@ curl -i $BASE/health                          # → 200 (always public)
   .venv/                ← virtualenv (gitignored)
 ```
 
+## Phase 1C session smoke test
+
+After the server is running, validate the PTY tools without leaving curl:
+
+```bash
+TOKEN="<your-bearer>"
+BASE="http://127.0.0.1:8765"
+
+# Use the fastmcp Python client (it does the JSON-RPC + SSE plumbing).
+python3 - <<'PY'
+import asyncio, json, os
+from fastmcp import Client
+
+async def main():
+    async with Client("http://127.0.0.1:8765/mcp", auth=os.environ["TOKEN"]) as c:
+        # start an interactive cat session
+        r = await c.call_tool("start_session",
+            {"args": {"command": "cat", "label": "demo"}})
+        sid = json.loads(json.loads(r.content[0].text)["output"])["session_id"]
+        print("session:", sid)
+
+        # write a line
+        await c.call_tool("write_stdin",
+            {"args": {"session_id": sid, "data": "hello pty"}})
+        await asyncio.sleep(0.2)
+
+        # read echoed bytes
+        r = await c.call_tool("read_session",
+            {"args": {"session_id": sid, "tail_bytes": 4096}})
+        out = json.loads(json.loads(r.content[0].text)["output"])
+        print("read:", repr(out["bytes"]))
+
+        # resize TUI window (sends SIGWINCH to child)
+        await c.call_tool("resize_session",
+            {"args": {"session_id": sid, "cols": 200, "rows": 60}})
+
+        # list everything
+        r = await c.call_tool("list_sessions", {"args": {}})
+        print("sessions:", json.loads(json.loads(r.content[0].text)["output"]))
+
+        # stop
+        await c.call_tool("stop_session",
+            {"args": {"session_id": sid, "signal": "SIGTERM"}})
+
+asyncio.run(main())
+PY
+```
+
+You should see `'hello pty\r\nhello pty\r\n'` — the doubled line is the
+PTY echoing back what we wrote AND `cat` echoing its stdin. That's the
+canonical "real TTY" signal: pipes don't double like that.
+
+For real interactive tooling on Android, try:
+
+```python
+await c.call_tool("start_session",
+    {"args": {"command": "wifite --pmkid -i wlan2", "label": "wifite"}})
+```
+
+then poll `read_session` every second or two and `write_stdin` answers
+to its prompts. SIGWINCH via `resize_session` is what keeps the ncurses
+table rendering cleanly.
+
 ## What's in / not in this phase
 
-✅ **Phase 1B (this build):**
+✅ **Phase 1B (foundation, shipped):**
 - Streamable-HTTP MCP transport at `/mcp`
 - Bearer-token auth middleware
-- 11 tools dynamically registered from YAML
-- 4 external tools (`exec_command`, `list_ifaces`, `set_monitor_mode`, `set_channel`) — fully working subprocess.run with timeout + audit
-- 7 internal handler stubs — return structured "not_implemented" for now, except `read_command_logs` which works
+- Dynamic YAML tool registration
+- 4 external tools (`exec_command`, `list_ifaces`, `set_monitor_mode`, `set_channel`)
+- `read_command_logs` internal handler
 - `/health`, `/tools`, `/audit/since` aux endpoints
-- Bounded SQLite audit log (default cap 2000 entries)
+- Bounded SQLite audit log (default cap 2000)
 - JSON structured logging
 - Graceful SIGTERM/SIGINT shutdown
+- 3 wpa-sec tools (`wpasec_preview`, `wpasec_upload`, `wpasec_save_key`)
 
-🟡 **Phase 1C (next round):**
-- Wire `start_session` / `write_stdin` / `read_session` / `stop_session`
-  to real `asyncio.subprocess` PTYs with ring buffers
-- Wire `list_attack_profiles` / `run_attack_profile` to either:
-  - Shared SQLite read of the cockpit's `attack_profiles` table, OR
-  - HTTP callback to a cockpit-exposed `/cockpit/*` endpoint
-- Cockpit auto-pushes config.yaml updates when tools registry changes
+✅ **Phase 1C (this build — sessions are LIVE):**
+- Real PTY-backed `SessionManager` (`handlers/sessions.py`)
+  - `pty.openpty()` + `TIOCSCTTY` for proper controlling terminal
+  - `loop.add_reader` drains master fd → bounded ring buffer (no polling)
+  - Per-session `asyncio.Lock` keeps concurrent writes from interleaving
+  - `os.setsid()` + `killpg` so the whole child group dies on stop
+  - Auto-purge of oldest exited sessions when registry hits `max_sessions`
+- 6 working session tools: `start_session`, `write_stdin`, `read_session`,
+  `stop_session`, **`list_sessions` (new)**, **`resize_session` (new)**
+- 16 total tools registered (4 ext + 6 sessions + 3 wpa-sec + 3 internal)
+- Session shutdown wired into FastAPI lifespan so `SIGTERM` cleans up
+  every live PTY before the audit DB closes
+- New `sessions:` config block: `ring_cap_bytes` (default 64 KiB),
+  `max_sessions` (default 16)
+- 5-test unit suite (`tests/test_sessions.py`) + MCP-transport round
+  trip (`tests/test_mcp_e2e.py`)
+
+🟡 **Phase 1D (next round):**
+- `list_attack_profiles` / `run_attack_profile` wired to cockpit
+  SQLite `attack_profiles` table (shared-file or HTTP callback)
+- Streaming `read_session` cursor (since byte N) so Hermes can tail
+  rather than poll
+- Cockpit auto-pushes config.yaml updates when its tools registry changes
 
 🔵 **Phase 2:**
 - Bind 0.0.0.0 over Tailscale

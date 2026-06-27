@@ -20,6 +20,13 @@ server:
   # called from React Native Web. Leave empty for loopback-only deploys.
   allowed_origins: []
 
+# ─── Session manager (Phase 1C) ──────────────────────────────────────
+# Per-session PTY ring buffer + concurrent session caps. Defaults give
+# ~1 MiB worst-case memory (16 × 64 KiB) which is fine even on a phone.
+sessions:
+  ring_cap_bytes: 65536   # 64 KiB scrollback per session
+  max_sessions: 16        # registry-wide cap; oldest exited GC'd first
+
 tools:
   # ─── External tools (subprocess.run) ─────────────────────────────────
   - name: exec_command
@@ -113,22 +120,24 @@ tools:
     timeout_sec: 600
 
   - name: start_session
-    description: "Start a long-lived PTY session (stub in 1B)."
+    description: "Start a long-lived PTY-backed session (interactive curses tools, REPLs, msfconsole). Returns a session_id you pass to read/write/stop."
     command_template: "__internal:start_session"
     arg_schema_json: |
       {
         "type": "object",
         "required": ["command"],
         "properties": {
-          "command": {"type": "string"},
-          "label": {"type": "string"}
+          "command": {"type": "string", "description": "Shell command to run inside the PTY (bash -c)"},
+          "label": {"type": "string", "description": "Optional human-readable label for list_sessions"},
+          "cols": {"type": "integer", "minimum": 20, "maximum": 500, "default": 120},
+          "rows": {"type": "integer", "minimum": 5, "maximum": 200, "default": 32}
         }
       }
     wrap_mode: none
     timeout_sec: 10
 
   - name: write_stdin
-    description: "Send bytes to a running session's stdin (stub in 1B)."
+    description: "Send bytes (e.g. a command line or single keypress) to a running session's stdin. Appends a newline by default."
     command_template: "__internal:write_stdin"
     arg_schema_json: |
       {
@@ -137,14 +146,14 @@ tools:
         "properties": {
           "session_id": {"type": "string"},
           "data": {"type": "string"},
-          "newline": {"type": "boolean", "default": true}
+          "newline": {"type": "boolean", "default": true, "description": "Append \\n if data does not already end with one"}
         }
       }
     wrap_mode: none
     timeout_sec: 5
 
   - name: read_session
-    description: "Read recent output from a session ring buffer (stub in 1B)."
+    description: "Read the tail of a session's output ring buffer (UTF-8 decoded, replacement-char on invalid bytes). Returns running state + exit_code when applicable."
     command_template: "__internal:read_session"
     arg_schema_json: |
       {
@@ -152,21 +161,51 @@ tools:
         "required": ["session_id"],
         "properties": {
           "session_id": {"type": "string"},
-          "tail_bytes": {"type": "integer", "default": 4096, "maximum": 65536}
+          "tail_bytes": {"type": "integer", "default": 4096, "minimum": 0, "maximum": 65536},
+          "clear": {"type": "boolean", "default": false, "description": "Empty the ring buffer after reading"}
         }
       }
     wrap_mode: none
     timeout_sec: 5
 
   - name: stop_session
-    description: "Kill a running session by id (stub in 1B)."
+    description: "Terminate a session and its child process group (killpg). Defaults to SIGTERM with a 2 s grace then SIGKILL."
     command_template: "__internal:stop_session"
     arg_schema_json: |
       {
         "type": "object",
         "required": ["session_id"],
         "properties": {
-          "session_id": {"type": "string"}
+          "session_id": {"type": "string"},
+          "signal": {
+            "type": "string",
+            "enum": ["SIGTERM", "SIGINT", "SIGHUP", "SIGKILL", "SIGQUIT"],
+            "default": "SIGTERM"
+          }
+        }
+      }
+    wrap_mode: none
+    timeout_sec: 10
+
+  - name: list_sessions
+    description: "List every PTY session known to this node (running + recently exited). Includes pid, label, command, buffer size, total bytes."
+    command_template: "__internal:list_sessions"
+    arg_schema_json: |
+      {"type": "object", "properties": {}}
+    wrap_mode: none
+    timeout_sec: 5
+
+  - name: resize_session
+    description: "Resize a session's PTY window (TIOCSWINSZ). Sends SIGWINCH to the child so curses TUIs (wifite, htop, vim) repaint cleanly."
+    command_template: "__internal:resize_session"
+    arg_schema_json: |
+      {
+        "type": "object",
+        "required": ["session_id", "cols", "rows"],
+        "properties": {
+          "session_id": {"type": "string"},
+          "cols": {"type": "integer", "minimum": 20, "maximum": 500},
+          "rows": {"type": "integer", "minimum": 5, "maximum": 200}
         }
       }
     wrap_mode: none
