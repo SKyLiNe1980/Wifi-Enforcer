@@ -973,3 +973,58 @@ agent_communication:
             chroot server on app start (frontend change, needs EAS).
           - Phase 1D: Hermes <-> local MCP loop / streaming read cursor.
 
+
+    - agent: "main"
+      message: |
+        Phase 1B.2b — Cockpit autospawn + tool registry sync: WIRED.
+        (Frontend-only — will land on next EAS build.)
+
+        Files changed:
+          - MOD  frontend/src/lib/localDb.ts
+              • Migration v7: ADD COLUMNs autospawn_enabled, autospawn_cmd
+                on mcp_config; source, last_synced_at on mcp_tools.
+              • New: mcpLocal.syncToolsFromServer(serverTools[]) — idempotent
+                upsert keyed by name. Preserves user's `enabled` flag across
+                resyncs. Marks server-sourced rows built_in=1, source='server'.
+                Returns {inserted, updated, total} for UI feedback.
+              • Extended MCPConfig type + updateConfig() to persist
+                autospawn fields.
+          - MOD  frontend/src/components/MCPTab.tsx (+~290 LOC)
+              • Auto tool-sync after first /health success per "running" streak
+                (resets on disconnect so server bounce re-syncs).
+              • Manual [ RESYNC ] button in // tools tab header.
+              • SERVER badge (cyan) on tool rows sourced from /tools.
+              • // autospawn card under // connectivity:
+                  - on/off switch (off by default)
+                  - editable spawn command (default: nethunter -c "...")
+                  - live status pill (idle / spawning / running / failed / exited)
+                  - inline pid + tailable log (last 4 KB of stdout)
+                  - STOP button kills the spawned session via killStream
+              • Autospawn trigger: on /health unreachable, native streaming
+                only, 30s hard cooldown, refuses double-spawn while a session
+                is already alive. Cleanup on tab unmount does NOT kill the
+                server process — only detaches listeners.
+              • Roadmap pane updated: 1B.2b ✓, 1C ✓.
+
+        VERIFICATION:
+          ✓ TypeScript `tsc --noEmit --skipLibCheck` clean
+          ✓ ESLint clean (MCPTab.tsx + localDb.ts)
+          ✓ Web bundle pre-existing wa-sqlite.wasm failure unrelated
+            (app is local-first SQLite, runs only on real device via EAS)
+
+        USER ACTION required to land this:
+          1. Trigger an EAS build via Publish button (top right).
+          2. After install: open // mcp tab, observe // tools (16) — matches
+             server count, no more :11 mismatch.
+          3. (Optional) Turn on // autospawn after manually verifying the
+             default chroot command works in a terminal once. From then on,
+             cockpit will respawn server on /health failure.
+
+        BACKLOG STILL PARKED:
+          - 1D Hermes ↔ local MCP loop
+          - 1D streaming read_session cursor (since-byte-N)
+          - EUEF MCP wrapper
+          - airodump-ng live table parser
+          - enforcer-node .deb packaging for arm64
+          - Voice / Whisper stack
+
