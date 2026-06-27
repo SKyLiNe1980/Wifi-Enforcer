@@ -22,7 +22,7 @@ import { MaterialCommunityIcons } from "@expo/vector-icons";
 import * as Clipboard from "expo-clipboard";
 import * as Crypto from "expo-crypto";
 import {
-  mcpLocal,
+  mcpLocal, settingsLocal,
   type MCPConfig, type MCPTool, type MCPAuditEntry,
 } from "../lib/localDb";
 import { startStream, killStream, hasNativeStreaming, execReal, HAS_NATIVE_ROOT } from "../lib/rootShell";
@@ -103,6 +103,23 @@ export default function MCPTab() {
   >("idle");
   const [toolSyncMsg, setToolSyncMsg] = useState<string>("");
   const lastToolSyncRef = useRef<number>(0);
+
+  // ─── Chroot wrapping helper ─────────────────────────────────────────
+  // The cockpit app runs in an isolated mount namespace (LineageOS
+  // data_mirror sandbox) and CAN'T see the chroot mounts that bootkali
+  // sets up at boot. To enter Kali we go through the *exact* path the
+  // rest of the cockpit already uses: settings.chroot_path, which is
+  // the `busybox_nh chroot /data/local/nhsystem/kalifs /usr/bin/sudo -E`
+  // incantation set up at install time. We wrap with `bash -c '...'`
+  // so the inner command can contain pipes / && / redirects without
+  // escaping hell. Single-quotes inside get encoded as '\''.
+  const wrapChrootCmd = useCallback(async (innerCmd: string): Promise<string> => {
+    const s = await settingsLocal.get();
+    const chrootPath = (s.chroot_path || "").trim();
+    if (!chrootPath) return innerCmd;
+    const escaped = innerCmd.replace(/'/g, "'\\''");
+    return `${chrootPath} bash -c '${escaped}'`;
+  }, []);
   // Have we run the auto-sync for THIS session of /health success?
   // Reset to false whenever serverHealth leaves "running" so we re-sync
   // after a server bounce.
@@ -312,7 +329,13 @@ export default function MCPTab() {
       setAutospawnLog("→ launching: " + config.autospawn_cmd);
       setAutospawnPid(null);
 
-      const unsub = startStream(sid, config.autospawn_cmd, {
+      // Wrap with chroot_path so the python server actually launches
+      // *inside* Kali (not in the cockpit's isolated namespace).
+      // startStream is fire-and-forget so we await wrapChrootCmd in an
+      // async IIFE rather than awaiting maybeAutospawn itself.
+      (async () => {
+        const wrapped = await wrapChrootCmd(config.autospawn_cmd);
+        const unsub = startStream(sid, wrapped, {
         onPid: (e) => {
           setAutospawnPid(e.pid);
           setAutospawnLog((prev) => prev + `\n[pid ${e.pid}]`);
@@ -347,6 +370,7 @@ export default function MCPTab() {
       });
       autospawnSessionRef.current = sid;
       autospawnUnsubRef.current = unsub;
+      })();   // close async IIFE
     };
 
     // Reset autospawn status when autospawn toggled off. Use functional
@@ -542,7 +566,10 @@ export default function MCPTab() {
     setChrootSyncStatus("running");
     setChrootSyncMsg("reading chroot yaml…");
     try {
-      const res = await execReal(cmd);
+      // Wrap the inner cmd with settings.chroot_path so we actually
+      // cross the data_mirror boundary into Kali.
+      const wrapped = await wrapChrootCmd(cmd);
+      const res = await execReal(wrapped);
       // execReal returns { output, exit_code, ... }. exit_code != 0 usually
       // means: chroot not mounted, file missing, or permission denied.
       if (res.exit_code !== 0 && !res.output) {
@@ -583,7 +610,7 @@ export default function MCPTab() {
       }
       return null;
     }
-  }, [config, refresh]);
+  }, [config, refresh, wrapChrootCmd]);
 
   // ─── First-mount chroot auto-import ─────────────────────────────────
   // If the bearer token is empty AND chroot_autosync_enabled is on AND
