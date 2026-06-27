@@ -917,3 +917,59 @@ agent_communication:
           - Cross-tab UX (Quick command output invisible in shell mode)
           - Wifite PTY wrapping (ioctl errors)
           - Mode rename (mock→preview, real→Android, kali→Kali)
+
+agent_communication:
+    - agent: "main"
+      message: |
+        Phase 1C — Real PTY-backed MCP sessions: SHIPPED.
+
+        Files changed:
+          - NEW  enforcer-mcp/handlers/sessions.py   (~340 LOC SessionManager)
+          - MOD  enforcer-mcp/handlers/internal.py   (delegates to SessionMgr)
+          - MOD  enforcer-mcp/handlers/__init__.py   (exports init/get fns)
+          - MOD  enforcer-mcp/server.py              (lifespan init + shutdown_all)
+          - MOD  enforcer-mcp/config.yaml.example    (sessions: block + 2 new tools)
+          - MOD  enforcer-mcp/README.md              (Phase 1C status + smoke test)
+          - NEW  enforcer-mcp/scripts/wpasec-upload  (user-supplied, install -> /usr/bin)
+          - NEW  enforcer-mcp/scripts/capcheck       (user-supplied, install -> /usr/bin)
+          - NEW  enforcer-mcp/tests/test_sessions.py (5 unit tests for SessionManager)
+          - NEW  enforcer-mcp/tests/test_mcp_e2e.py  (Streamable HTTP roundtrip)
+
+        Architecture:
+          - pty.openpty() + TIOCSCTTY = real controlling tty
+          - loop.add_reader drains master fd into bounded bytearray (default
+            64 KiB cap, configurable via sessions.ring_cap_bytes)
+          - per-session asyncio.Lock serializes os.write
+          - os.setsid + killpg so SIGTERM nukes the whole subtree
+          - shutdown_all() wired into FastAPI lifespan
+          - Auto-GC of oldest exited sessions when registry hits max_sessions
+
+        New MCP tools (now 16 total, all registering):
+          - list_sessions    → enumerate every session (incl. exited)
+          - resize_session   → TIOCSWINSZ + SIGWINCH for ncurses repaints
+
+        Verification (locally, against running server):
+          ✓ 5/5 unit tests pass (test_sessions.py)
+          ✓ MCP e2e roundtrip pass (test_mcp_e2e.py)
+            - 16 tools listed via tools/list
+            - start → write → read → list → resize → stop on real `cat` PTY
+            - PTY echo doubled as expected (proves real tty, not pipe)
+            - 6 audit-log rows written with timings
+          ✓ Ring buffer overflow test: 5 MB of `yes` flooded but capped at 2048 B
+          ✓ Server SIGTERM drains live PTYs before DB close
+
+        USER ACTION REQUIRED inside chroot to land Phase 1C:
+          1. `cd /opt/enforcer-mcp && git pull` (or scp the new tree)
+          2. Restart the server: `python3 server.py --config /etc/enforcer-mcp/config.yaml`
+          3. The `sessions:` block in config.yaml.example is optional —
+             without it, defaults (64 KiB × 16 sessions) apply.
+
+        NO EAS BUILD REQUIRED for Phase 1C. The next visible cockpit change
+        (Phase 1B.2b autospawn + IMPORT button restoration) will be batched
+        into the same EAS build to conserve credits.
+
+        NEXT:
+          - Phase 1B.2b: cockpit calls RootShell.execStream to spawn the
+            chroot server on app start (frontend change, needs EAS).
+          - Phase 1D: Hermes <-> local MCP loop / streaming read cursor.
+

@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""
+capcheck — Pre-flight capture quality inspector for wpasec-upload
+
+Scans captures and reports: ESSID, BSSID, handshake count, PMKID presence.
+Filters out garbage before uploading to wpa-sec.
+"""
+
+import subprocess, sys, re, json, argparse
+from pathlib import Path
+
+CAP_EXTS = {'.cap', '.pcap', '.pcapng', '.22000'}
+AIRCRACK_RE = re.compile(
+    r'^\s*(\d+)\s+([0-9A-Fa-f:]{17})\s+([-\w]+)?\s+.*?(?:WPA|WPA2|WPA3|WEP|OPN).*?\s+(\S+)$',
+    re.MULTILINE
+)
+
+def inspect_cap(filepath):
+    """Run aircrack-ng on a capture, return parsed results"""
+    p = Path(filepath)
+    if p.suffix == '.22000':
+        return inspect_22000(filepath)
+    
+    result = subprocess.run(
+        ['aircrack-ng', filepath], 
+        capture_output=True, text=True, timeout=30
+    )
+    output = result.stdout + result.stderr
+    
+    nets = []
+    for m in AIRCRACK_RE.finditer(output):
+        nets.append({
+            'bssid': m.group(2).upper(),
+            'essid': m.group(3) or '(hidden)',
+            'handshake': bool(re.search(rf'{m.group(2).upper()}.*(?:handshake|WPA.*handshake)', output)),
+        })
+    
+    return {
+        'file': filepath,
+        'type': p.suffix,
+        'size': p.stat().st_size,
+        'networks': nets,
+        'raw_match': bool(nets)
+    }
+
+def inspect_22000(filepath):
+    """Inspect .22000 hash file"""
+    p = Path(filepath)
+    nets = []
+    try:
+        text = p.read_text(errors='ignore')
+        for line in text.splitlines():
+            if line.startswith('WPA*01*') or line.startswith('WPA*02*'):
+                parts = line.split('*')
+                if len(parts) >= 6:
+                    essid_hex = parts[5] if len(parts) > 5 else ''
+                    try:
+                        essid = bytes.fromhex(essid_hex).decode('utf-8', errors='replace')
+                    except:
+                        essid = essid_hex
+                    pmkid = line.startswith('WPA*01*')
+                    nets.append({
+                        'essid': essid,
+                        'pmkid': pmkid,
+                        'eapol': not pmkid,
+                        'bssid': parts[2].upper() if len(parts) > 2 else '?',
+                    })
+    except:
+        pass
+    
+    return {
+        'file': filepath,
+        'type': '.22000',
+        'size': p.stat().st_size,
+        'networks': nets,
+        'raw_match': len(nets) > 0
+    }
+
+def scan_dir(directory):
+    """Recursively find capture files"""
+    return sorted(
+        p for p in Path(directory).rglob('*')
+        if p.suffix.lower() in CAP_EXTS
+    )
+
+def main():
+    ap = argparse.ArgumentParser(description='Pre-flight capture quality checker')
+    ap.add_argument('path', nargs='?', default='.', help='Capture file or directory')
+    ap.add_argument('--json', action='store_true', help='JSON output')
+    ap.add_argument('--min-handshakes', type=int, default=0, 
+                   help='Only show captures with handshakes')
+    ap.add_argument('--valid-only', action='store_true',
+                   help='Only show captures with valid handshakes/PMKIDs')
+    args = ap.parse_args()
+    
+    path = Path(args.path)
+    files = scan_dir(path) if path.is_dir() else [path]
+    files = [f for f in files if f.suffix.lower() in CAP_EXTS]
+    
+    if not files:
+        print("No capture files found")
+        return 1
+    
+    results = []
+    good, bad = 0, 0
+    
+    for f in files:
+        info = inspect_cap(str(f))
+        results.append(info)
+        has_data = any(n.get('handshake') or n.get('pmkid') for n in info['networks'])
+        
+        if has_data:
+            good += 1
+        else:
+            bad += 1
+        
+        if args.valid_only and not has_data:
+            continue
+        
+        if not args.json:
+            status = "GOOD" if has_data else "EMPTY"
+            size = info['size']
+            if size > 1_000_000:
+                size_str = f"{size/1_000_000:.1f}M"
+            elif size > 1_000:
+                size_str = f"{size/1_000:.0f}K"
+            else:
+                size_str = f"{size}B"
+            
+            print(f"\n{'='*60}")
+            print(f"  [{status}] {f.name} ({size_str})")
+            
+            for n in info['networks']:
+                flags = []
+                if n.get('handshake'): flags.append('HS')
+                if n.get('pmkid'): flags.append('PMKID')
+                if n.get('eapol'): flags.append('EAPOL')
+                flag_str = ','.join(flags) if flags else 'no data'
+                print(f"    {n['essid']:20s} {n['bssid']:17s} [{flag_str}]")
+    
+    if args.json:
+        print(json.dumps(results, indent=2))
+    else:
+        print(f"\n{'='*60}")
+        print(f"  {good} good, {bad} empty  |  {len(files)} total")
+    
+    return 0 if good > 0 else 1
+
+if __name__ == '__main__':
+    sys.exit(main())

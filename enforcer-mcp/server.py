@@ -45,7 +45,7 @@ from starlette.responses import JSONResponse
 # we want the standalone successor that the ecosystem actively maintains.
 from fastmcp import FastMCP
 
-from handlers import INTERNAL_HANDLERS
+from handlers import INTERNAL_HANDLERS, init_session_manager, get_session_manager
 
 
 # ─── Structured logging ────────────────────────────────────────────────────
@@ -298,6 +298,17 @@ def register_tools(
         def _make_handler(_spec: ToolSpec, _v: Draft202012Validator):
             async def _tool_impl(args: Dict[str, Any]) -> Dict[str, Any]:
                 t0 = datetime.now(timezone.utc)
+                # Smooth two calling conventions:
+                #   • {"args": {"file": "..."}}   (matches our wrapper schema)
+                #   • {"file": "..."}             (direct — what most clients try first)
+                # FastMCP introspects our handler signature as accepting a single
+                # `args: dict` param, so the auto-generated schema technically wants
+                # the wrapper form. But Postman / Hermes / curl users instinctively
+                # send the inner shape. Unwrap if we see the wrapper, otherwise treat
+                # args as the inner dict directly.
+                if isinstance(args, dict) and "args" in args and len(args) == 1 \
+                        and isinstance(args["args"], dict):
+                    args = args["args"]
                 # Validate args against the YAML-defined schema
                 errors = sorted(_v.iter_errors(args), key=lambda e: list(e.path))
                 if errors:
@@ -365,18 +376,42 @@ def build_app(cfg: Dict[str, Any], conn: sqlite3.Connection) -> FastAPI:
             "Upgrade with: pip install -U 'fastmcp>=3.4'"
         )
 
+    # Initialise the PTY-backed session manager (Phase 1C). We do this here
+    # — inside the lifespan startup phase — so the asyncio event loop exists
+    # before any session's loop.add_reader is wired up. Default cap is 16
+    # sessions × 64 KiB ring each (~1 MiB worst case). Knobs live under
+    # `sessions:` in config.yaml.
+    sessions_cfg = cfg.get("sessions", {}) or {}
+    session_ring_cap = int(sessions_cfg.get("ring_cap_bytes", 64 * 1024))
+    session_max = int(sessions_cfg.get("max_sessions", 16))
+
     # FastAPI hosts both the MCP endpoint AND our auxiliary HTTP routes.
     # The MCP ASGI app supplies a lifespan we must wire into FastAPI so
     # the MCP server's background tasks start/stop cleanly.
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        # Sessions singleton must be initialised inside the running loop
+        # so loop.add_reader / asyncio.Lock pick up the right one.
+        init_session_manager(
+            ring_cap=session_ring_cap,
+            max_sessions=session_max,
+            logger=log,
+        )
         async with mcp_asgi.lifespan(app):
             log("info", "server.startup", tools=len(specs),
-                bind=server_cfg.get("host"), port=server_cfg.get("port"))
+                bind=server_cfg.get("host"), port=server_cfg.get("port"),
+                session_ring_cap=session_ring_cap,
+                session_max=session_max)
             try:
                 yield
             finally:
                 log("info", "server.shutdown")
+                # Tear down any live PTY sessions before closing the DB so
+                # their final-drain reads can still hit a valid event loop.
+                try:
+                    await get_session_manager().shutdown_all()
+                except Exception as e:
+                    log("warn", "sessions.shutdown.error", err=str(e))
                 conn.close()
 
     app = FastAPI(

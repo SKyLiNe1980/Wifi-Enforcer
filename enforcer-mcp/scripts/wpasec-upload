@@ -1,0 +1,333 @@
+#!/usr/bin/env python3
+"""
+wpasec-upload — upload pcap/pmkid/.22000 captures to wpa-sec.stanev.org
+
+Two-step flow (matching the actual website):
+  1. POST key=<32-char-hex> as form-urlencoded → server sets session cookie
+  2. POST webfile=<file> as multipart/form-data with session cookie
+
+Accepts: .cap, .pcap, .pcapng, .pcapng.gz, .22000 (auto-converted via hcxpcapngtool)
+
+Key sources (checked in order, only when actually uploading):
+  -k flag, WPASEC_KEY env, ~/.wpasec (first line)
+
+Usage:
+  wpasec-upload capture.pcapng
+  wpasec-upload -k a1b2c3... *.pcapng *.22000
+  wpasec-upload --dry-run *.cap            # no key needed for preview
+  wpasec-upload -s -k a1b2c3...            # save key to ~/.wpasec
+  wpasec-upload -R capture.pcapng          # remove file after successful upload
+"""
+
+import argparse
+import os
+import re
+import sys
+import tempfile
+import time
+from pathlib import Path
+from subprocess import run
+from urllib.request import (
+    Request,
+    build_opener,
+    HTTPCookieProcessor,
+    HTTPRedirectHandler,
+)
+from urllib.parse import urlencode
+from http.cookiejar import CookieJar
+
+WPASEC_URL = "https://wpa-sec.stanev.org"
+WPASEC_SUBMIT = f"{WPASEC_URL}/?submit"
+KEY_FILE = Path.home() / ".wpasec"
+
+
+def read_key(filepath=KEY_FILE):
+    """Read 32-char hex key from file (first line)."""
+    try:
+        line = filepath.read_text().strip().splitlines()[0].strip()
+        if re.fullmatch(r"[0-9a-fA-F]{32}", line):
+            return line.lower()
+    except (FileNotFoundError, IndexError):
+        pass
+    return None
+
+
+def resolve_key(args):
+    """Resolve key from -k, env, or keyfile. Exits if none found."""
+    key = args.key or os.environ.get("WPASEC_KEY") or read_key()
+    if not key:
+        print("No wpa-sec key. Use -k, WPASEC_KEY, or save to ~/.wpasec")
+        sys.exit(1)
+    if not re.fullmatch(r"[0-9a-fA-F]{32}", key):
+        print(f"Invalid key format (need 32 hex chars): {key}")
+        sys.exit(1)
+    return key.lower()
+
+
+class StopRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+    def http_error_302(self, req, fp, code, msg, headers):
+        return fp  # accept 302 as valid
+
+
+def make_opener():
+    cj = CookieJar()
+    return build_opener(HTTPCookieProcessor(cj), StopRedirect()), cj
+
+
+def establish_session(key):
+    """POST key as form-urlencoded. Returns (opener, cookiejar) or (None, None)."""
+    opener, cj = make_opener()
+    data = urlencode({"key": key}).encode("ascii")
+    req = Request(WPASEC_SUBMIT, data=data, method="POST")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    try:
+        resp = opener.open(req, timeout=30)
+        if resp.status not in (200, 302):
+            print(f"  Key POST returned HTTP {resp.status}")
+            return None, None
+    except Exception as e:
+        print(f"  Key POST failed: {e}")
+        return None, None
+    return opener, cj
+
+
+# ── .22000 conversion ─────────────────────────────────────────────────────
+
+def is_22000(filepath):
+    """Check if file is a .22000 hashcat hash file (or has .22000 extension)."""
+    path = Path(filepath)
+    if path.suffix == ".22000":
+        return True
+    # Also sniff first line for WPA*01* or WPA*02* signature
+    try:
+        first = path.read_text(encoding="ascii", errors="ignore")[:100]
+        if first.startswith("WPA*01*") or first.startswith("WPA*02*"):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def convert_22000(filepath):
+    """Convert .22000 hash to a temporary cap file via hcxhash2cap. Returns temp file path or None."""
+    tmp = tempfile.NamedTemporaryFile(suffix=".cap", delete=False)
+    tmp.close()
+    requested = tmp.name
+    os.unlink(requested)  # hcxhash2cap writes fresh
+
+    result = run(
+        ["hcxhash2cap", "--pmkid-eapol", str(filepath), "-c", requested],
+        capture_output=True, text=True, timeout=30
+    )
+    if result.returncode != 0:
+        err = result.stderr.strip() if result.stderr else "(no output)"
+        print(f"  CONVERT FAILED: {err[:120]}")
+        return None
+
+    # hcxhash2cap may write to requested path, or append _0 / _1 for multi-hash files
+    import glob as _glob
+    candidates = sorted(_glob.glob(requested.replace(".cap", "*.cap")))
+    if not candidates:
+        print(f"  CONVERT FAILED: no output file (expected {requested} or *_*.cap)")
+        return None
+
+    # Prefer the requested path; fall back to first _0 or _1 etc.
+    actual = requested if requested in candidates else candidates[0]
+    return actual
+
+
+def resolve_upload_path(filepath):
+    """Return the actual file to upload.
+    .22000 files are uploaded directly (hcxpcapngtool 7.1 dropped reverse conversion)."""
+    return filepath, False
+
+
+# ── upload ─────────────────────────────────────────────────────────────────
+
+def upload_file(opener, filepath):
+    """POST capture as multipart field 'webfile'. Returns body text or None."""
+    path = Path(filepath)
+    if not path.is_file():
+        print(f"  SKIP: not a file: {filepath}")
+        return None
+    if path.stat().st_size == 0:
+        print(f"  SKIP: empty file: {filepath}")
+        return None
+
+    boundary = f"----wpasec{int(time.time())}"
+    file_bytes = path.read_bytes()
+    body = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="webfile"; filename="{path.name}"\r\n'
+        f"Content-Type: application/octet-stream\r\n\r\n"
+    ).encode("latin-1") + file_bytes + f"\r\n--{boundary}--\r\n".encode("latin-1")
+
+    req = Request(WPASEC_SUBMIT, data=body, method="POST")
+    req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+    try:
+        resp = opener.open(req, timeout=120)
+        return resp.read().decode("utf-8", errors="replace")
+    except Exception as e:
+        print(f"  FAILED: {e}")
+        return None
+
+
+def parse_response(body):
+    """Human-readable summary from server response."""
+    if not body:
+        return "(empty)"
+    text = re.sub(r"<[^>]+>", " ", body)
+    text = re.sub(r"\s+", " ", text).strip()
+    m = re.search(r"ESSID[^:]*:\s*(\S.*)", text)
+    if m:
+        return f"ESSID: {m.group(1).strip()}"
+    for phrase in [
+        "already submitted",
+        "successfully uploaded",
+        "not a valid capture",
+        "submitted successfully",
+    ]:
+        idx = text.lower().find(phrase)
+        if idx >= 0:
+            start = max(0, idx - 10)
+            end = min(len(text), idx + len(phrase) + 70)
+            return text[start:end].strip()
+    return text[:180]
+
+
+# ── main ───────────────────────────────────────────────────────────────────
+
+def main():
+    ap = argparse.ArgumentParser(description="Upload WPA captures to wpa-sec.stanev.org")
+    ap.add_argument("files", nargs="*", help="Capture file(s) or .22000 hash(es)")
+    ap.add_argument("-k", "--key", help="32-char wpa-sec hex key")
+    ap.add_argument("-R", "--remove", action="store_true", help="Remove file after success")
+    ap.add_argument("-n", "--dry-run", action="store_true", help="Preview only (no key needed)")
+    ap.add_argument("-s", "--save-key", action="store_true", help="Save -k value to ~/.wpasec")
+    ap.add_argument("--stdin", action="store_true", help="Read file list from stdin (one per line)")
+    ap.add_argument("--no-convert", action="store_true", help="Skip .22000 auto-conversion")
+    args = ap.parse_args()
+
+    # Collect files — expand directories and skip literal glob chars
+    files = []
+    cap_exts = {'.cap', '.pcap', '.pcapng', '.22000'}
+    
+    for entry in args.files:
+        path = Path(entry)
+        if not path.exists():
+            print(f"  SKIP: not found: {entry}")
+            continue
+        if path.is_dir():
+            found = sorted(
+                p for p in path.iterdir() 
+                if p.suffix.lower() in cap_exts or p.suffix.lower() == '.gz'
+            )
+            files.extend(str(f) for f in found)
+        else:
+            files.append(str(path))
+    
+    if args.stdin:
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            path = Path(line)
+            if path.is_dir():
+                files.extend(
+                    str(p) for p in sorted(path.iterdir())
+                    if p.suffix.lower() in cap_exts or p.suffix.lower() == '.gz'
+                )
+            elif path.exists():
+                files.append(str(path))
+            else:
+                print(f"  SKIP: not found: {line}")
+
+    # Key save — needs key but doesn't upload
+    if args.save_key:
+        key = args.key or os.environ.get("WPASEC_KEY")
+        if not key or not re.fullmatch(r"[0-9a-fA-F]{32}", key):
+            print("--save-key needs a valid key via -k or WPASEC_KEY")
+            sys.exit(1)
+        KEY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        KEY_FILE.write_text(key.lower() + "\n")
+        print(f"Key saved → {KEY_FILE}")
+        if not files:
+            return
+
+    # Dry run — no key needed, no network
+    if args.dry_run:
+        print(f"DRY RUN — {len(files)} file(s):")
+        for f in files:
+            tag = " [.22000 → cap]" if is_22000(f) and not args.no_convert else ""
+            print(f"  {f}{tag}")
+        return
+
+    # Real upload — need key
+    if not files:
+        print("No files specified. Provide capture files or use --dry-run to preview.")
+        sys.exit(1)
+
+    key = resolve_key(args)
+
+    # Step 1: establish session
+    print(f"→ {WPASEC_URL}")
+    opener, _cj = establish_session(key)
+    if opener is None:
+        print("Session failed — check your key and network.")
+        sys.exit(1)
+    print("  Session OK\n")
+
+    # Step 2: upload each file
+    ok, fail = 0, 0
+    temps = []  # track temp files for cleanup
+
+    for fp in files:
+        fname = Path(fp).name
+        converted = False
+
+        # Auto-convert .22000 via hcxhash2cap
+        if not args.no_convert and is_22000(fp):
+            converted_path = convert_22000(fp)
+            if converted_path is None:
+                fail += 1
+                continue
+            temps.append(converted_path)
+            fp = converted_path
+            converted = True
+
+        tag = " [.22000]" if converted else ""
+        print(f"  {fname}{tag} …", end=" ", flush=True)
+
+        body = upload_file(opener, fp)
+        if body is None:
+            fail += 1
+            continue
+
+        print(parse_response(body))
+
+        lower = body.lower()
+        if "not a valid capture" in lower:
+            fail += 1
+        else:
+            ok += 1
+            if args.remove and not converted:
+                try:
+                    Path(fp).unlink()
+                    print(f"    (removed)")
+                except OSError:
+                    pass
+
+    # Cleanup temp files
+    for t in temps:
+        try:
+            os.unlink(t)
+        except OSError:
+            pass
+
+    print(f"\n{ok} ok  |  {fail} failed  |  {len(files)} total")
+
+
+if __name__ == "__main__":
+    main()
