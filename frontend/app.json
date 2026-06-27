@@ -19,7 +19,6 @@
         "backgroundColor": "#04070a"
       },
       "edgeToEdgeEnabled": true,
-      "usesCleartextTraffic": true,
       "permissions": [
         "android.permission.INTERNET",
         "android.permission.ACCESS_WIFI_STATE",
@@ -44,6 +43,7 @@
         }
       ],
       "./plugins/withRootShell",
+      "./plugins/withCleartextTraffic",
       "expo-web-browser",
       "expo-font"
     ],
