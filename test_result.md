@@ -1028,3 +1028,67 @@ agent_communication:
           - enforcer-node .deb packaging for arm64
           - Voice / Whisper stack
 
+
+    - agent: "main"
+      message: |
+        Post-1B.2b polish: chroot YAML auto-import + IP-reset fix.
+
+        User report after EAS install:
+          1. Bearer token wiped (expected — EAS install limitation).
+             User's brilliant suggestion: skip clipboard, just read
+             /etc/enforcer-mcp/config.yaml via root shell directly.
+          2. bind_host + cockpit_probe_host kept reverting to 127.0.0.1
+             when interacting with other parts of the UI.
+          3. Couldn't find the RESYNC button (it IS in // tools subtab,
+             top right — likely just missed it visually).
+
+        Files changed:
+          - MOD  frontend/src/lib/localDb.ts
+              • Migration v8: + chroot_yaml_cmd, chroot_autosync_enabled
+                (default ON), last_chroot_sync_at columns on mcp_config.
+              • New: mcpLocal.applyChrootYaml(text) — regex-parses
+                bearer_token_hex / port / host out of the chroot's
+                config.yaml, validates each field (hex-only token,
+                port 1-65535, no path chars in host), upserts via
+                updateConfig. Strips ANSI escapes for less/bat output.
+              • Tested parser against 6 input cases standalone (quoted,
+                indented, ANSI, garbage, comments) — all pass.
+
+          - MOD  frontend/src/components/MCPTab.tsx
+              • New handleChrootSync() — execReal(chroot_yaml_cmd) →
+                applyChrootYaml() → refresh(). Reports imported fields
+                in a structured Alert.
+              • Auto-fires on first mount when bearer_token is empty
+                AND chroot_autosync_enabled is on AND root shell is
+                available. Self-heals after every EAS install.
+              • New // auto-import from chroot yaml card: switch +
+                editable read-command + SYNC FROM CHROOT button +
+                last-sync timestamp.
+              • IP-RESET FIX: Split refresh() into refreshConfig() +
+                refreshLists(). Tool CRUD ops (toggleToolEnabled,
+                saveTool, deleteTool) now only call refreshLists(),
+                so they no longer clobber the user's in-progress
+                bind_host / probe_host edits in the // status subtab.
+                Root cause: tool-CRUD refresh was re-reading SQLite
+                and resetting the TextInput shadow state.
+
+        VERIFICATION:
+          ✓ tsc --noEmit --skipLibCheck clean
+          ✓ ESLint clean (both files)
+          ✓ YAML parser tested standalone with 6 input variants
+
+        USER ACTION on next EAS build:
+          1. After install: open // mcp. Chroot autosync is ON by default,
+             so the cockpit will auto-read /etc/enforcer-mcp/config.yaml
+             on first launch and import bearer + port + bind_host.
+          2. // tools → top right has [RESYNC] button (next to [NEW]) for
+             manual pull from /tools.
+          3. // auth → // auto-import from chroot yaml card has the
+             manual [SYNC FROM CHROOT] button if you ever want to force
+             a re-pull (e.g. you rotated the token in the chroot YAML).
+          4. IP fields should now stay where you set them — tool toggles
+             no longer reset them.
+
+        NOTE: Same EAS build as 1B.2b autospawn + IMPORT button +
+        tool-sync. ONE build for the user, lots of features lit up.
+

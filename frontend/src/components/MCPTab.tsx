@@ -25,7 +25,7 @@ import {
   mcpLocal,
   type MCPConfig, type MCPTool, type MCPAuditEntry,
 } from "../lib/localDb";
-import { startStream, killStream, hasNativeStreaming } from "../lib/rootShell";
+import { startStream, killStream, hasNativeStreaming, execReal, HAS_NATIVE_ROOT } from "../lib/rootShell";
 
 // Keep palette identical to the rest of the cockpit so the tab feels native.
 const C = {
@@ -71,6 +71,7 @@ export default function MCPTab() {
   const [bindInput, setBindInput] = useState("127.0.0.1");
   const [probeInput, setProbeInput] = useState("127.0.0.1");
   const [autospawnCmdInput, setAutospawnCmdInput] = useState("");
+  const [chrootCmdInput, setChrootCmdInput] = useState("");
   const [showAutospawnLog, setShowAutospawnLog] = useState(false);
 
   // Tool editor modal — null = closed, else current draft.
@@ -125,20 +126,30 @@ export default function MCPTab() {
   const [autospawnLog, setAutospawnLog] = useState<string>("");
   const [autospawnPid, setAutospawnPid] = useState<number | null>(null);
 
-  const refresh = useCallback(async () => {
-    const [c, t, a] = await Promise.all([
-      mcpLocal.getConfig(),
-      mcpLocal.listTools(),
-      mcpLocal.listAudit(200),
-    ]);
+  // Reading the config row also re-syncs the textinput shadow state.
+  // We split this from refreshLists() — toggling a tool in the // tools
+  // subtab does NOT need to reset the user's half-typed bind_host in
+  // // status, which was causing the "0.0.0.0 keeps reverting to
+  // 127.0.0.1" bug.
+  const refreshConfig = useCallback(async () => {
+    const c = await mcpLocal.getConfig();
     setConfig(c);
-    setTools(t);
-    setAudit(a);
     setPortInput(String(c.port));
     setBindInput(c.bind_host);
     setProbeInput(c.cockpit_probe_host || "127.0.0.1");
     setAutospawnCmdInput(c.autospawn_cmd || "");
+    setChrootCmdInput(c.chroot_yaml_cmd || "");
   }, []);
+
+  const refreshLists = useCallback(async () => {
+    const [t, a] = await Promise.all([mcpLocal.listTools(), mcpLocal.listAudit(200)]);
+    setTools(t);
+    setAudit(a);
+  }, []);
+
+  const refresh = useCallback(async () => {
+    await Promise.all([refreshConfig(), refreshLists()]);
+  }, [refreshConfig, refreshLists]);
 
   // ─── Tool sync helper (callable from health probe + manual button) ──
   const syncToolsNow = useCallback(async (
@@ -502,6 +513,98 @@ export default function MCPTab() {
     await syncToolsNow(base, config.bearer_token, { silent: false });
   }, [config, syncToolsNow]);
 
+  // ─── Chroot YAML auto-import ────────────────────────────────────────
+  // Shells out via RootShell.exec to read the chroot's config.yaml and
+  // pulls bearer_token / port / bind_host into local SQLite. Solves the
+  // post-EAS-install reset problem AND the user's manual copy-token-to-
+  // clipboard ritual in one shot.
+  const [chrootSyncStatus, setChrootSyncStatus] = useState<
+    "idle" | "running" | "ok" | "failed"
+  >("idle");
+  const [chrootSyncMsg, setChrootSyncMsg] = useState<string>("");
+  const didAutoChrootSyncRef = useRef<boolean>(false);
+
+  const handleChrootSync = useCallback(async (opts: { silent?: boolean } = {}) => {
+    if (!config) return null;
+    const cmd = (config.chroot_yaml_cmd || "").trim();
+    if (!cmd) {
+      if (!opts.silent) Alert.alert("No command set", "Configure chroot_yaml_cmd first.");
+      return null;
+    }
+    if (!HAS_NATIVE_ROOT) {
+      if (!opts.silent) {
+        Alert.alert("Root shell unavailable",
+          "This works only on the deployed APK (not Expo Go / web preview). " +
+          "Use IMPORT (clipboard) instead.");
+      }
+      return null;
+    }
+    setChrootSyncStatus("running");
+    setChrootSyncMsg("reading chroot yaml…");
+    try {
+      const res = await execReal(cmd);
+      // execReal returns { output, exit_code, ... }. exit_code != 0 usually
+      // means: chroot not mounted, file missing, or permission denied.
+      if (res.exit_code !== 0 && !res.output) {
+        throw new Error(`shell exit ${res.exit_code}: ${res.output || "(no output)"}`);
+      }
+      const parsed = await mcpLocal.applyChrootYaml(res.output || "");
+      if (parsed.imported.length === 0) {
+        setChrootSyncStatus("failed");
+        const msg = `nothing imported (skipped: ${parsed.skipped.join(", ") || "none"})`;
+        setChrootSyncMsg(msg);
+        if (!opts.silent) {
+          Alert.alert("No fields imported",
+            "The shell ran but no bearer_token_hex / port / host keys were found in the output.\n\n" +
+            "First 200 chars of output:\n" + (res.output || "").slice(0, 200));
+        }
+        return parsed;
+      }
+      setChrootSyncStatus("ok");
+      setChrootSyncMsg(`✓ imported ${parsed.imported.join(", ")}`);
+      // Reload everything from SQLite so all the UI form state lines up.
+      await refresh();
+      if (!opts.silent) {
+        Alert.alert("Synced from chroot",
+          `Imported: ${parsed.imported.join(", ")}\n` +
+          (parsed.skipped.length ? `\nSkipped: ${parsed.skipped.join(", ")}` : "") +
+          `\n\nbearer_token: ${parsed.raw.bearer_token_hex ? parsed.raw.bearer_token_hex.slice(0,8)+"…"+parsed.raw.bearer_token_hex.slice(-4) : "—"}` +
+          `\nport: ${parsed.raw.port ?? "—"}` +
+          `\nhost: ${parsed.raw.host ?? "—"}`);
+      }
+      return parsed;
+    } catch (e: any) {
+      setChrootSyncStatus("failed");
+      setChrootSyncMsg(`✗ ${e?.message || "shell error"}`);
+      if (!opts.silent) {
+        Alert.alert("Chroot sync failed",
+          (e?.message || "shell error") +
+          "\n\nCheck that:\n• Chroot is mounted\n• Path in chroot_yaml_cmd is correct\n• `nethunter` wrapper exists");
+      }
+      return null;
+    }
+  }, [config, refresh]);
+
+  // ─── First-mount chroot auto-import ─────────────────────────────────
+  // If the bearer token is empty AND chroot_autosync_enabled is on AND
+  // root shell is available, automatically read the chroot YAML to
+  // self-heal after an EAS install (which wipes SQLite + sometimes
+  // SecureStore). Runs once per mount. Placed AFTER handleChrootSync
+  // declaration to avoid TS use-before-assign.
+  useEffect(() => {
+    if (!config) return;
+    if (didAutoChrootSyncRef.current) return;
+    if (!HAS_NATIVE_ROOT) return;
+    if (!config.chroot_autosync_enabled) return;
+    // Only auto-fire if bearer is genuinely empty (post-install). Don't
+    // overwrite a user who just typed their token in manually.
+    if (config.bearer_token && config.bearer_token.length >= 16) return;
+    didAutoChrootSyncRef.current = true;
+    handleChrootSync({ silent: true }).catch((e) =>
+      console.warn("[MCPTab] auto chroot-sync failed:", e),
+    );
+  }, [config, handleChrootSync]);
+
   const handleStopAutospawn = useCallback(async () => {
     const sid = autospawnSessionRef.current;
     if (!sid) return;
@@ -527,10 +630,13 @@ export default function MCPTab() {
   }, [autospawnPid]);
 
   // ─── Tools CRUD ─────────────────────────────────────────────────────────
+  // CRUD operations use refreshLists() rather than full refresh() so they
+  // don't reset the user's in-progress IP/port/cmd input edits in the
+  // // status subtab.
   const toggleToolEnabled = useCallback(async (t: MCPTool) => {
     await mcpLocal.upsertTool({ ...t, enabled: !t.enabled });
-    refresh();
-  }, [refresh]);
+    refreshLists();
+  }, [refreshLists]);
 
   const saveTool = useCallback(async () => {
     if (!editingTool) return;
@@ -557,11 +663,11 @@ export default function MCPTab() {
         built_in: !!editingTool.built_in,
       });
       setEditingTool(null);
-      refresh();
+      refreshLists();
     } catch (e: any) {
       Alert.alert("Save failed", e?.message || "sqlite error");
     }
-  }, [editingTool, refresh]);
+  }, [editingTool, refreshLists]);
 
   const deleteTool = useCallback((t: MCPTool) => {
     if (t.built_in) {
@@ -575,11 +681,11 @@ export default function MCPTab() {
         { text: "Cancel", style: "cancel" },
         {
           text: "Delete", style: "destructive",
-          onPress: async () => { await mcpLocal.deleteTool(t.id); refresh(); },
+          onPress: async () => { await mcpLocal.deleteTool(t.id); refreshLists(); },
         },
       ],
     );
-  }, [refresh]);
+  }, [refreshLists]);
 
   // ─── Computed status ────────────────────────────────────────────────────
   const statusInfo = useMemo(() => {
@@ -928,8 +1034,93 @@ export default function MCPTab() {
             <Text style={[s.helperFine, { marginTop: 6, color: C.yellow }]}>
               ⚠ token lives in Android Keystore (encrypted) + sqlite cache. survives
               app updates &amp; clear-data, but NOT full uninstall. COPY it somewhere
-              safe before reinstalling the APK.
+              safe before reinstalling the APK — or use SYNC FROM CHROOT below to
+              auto-pull it from /etc/enforcer-mcp/config.yaml after every install.
             </Text>
+          </View>
+
+          {/* CHROOT YAML AUTO-IMPORT CARD ─────────────────────────── */}
+          <Text style={[s.sectionTitle, { marginTop: 20 }]}>{"// auto-import from chroot yaml"}</Text>
+          <View style={s.card}>
+            <Text style={s.helperFine}>
+              shell into the chroot and read{" "}
+              <Text style={{ color: C.cyan }}>/etc/enforcer-mcp/config.yaml</Text>
+              {" "}directly — bearer token, port, bind host all imported in one tap.
+              solves the EAS-install wipe problem without manual clipboard dance.
+            </Text>
+
+            <View style={[s.row, { justifyContent: "space-between", marginTop: 12 }]}>
+              <Text style={s.kvLabel}>auto-sync on app start when token empty</Text>
+              <Switch
+                value={config.chroot_autosync_enabled}
+                onValueChange={(v) => patchConfig({ chroot_autosync_enabled: v })}
+                trackColor={{ false: C.border, true: C.greenDim }}
+                thumbColor={config.chroot_autosync_enabled ? C.green : C.textDim}
+              />
+            </View>
+            <Text style={[s.helperFine, { marginTop: 4 }]}>
+              when on, the cockpit reads the chroot yaml automatically on every
+              app launch IF the bearer token is empty (typical post-install).
+              never overwrites a token you&apos;ve already imported manually.
+            </Text>
+
+            <Text style={[s.kvLabel, { marginTop: 14 }]}>chroot read command</Text>
+            <TextInput
+              style={[s.input, { fontFamily: MONO, fontSize: 11 }]}
+              value={chrootCmdInput}
+              onChangeText={setChrootCmdInput}
+              onBlur={() => {
+                const v = chrootCmdInput.trim();
+                if (v && v !== config.chroot_yaml_cmd) {
+                  patchConfig({ chroot_yaml_cmd: v });
+                }
+              }}
+              placeholder='nethunter -c "cat /etc/enforcer-mcp/config.yaml"'
+              placeholderTextColor={C.textDim}
+              autoCapitalize="none"
+              autoCorrect={false}
+              multiline
+            />
+
+            <View style={[s.row, { marginTop: 12, gap: 6 }]}>
+              <TouchableOpacity
+                style={[s.btn, { flex: 1, backgroundColor: C.panel2, borderColor: C.green }]}
+                onPress={() => handleChrootSync({ silent: false })}
+                disabled={chrootSyncStatus === "running" || !HAS_NATIVE_ROOT}
+              >
+                <MaterialCommunityIcons
+                  name={chrootSyncStatus === "running" ? "sync" : "database-import-outline"}
+                  size={14}
+                  color={C.green}
+                />
+                <Text style={[s.btnText, { color: C.green }]}>
+                  {chrootSyncStatus === "running" ? "READING…" : "SYNC FROM CHROOT"}
+                </Text>
+              </TouchableOpacity>
+            </View>
+
+            {chrootSyncMsg ? (
+              <Text style={[s.helperFine, {
+                marginTop: 8,
+                color: chrootSyncStatus === "ok" ? C.green :
+                       chrootSyncStatus === "failed" ? C.red : C.yellow,
+              }]}>
+                {chrootSyncMsg}
+              </Text>
+            ) : null}
+
+            {config.last_chroot_sync_at ? (
+              <Text style={[s.helperFine, { marginTop: 4, color: C.textDim }]}>
+                last successful sync: {new Date(config.last_chroot_sync_at).toLocaleString()}
+              </Text>
+            ) : null}
+
+            {!HAS_NATIVE_ROOT && (
+              <Text style={[s.helperFine, { marginTop: 8, color: C.yellow }]}>
+                ⚠ root shell unavailable — works only on the deployed APK,
+                not Expo Go / web preview.
+              </Text>
+            )}
           </View>
 
           <Text style={[s.sectionTitle, { marginTop: 20 }]}>{"// roadmap"}</Text>

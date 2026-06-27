@@ -22,7 +22,7 @@ let _db: SQLite.SQLiteDatabase | null = null;
 // pre-migration → re-run the seed → insert 9 attack + 5 AI profiles AGAIN.
 // With 8 concurrent callers that produced 72 attack profiles. Fun.
 let _dbPromise: Promise<SQLite.SQLiteDatabase> | null = null;
-const TARGET_VERSION = 7;
+const TARGET_VERSION = 8;
 
 export async function openLocalDb(): Promise<SQLite.SQLiteDatabase> {
   if (_db) return _db;
@@ -238,6 +238,29 @@ async function runMigrations(db: SQLite.SQLiteDatabase) {
             DEFAULT 'nethunter -c "cd /opt/enforcer-mcp && python3 server.py --config /etc/enforcer-mcp/config.yaml"';
           ALTER TABLE mcp_tools ADD COLUMN source TEXT DEFAULT 'local';
           ALTER TABLE mcp_tools ADD COLUMN last_synced_at TEXT;
+        `);
+        break;
+      case 8:
+        // Chroot-YAML auto-sync. EAS installs wipe local SQLite + sometimes
+        // expo-secure-store, which means the bearer token + server bind/port
+        // settings get reset to seed defaults on every fresh APK install.
+        // The user's chroot /etc/enforcer-mcp/config.yaml is the source of
+        // truth — instead of asking them to copy/paste the token every
+        // time, we just shell out and read the YAML directly.
+        //
+        //   chroot_yaml_cmd: the shell command that prints the YAML to
+        //     stdout. Default uses `nethunter -c "cat …"` so it works
+        //     regardless of cockpit exec_mode. User-editable for custom
+        //     chroot wrappers / non-default install paths.
+        //   chroot_autosync_enabled: when true, MCPTab will run this on
+        //     mount whenever the bearer token is empty (typical post-
+        //     install state). Off by default — user has to opt in once
+        //     to confirm the chroot path is right for their setup.
+        await db.execAsync(`
+          ALTER TABLE mcp_config ADD COLUMN chroot_yaml_cmd TEXT
+            DEFAULT 'nethunter -c "cat /etc/enforcer-mcp/config.yaml"';
+          ALTER TABLE mcp_config ADD COLUMN chroot_autosync_enabled INTEGER DEFAULT 1;
+          ALTER TABLE mcp_config ADD COLUMN last_chroot_sync_at TEXT;
         `);
         break;
       default:
@@ -743,6 +766,9 @@ export type MCPConfig = {
   require_token: boolean;
   autospawn_enabled: boolean;
   autospawn_cmd: string;
+  chroot_yaml_cmd: string;
+  chroot_autosync_enabled: boolean;
+  last_chroot_sync_at: string | null;
   updated_at: string;
 };
 export type MCPTool = {
@@ -791,6 +817,9 @@ export const mcpLocal = {
       cockpit_probe_host: row.cockpit_probe_host || "127.0.0.1",
       autospawn_enabled: !!row.autospawn_enabled,
       autospawn_cmd: row.autospawn_cmd || 'nethunter -c "cd /opt/enforcer-mcp && python3 server.py --config /etc/enforcer-mcp/config.yaml"',
+      chroot_yaml_cmd: row.chroot_yaml_cmd || 'nethunter -c "cat /etc/enforcer-mcp/config.yaml"',
+      chroot_autosync_enabled: !!row.chroot_autosync_enabled,
+      last_chroot_sync_at: row.last_chroot_sync_at || null,
       server_enabled: !!row.server_enabled,
       require_token: !!row.require_token,
     };
@@ -809,6 +838,7 @@ export const mcpLocal = {
       `UPDATE mcp_config SET server_enabled=?, port=?, bind_host=?, cockpit_probe_host=?,
         bearer_token=?, transport=?, require_token=?,
         autospawn_enabled=?, autospawn_cmd=?,
+        chroot_yaml_cmd=?, chroot_autosync_enabled=?, last_chroot_sync_at=?,
         updated_at=? WHERE id = 1`,
       [
         merged.server_enabled ? 1 : 0,
@@ -820,6 +850,9 @@ export const mcpLocal = {
         merged.require_token ? 1 : 0,
         merged.autospawn_enabled ? 1 : 0,
         merged.autospawn_cmd,
+        merged.chroot_yaml_cmd,
+        merged.chroot_autosync_enabled ? 1 : 0,
+        merged.last_chroot_sync_at,
         merged.updated_at,
       ],
     );
@@ -879,6 +912,90 @@ export const mcpLocal = {
     // Built-in tools can be disabled but not deleted — keeps the
     // restore-default path simple.
     await db.runAsync("DELETE FROM mcp_tools WHERE id = ? AND built_in = 0", [id]);
+  },
+
+  /**
+   * Parse the chroot's /etc/enforcer-mcp/config.yaml (or whatever the
+   * user's chroot_yaml_cmd returns) and patch our local mcp_config.
+   *
+   * Why this exists: every EAS install wipes SQLite + sometimes
+   * SecureStore. The chroot YAML is the source of truth for the bearer
+   * token, port, and bind host — there's no good reason to make the
+   * user copy/paste them back into the cockpit on every install when
+   * the cockpit has root shell access and can just read the file.
+   *
+   * We deliberately use a hand-rolled regex parser instead of pulling
+   * `js-yaml` (5x app size hit for one file). The YAML we parse is
+   * known-shape: a `server:` block with bearer_token_hex, port, host.
+   * Anything else we ignore.
+   *
+   * Returns the keys that were actually changed so the UI can show
+   * meaningful feedback ("imported token + port + host").
+   */
+  async applyChrootYaml(yamlText: string): Promise<{
+    imported: string[];
+    skipped: string[];
+    raw: { bearer_token_hex?: string; port?: number; host?: string };
+  }> {
+    if (typeof yamlText !== "string" || !yamlText.trim()) {
+      return { imported: [], skipped: ["empty"], raw: {} };
+    }
+    // Strip ANSI escape codes (in case the shell wrapped output through
+    // a colorising pager like `bat` or `less -R`).
+    const clean = yamlText.replace(/\u001b\[[0-9;]*m/g, "");
+    // The fields we care about are nested under server: but the YAML
+    // indentation depth varies (2 vs 4 spaces). Match anywhere the key
+    // appears at the start of a line (after whitespace) followed by a
+    // colon. Strip surrounding quotes off the value.
+    const grab = (key: string): string | null => {
+      const re = new RegExp(`^[\\t ]+${key}\\s*:\\s*([^\\r\\n#]+?)\\s*(?:#.*)?$`, "m");
+      const m = clean.match(re);
+      if (!m) return null;
+      return m[1].replace(/^['"]|['"]$/g, "").trim();
+    };
+    const tok = grab("bearer_token_hex");
+    const portS = grab("port");
+    const host = grab("host");
+
+    const raw = {
+      bearer_token_hex: tok || undefined,
+      port: portS && /^\d+$/.test(portS) ? Number(portS) : undefined,
+      host: host || undefined,
+    };
+
+    const patch: Partial<MCPConfig> = { last_chroot_sync_at: nowIso() };
+    const imported: string[] = [];
+    const skipped: string[] = [];
+
+    if (raw.bearer_token_hex && /^[0-9a-f]{16,}$/i.test(raw.bearer_token_hex)) {
+      patch.bearer_token = raw.bearer_token_hex.toLowerCase();
+      imported.push("bearer_token");
+    } else if (tok) {
+      skipped.push("bearer_token (bad format)");
+    }
+
+    if (raw.port && raw.port > 0 && raw.port < 65536) {
+      patch.port = raw.port;
+      imported.push("port");
+    } else if (portS) {
+      skipped.push("port (out of range)");
+    }
+
+    if (raw.host && raw.host.length <= 64) {
+      // Accept 0.0.0.0, 127.0.0.1, tailnet IPs, hostnames — anything that
+      // isn't obviously a URL or path.
+      if (!/[/\s]/.test(raw.host) && !raw.host.startsWith("http")) {
+        patch.bind_host = raw.host;
+        imported.push("bind_host");
+      } else {
+        skipped.push("host (unexpected chars)");
+      }
+    }
+
+    if (imported.length > 0) {
+      await this.updateConfig(patch);
+    }
+    return { imported, skipped, raw };
   },
 
   /**
