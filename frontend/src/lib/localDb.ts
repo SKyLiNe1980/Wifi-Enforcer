@@ -22,7 +22,7 @@ let _db: SQLite.SQLiteDatabase | null = null;
 // pre-migration → re-run the seed → insert 9 attack + 5 AI profiles AGAIN.
 // With 8 concurrent callers that produced 72 attack profiles. Fun.
 let _dbPromise: Promise<SQLite.SQLiteDatabase> | null = null;
-const TARGET_VERSION = 8;
+const TARGET_VERSION = 9;
 
 export async function openLocalDb(): Promise<SQLite.SQLiteDatabase> {
   if (_db) return _db;
@@ -223,19 +223,19 @@ async function runMigrations(db: SQLite.SQLiteDatabase) {
         //   1. autospawn_enabled — opt-in switch (off by default; user
         //      explicitly turns it on after they've verified the chroot
         //      command works manually first).
-        //   2. autospawn_cmd — the full shell command the cockpit will
-        //      run via RootShell.executeStream when autospawn fires.
-        //      Default wraps with `nethunter -c "..."` so the python
-        //      server starts inside the chroot regardless of cockpit
-        //      exec_mode. User-editable for custom chroot wrappers.
+        //   2. autospawn_cmd — the inner shell command (run *inside* the
+        //      chroot). MCPTab prepends the existing settings.chroot_path
+        //      (busybox_nh + chroot + sudo -E) at exec time so the command
+        //      actually enters Kali. Defaults to just the `cd && python3`
+        //      part — DO NOT default to `nethunter -c "..."` because that
+        //      runs in the app's isolated namespace and can't see the
+        //      bootkali mounts.
         //   3. mcp_tools.source — 'server' for entries upserted from the
         //      server's /tools endpoint, 'local' for hand-added ones.
-        //      Lets us tell the user which tools came from where without
-        //      losing the existing built_in flag.
         await db.execAsync(`
           ALTER TABLE mcp_config ADD COLUMN autospawn_enabled INTEGER DEFAULT 0;
           ALTER TABLE mcp_config ADD COLUMN autospawn_cmd TEXT
-            DEFAULT 'nethunter -c "cd /opt/enforcer-mcp && python3 server.py --config /etc/enforcer-mcp/config.yaml"';
+            DEFAULT 'cd /opt/enforcer-mcp && python3 server.py --config /etc/enforcer-mcp/config.yaml';
           ALTER TABLE mcp_tools ADD COLUMN source TEXT DEFAULT 'local';
           ALTER TABLE mcp_tools ADD COLUMN last_synced_at TEXT;
         `);
@@ -248,19 +248,50 @@ async function runMigrations(db: SQLite.SQLiteDatabase) {
         // truth — instead of asking them to copy/paste the token every
         // time, we just shell out and read the YAML directly.
         //
-        //   chroot_yaml_cmd: the shell command that prints the YAML to
-        //     stdout. Default uses `nethunter -c "cat …"` so it works
-        //     regardless of cockpit exec_mode. User-editable for custom
-        //     chroot wrappers / non-default install paths.
+        // IMPORTANT: We do NOT default to `nethunter -c "..."` here.
+        // That command runs in the app's isolated mount namespace and
+        // can't see the chroot mounts that bootkali set up at boot.
+        // Instead we default to the literal inner command and let
+        // wrapChrootCmd() in MCPTab prepend the existing
+        // settings.chroot_path (the busybox_nh data_mirror incantation)
+        // so the command actually enters the Kali filesystem.
+        //
+        //   chroot_yaml_cmd: the shell command (run *inside* the chroot)
+        //     that prints the YAML to stdout. Default is just `cat …`
+        //     because the wrapper prepends the chroot entry path.
         //   chroot_autosync_enabled: when true, MCPTab will run this on
         //     mount whenever the bearer token is empty (typical post-
-        //     install state). Off by default — user has to opt in once
-        //     to confirm the chroot path is right for their setup.
+        //     install state). On by default — the whole point of this
+        //     feature is self-healing after install.
         await db.execAsync(`
           ALTER TABLE mcp_config ADD COLUMN chroot_yaml_cmd TEXT
-            DEFAULT 'nethunter -c "cat /etc/enforcer-mcp/config.yaml"';
+            DEFAULT 'cat /etc/enforcer-mcp/config.yaml';
           ALTER TABLE mcp_config ADD COLUMN chroot_autosync_enabled INTEGER DEFAULT 1;
           ALTER TABLE mcp_config ADD COLUMN last_chroot_sync_at TEXT;
+        `);
+        break;
+      case 9:
+        // Patch-up for the previous EAS install: v8 shipped with
+        // `nethunter -c "..."` defaults that DO NOT WORK because the
+        // cockpit app runs in an isolated mount namespace and can't see
+        // bootkali's chroot mounts (LineageOS data_mirror sandbox).
+        //
+        // The correct route is settings.chroot_path (busybox_nh + chroot
+        // + sudo -E) which is already plumbed for other tabs. We rewrite
+        // the offending defaults so they're just the *inner* command;
+        // the cockpit's wrapChrootCmd() helper prepends the chroot_path
+        // at exec time.
+        //
+        // We only touch rows that still look like the old bad default
+        // — if the user has customised their command (e.g. added a
+        // different YAML path), we leave it alone.
+        await db.execAsync(`
+          UPDATE mcp_config
+            SET chroot_yaml_cmd = 'cat /etc/enforcer-mcp/config.yaml'
+            WHERE chroot_yaml_cmd LIKE 'nethunter -c %';
+          UPDATE mcp_config
+            SET autospawn_cmd = 'cd /opt/enforcer-mcp && python3 server.py --config /etc/enforcer-mcp/config.yaml'
+            WHERE autospawn_cmd LIKE 'nethunter -c %';
         `);
         break;
       default:
@@ -816,8 +847,8 @@ export const mcpLocal = {
       bearer_token: bearer || "",
       cockpit_probe_host: row.cockpit_probe_host || "127.0.0.1",
       autospawn_enabled: !!row.autospawn_enabled,
-      autospawn_cmd: row.autospawn_cmd || 'nethunter -c "cd /opt/enforcer-mcp && python3 server.py --config /etc/enforcer-mcp/config.yaml"',
-      chroot_yaml_cmd: row.chroot_yaml_cmd || 'nethunter -c "cat /etc/enforcer-mcp/config.yaml"',
+      autospawn_cmd: row.autospawn_cmd || 'cd /opt/enforcer-mcp && python3 server.py --config /etc/enforcer-mcp/config.yaml',
+      chroot_yaml_cmd: row.chroot_yaml_cmd || 'cat /etc/enforcer-mcp/config.yaml',
       chroot_autosync_enabled: !!row.chroot_autosync_enabled,
       last_chroot_sync_at: row.last_chroot_sync_at || null,
       server_enabled: !!row.server_enabled,
