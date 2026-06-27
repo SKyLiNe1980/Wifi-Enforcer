@@ -298,6 +298,17 @@ def register_tools(
         def _make_handler(_spec: ToolSpec, _v: Draft202012Validator):
             async def _tool_impl(args: Dict[str, Any]) -> Dict[str, Any]:
                 t0 = datetime.now(timezone.utc)
+                # Smooth two calling conventions:
+                #   • {"args": {"file": "..."}}   (matches our wrapper schema)
+                #   • {"file": "..."}             (direct — what most clients try first)
+                # FastMCP introspects our handler signature as accepting a single
+                # `args: dict` param, so the auto-generated schema technically wants
+                # the wrapper form. But Postman / Hermes / curl users instinctively
+                # send the inner shape. Unwrap if we see the wrapper, otherwise treat
+                # args as the inner dict directly.
+                if isinstance(args, dict) and "args" in args and len(args) == 1 \
+                        and isinstance(args["args"], dict):
+                    args = args["args"]
                 # Validate args against the YAML-defined schema
                 errors = sorted(_v.iter_errors(args), key=lambda e: list(e.path))
                 if errors:
