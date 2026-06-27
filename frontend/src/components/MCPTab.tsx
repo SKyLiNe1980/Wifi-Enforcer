@@ -13,7 +13,7 @@
  * Everything reads/writes through `mcpLocal` (SQLite). No network. Cold-boot
  * safe like the rest of the local-first cockpit.
  */
-import React, { useEffect, useState, useCallback, useMemo } from "react";
+import React, { useEffect, useState, useCallback, useMemo, useRef } from "react";
 import {
   View, Text, StyleSheet, ScrollView, TouchableOpacity, TextInput,
   Alert, Platform, Switch,
@@ -25,6 +25,7 @@ import {
   mcpLocal,
   type MCPConfig, type MCPTool, type MCPAuditEntry,
 } from "../lib/localDb";
+import { startStream, killStream, hasNativeStreaming } from "../lib/rootShell";
 
 // Keep palette identical to the rest of the cockpit so the tab feels native.
 const C = {
@@ -69,6 +70,8 @@ export default function MCPTab() {
   const [portInput, setPortInput] = useState("8765");
   const [bindInput, setBindInput] = useState("127.0.0.1");
   const [probeInput, setProbeInput] = useState("127.0.0.1");
+  const [autospawnCmdInput, setAutospawnCmdInput] = useState("");
+  const [showAutospawnLog, setShowAutospawnLog] = useState(false);
 
   // Tool editor modal — null = closed, else current draft.
   const [editingTool, setEditingTool] = useState<Partial<MCPTool> | null>(null);
@@ -89,6 +92,39 @@ export default function MCPTab() {
   // Tick every second to refresh "Xs ago" labels without re-firing polls
   const [, setTick] = useState(0);
 
+  // ─── Tool registry sync ─────────────────────────────────────────────
+  // Cockpit pulls GET /tools after first /health success, then on every
+  // user-initiated [resync]. Without this the // tools tab stays frozen
+  // at whatever was seeded into local SQLite (Phase 1A = 11) even though
+  // the chroot server is happily registering new ones.
+  const [toolSyncStatus, setToolSyncStatus] = useState<
+    "idle" | "syncing" | "synced" | "failed"
+  >("idle");
+  const [toolSyncMsg, setToolSyncMsg] = useState<string>("");
+  const lastToolSyncRef = useRef<number>(0);
+  // Have we run the auto-sync for THIS session of /health success?
+  // Reset to false whenever serverHealth leaves "running" so we re-sync
+  // after a server bounce.
+  const didAutoToolSyncRef = useRef<boolean>(false);
+
+  // ─── Autospawn state machine ────────────────────────────────────────
+  // When autospawn_enabled and the cockpit can't reach the server, spawn
+  // it via the native RootShell stream. We track the spawned session in
+  // a ref so:
+  //   • re-renders don't trigger another spawn
+  //   • we don't spawn while a previous attempt is still settling
+  //   • the cleanup on unmount can detach event listeners without
+  //     killing the actual process (we WANT the server to keep running
+  //     after the user leaves the tab)
+  const autospawnSessionRef = useRef<string | null>(null);
+  const autospawnUnsubRef = useRef<(() => void) | null>(null);
+  const autospawnAttemptedAtRef = useRef<number>(0);
+  const [autospawnStatus, setAutospawnStatus] = useState<
+    "idle" | "spawning" | "running" | "exited" | "failed" | "disabled"
+  >("disabled");
+  const [autospawnLog, setAutospawnLog] = useState<string>("");
+  const [autospawnPid, setAutospawnPid] = useState<number | null>(null);
+
   const refresh = useCallback(async () => {
     const [c, t, a] = await Promise.all([
       mcpLocal.getConfig(),
@@ -101,6 +137,53 @@ export default function MCPTab() {
     setPortInput(String(c.port));
     setBindInput(c.bind_host);
     setProbeInput(c.cockpit_probe_host || "127.0.0.1");
+    setAutospawnCmdInput(c.autospawn_cmd || "");
+  }, []);
+
+  // ─── Tool sync helper (callable from health probe + manual button) ──
+  const syncToolsNow = useCallback(async (
+    base: string, token: string, opts: { silent?: boolean } = {},
+  ) => {
+    setToolSyncStatus("syncing");
+    try {
+      const ctl = new AbortController();
+      const timer = setTimeout(() => ctl.abort(), 5000);
+      let r: Response;
+      try {
+        r = await fetch(`${base}/tools`, {
+          headers: { Authorization: `Bearer ${token}` },
+          signal: ctl.signal,
+        });
+      } finally {
+        clearTimeout(timer);
+      }
+      if (!r.ok) {
+        setToolSyncStatus("failed");
+        setToolSyncMsg(`HTTP ${r.status}`);
+        return null;
+      }
+      const data = await r.json();
+      const serverTools = Array.isArray(data?.tools) ? data.tools : [];
+      const res = await mcpLocal.syncToolsFromServer(serverTools);
+      setToolSyncStatus("synced");
+      const msg = `+${res.inserted} new · ${res.updated} updated · ${res.total} total`;
+      setToolSyncMsg(msg);
+      lastToolSyncRef.current = Date.now();
+      // Refresh visible tool list
+      const newTools = await mcpLocal.listTools();
+      setTools(newTools);
+      if (!opts.silent) {
+        Alert.alert("Tools synced", msg);
+      }
+      return res;
+    } catch (e: any) {
+      setToolSyncStatus("failed");
+      setToolSyncMsg(e?.message || "fetch failed");
+      if (!opts.silent) {
+        Alert.alert("Tool sync failed", e?.message || "network error");
+      }
+      return null;
+    }
   }, []);
 
   useEffect(() => {
@@ -159,14 +242,29 @@ export default function MCPTab() {
         setProbeError(null);
         setLastProbeAt(Date.now());
         setServerHealth("running");
+        // Autospawn: clear failure backoff once server reachable
+        setAutospawnStatus((cur) =>
+          cur === "spawning" || cur === "failed" ? "running" : cur);
+        // Auto-sync tools once per "running" streak (token must be set).
+        if (!didAutoToolSyncRef.current && token) {
+          didAutoToolSyncRef.current = true;
+          syncToolsNow(base, token, { silent: true }).catch(() => {});
+        }
       } catch (e: any) {
         if (cancelled) return;
         const msg = e?.message || String(e);
         // Network-level failure ≠ server bug. AbortError = our 3.5s timeout.
-        if (msg.includes("Network") || msg.includes("aborted") ||
-            msg.includes("Failed to fetch") || msg.includes("ECONNREFUSED") ||
-            msg.includes("connect")) {
+        const isUnreachable =
+          msg.includes("Network") || msg.includes("aborted") ||
+          msg.includes("Failed to fetch") || msg.includes("ECONNREFUSED") ||
+          msg.includes("connect");
+        if (isUnreachable) {
           setServerHealth("unreachable");
+          // Reset the one-shot tool-sync gate so the NEXT successful
+          // probe (after spawn / reconnect) re-syncs.
+          didAutoToolSyncRef.current = false;
+          // Autospawn: try once per 30s window when we hit unreachable.
+          maybeAutospawn();
         } else {
           setServerHealth("error");
         }
@@ -174,6 +272,81 @@ export default function MCPTab() {
         setLastProbeAt(Date.now());
       }
     };
+
+    // Spawn the chroot server via RootShell.executeStream. Idempotent in
+    // practice: tries at most once per 30s, and refuses to re-trigger
+    // while a previous spawn is still alive.
+    const maybeAutospawn = () => {
+      if (!config.autospawn_enabled) return;
+      if (!config.autospawn_cmd?.trim()) {
+        setAutospawnStatus("failed");
+        setAutospawnLog("autospawn_cmd is empty");
+        return;
+      }
+      if (!hasNativeStreaming()) {
+        // Expo Go / web preview: can't spawn native streams. Stay quiet.
+        setAutospawnStatus("disabled");
+        return;
+      }
+      if (autospawnSessionRef.current) return;          // already running
+      const since = Date.now() - autospawnAttemptedAtRef.current;
+      // Hard 30 s cooldown between any two attempts. Avoids hammering
+      // the root shell with bash fork bombs if e.g. the chroot path is
+      // wrong and every spawn dies immediately.
+      if (autospawnAttemptedAtRef.current && since < 30_000) return;
+
+      autospawnAttemptedAtRef.current = Date.now();
+      const sid = `mcp-autospawn-${Date.now()}`;
+      setAutospawnStatus("spawning");
+      setAutospawnLog("→ launching: " + config.autospawn_cmd);
+      setAutospawnPid(null);
+
+      const unsub = startStream(sid, config.autospawn_cmd, {
+        onPid: (e) => {
+          setAutospawnPid(e.pid);
+          setAutospawnLog((prev) => prev + `\n[pid ${e.pid}]`);
+        },
+        onLine: (e) => {
+          // Trim huge log — keep last ~30 lines worth.
+          setAutospawnLog((prev) => {
+            const next = prev + "\n" + e.line;
+            if (next.length > 4000) return next.slice(-4000);
+            return next;
+          });
+        },
+        onExit: (e) => {
+          setAutospawnPid(null);
+          autospawnSessionRef.current = null;
+          autospawnUnsubRef.current?.();
+          autospawnUnsubRef.current = null;
+          // exit_code 0 only if the user stopped it cleanly; the server
+          // is supposed to run forever, so any exit during normal ops
+          // counts as a failure for autospawn purposes.
+          setAutospawnStatus(e.exit_code === 0 ? "exited" : "failed");
+          setAutospawnLog((prev) => prev + `\n[exit ${e.exit_code} after ${e.duration_ms}ms]`);
+        },
+        onError: (e) => {
+          autospawnSessionRef.current = null;
+          autospawnUnsubRef.current?.();
+          autospawnUnsubRef.current = null;
+          setAutospawnPid(null);
+          setAutospawnStatus("failed");
+          setAutospawnLog((prev) => prev + `\n[error] ${e.message}`);
+        },
+      });
+      autospawnSessionRef.current = sid;
+      autospawnUnsubRef.current = unsub;
+    };
+
+    // Reset autospawn status when autospawn toggled off. Use functional
+    // setter so we don't capture a stale value and only flip to "disabled"
+    // when the user actively turns the feature off (preserve last status
+    // for transparency on the // status pane).
+    if (!config.autospawn_enabled && autospawnSessionRef.current === null) {
+      setAutospawnStatus((cur) => (cur === "spawning" ? "disabled" : cur === "disabled" ? cur : "disabled"));
+    } else if (config.autospawn_enabled) {
+      setAutospawnStatus((cur) => (cur === "disabled" ? "idle" : cur));
+    }
 
     const syncAudit = async () => {
       try {
@@ -221,8 +394,13 @@ export default function MCPTab() {
       clearInterval(healthTimer);
       clearInterval(auditTimer);
       clearInterval(tickTimer);
+      // NOTE: we intentionally do NOT detach the autospawn listeners or
+      // kill the spawned process here. The MCP server should keep running
+      // even when the user leaves the // mcp tab. The listeners do leak
+      // until app teardown, but the native bridge dedupes by sessionId
+      // so memory is bounded.
     };
-  }, [config?.server_enabled, config?.cockpit_probe_host, config?.port, config?.bearer_token]);  // eslint-disable-line react-hooks/exhaustive-deps
+  }, [config?.server_enabled, config?.cockpit_probe_host, config?.port, config?.bearer_token, config?.autospawn_enabled, config?.autospawn_cmd, syncToolsNow]);  // eslint-disable-line react-hooks/exhaustive-deps
 
   // ─── Config writes ──────────────────────────────────────────────────────
   const patchConfig = useCallback(async (patch: Partial<MCPConfig>) => {
@@ -312,6 +490,41 @@ export default function MCPTab() {
       ],
     );
   }, []);
+
+  const handleManualResync = useCallback(async () => {
+    if (!config) return;
+    const host = (config.cockpit_probe_host || "127.0.0.1").trim();
+    const base = `http://${host}:${config.port}`;
+    if (!config.bearer_token) {
+      Alert.alert("No bearer token", "Generate or import a token first.");
+      return;
+    }
+    await syncToolsNow(base, config.bearer_token, { silent: false });
+  }, [config, syncToolsNow]);
+
+  const handleStopAutospawn = useCallback(async () => {
+    const sid = autospawnSessionRef.current;
+    if (!sid) return;
+    Alert.alert(
+      "Stop server?",
+      "Send SIGTERM to the autospawned MCP server (PID " +
+        (autospawnPid ?? "?") + "). It will respawn on the next health-poll failure unless you also turn autospawn OFF.",
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Stop", style: "destructive",
+          onPress: async () => {
+            await killStream(sid, true).catch(() => {});
+            autospawnSessionRef.current = null;
+            autospawnUnsubRef.current?.();
+            autospawnUnsubRef.current = null;
+            setAutospawnStatus("exited");
+            setAutospawnPid(null);
+          },
+        },
+      ],
+    );
+  }, [autospawnPid]);
 
   // ─── Tools CRUD ─────────────────────────────────────────────────────────
   const toggleToolEnabled = useCallback(async (t: MCPTool) => {
@@ -548,9 +761,107 @@ export default function MCPTab() {
                     </Text>
                   </Text>
                 )}
+                {toolSyncStatus !== "idle" && (
+                  <Text style={[s.helperFine, { marginTop: 4 }]}>
+                    tool sync: <Text style={{
+                      color: toolSyncStatus === "synced" ? C.green
+                        : toolSyncStatus === "syncing" ? C.yellow : C.red,
+                    }}>{toolSyncStatus}</Text>
+                    {toolSyncMsg ? <Text style={{ color: C.textDim }}>{"  ·  " + toolSyncMsg}</Text> : null}
+                  </Text>
+                )}
                 {probeError && serverHealth !== "running" && (
                   <Text style={[s.helperFine, { marginTop: 6, color: C.red }]}>
                     err: {probeError}
+                  </Text>
+                )}
+              </View>
+
+              {/* AUTOSPAWN CARD — only meaningful when server_enabled */}
+              <Text style={[s.sectionTitle, { marginTop: 20 }]}>{"// autospawn"}</Text>
+              <View style={s.card}>
+                <View style={[s.row, { justifyContent: "space-between" }]}>
+                  <Text style={s.kvLabel}>auto-launch chroot server on unreachable</Text>
+                  <Switch
+                    value={config.autospawn_enabled}
+                    onValueChange={(v) => patchConfig({ autospawn_enabled: v })}
+                    trackColor={{ false: C.border, true: C.greenDim }}
+                    thumbColor={config.autospawn_enabled ? C.green : C.textDim}
+                  />
+                </View>
+                <Text style={[s.helperFine, { marginTop: 6 }]}>
+                  when on, the cockpit runs the command below via root shell
+                  the moment a /health probe fails. cooldown: 30 s between
+                  attempts. requires a working chroot wrapper (default uses
+                  <Text style={{ color: C.cyan }}> nethunter -c</Text>).
+                </Text>
+
+                <Text style={[s.kvLabel, { marginTop: 12 }]}>spawn command</Text>
+                <TextInput
+                  style={[s.input, { minHeight: 70, fontFamily: MONO, fontSize: 11 }]}
+                  value={autospawnCmdInput}
+                  onChangeText={setAutospawnCmdInput}
+                  onBlur={() => {
+                    const v = autospawnCmdInput.trim();
+                    if (v && v !== config.autospawn_cmd) {
+                      patchConfig({ autospawn_cmd: v });
+                    }
+                  }}
+                  placeholder='nethunter -c "cd /opt/enforcer-mcp && python3 server.py --config /etc/enforcer-mcp/config.yaml"'
+                  placeholderTextColor={C.textDim}
+                  autoCapitalize="none"
+                  autoCorrect={false}
+                  multiline
+                />
+
+                <View style={[s.row, { marginTop: 10, justifyContent: "space-between" }]}>
+                  <Text style={s.helperFine}>
+                    status: <Text style={{
+                      color:
+                        autospawnStatus === "running" ? C.green :
+                        autospawnStatus === "spawning" ? C.yellow :
+                        autospawnStatus === "failed" ? C.red :
+                        autospawnStatus === "exited" ? C.yellow :
+                        C.textDim,
+                    }}>{autospawnStatus.toUpperCase()}</Text>
+                    {autospawnPid !== null ? (
+                      <Text style={{ color: C.textDim }}>{`  ·  pid ${autospawnPid}`}</Text>
+                    ) : null}
+                  </Text>
+                  <View style={[s.row, { gap: 6 }]}>
+                    {autospawnLog ? (
+                      <TouchableOpacity
+                        style={[s.smallBtn, { borderColor: C.cyan }]}
+                        onPress={() => setShowAutospawnLog((v) => !v)}
+                      >
+                        <Text style={[s.smallBtnText, { color: C.cyan }]}>
+                          {showAutospawnLog ? "HIDE LOG" : "LOG"}
+                        </Text>
+                      </TouchableOpacity>
+                    ) : null}
+                    {autospawnSessionRef.current ? (
+                      <TouchableOpacity
+                        style={[s.smallBtn, { borderColor: C.red }]}
+                        onPress={handleStopAutospawn}
+                      >
+                        <Text style={[s.smallBtnText, { color: C.red }]}>STOP</Text>
+                      </TouchableOpacity>
+                    ) : null}
+                  </View>
+                </View>
+
+                {showAutospawnLog && autospawnLog ? (
+                  <View style={[s.tokenBox, { marginTop: 10 }]}>
+                    <Text style={[s.helperFine, { fontSize: 10, color: C.text }]}>
+                      {autospawnLog.trim()}
+                    </Text>
+                  </View>
+                ) : null}
+
+                {!hasNativeStreaming() && (
+                  <Text style={[s.helperFine, { marginTop: 8, color: C.yellow }]}>
+                    ⚠ native streaming bridge not detected — autospawn will no-op.
+                    works only on the deployed APK, not Expo Go / web preview.
                   </Text>
                 )}
               </View>
@@ -626,9 +937,9 @@ export default function MCPTab() {
             <Text style={s.helper}>
               <Text style={{ color: C.green }}>✓</Text> 1A  · UI + persistence{"\n"}
               <Text style={{ color: C.green }}>✓</Text> 1B.1 · FastMCP server (chroot){"\n"}
-              <Text style={{ color: C.green }}>✓</Text> 1B.2a · live probe + audit sync (this build){"\n"}
-              <Text style={{ color: C.yellow }}>·</Text> 1B.2b · cockpit auto-spawn the server{"\n"}
-              <Text style={{ color: C.textDim }}>·</Text> 1C  · real session handlers (PTY){"\n"}
+              <Text style={{ color: C.green }}>✓</Text> 1B.2a · live probe + audit sync{"\n"}
+              <Text style={{ color: C.green }}>✓</Text> 1B.2b · cockpit autospawn + tool sync (this build){"\n"}
+              <Text style={{ color: C.green }}>✓</Text> 1C  · real PTY-backed sessions (chroot){"\n"}
               <Text style={{ color: C.textDim }}>·</Text> 1D  · local Hermes ↔ local MCP loop{"\n"}
               <Text style={{ color: C.textDim }}>·</Text> 2   · Tailscale bridge + Nodes tab + enforcer-node .deb
             </Text>
@@ -641,14 +952,41 @@ export default function MCPTab() {
         <ScrollView contentContainerStyle={{ padding: 14, paddingBottom: 90 }}>
           <View style={[s.row, { justifyContent: "space-between", marginBottom: 12 }]}>
             <Text style={s.sectionTitle}>{"// registered tools"}</Text>
-            <TouchableOpacity
-              style={[s.btn, { backgroundColor: C.panel2, borderColor: C.mcpAccent }]}
-              onPress={() => setEditingTool({ name: "", command_template: "", wrap_mode: "auto", timeout_sec: 60, enabled: true, built_in: false })}
-            >
-              <MaterialCommunityIcons name="plus" size={14} color={C.mcpAccent} />
-              <Text style={[s.btnText, { color: C.mcpAccent }]}>NEW</Text>
-            </TouchableOpacity>
+            <View style={[s.row, { gap: 6 }]}>
+              <TouchableOpacity
+                style={[s.btn, { backgroundColor: C.panel2, borderColor: C.cyan }]}
+                onPress={handleManualResync}
+                disabled={toolSyncStatus === "syncing"}
+              >
+                <MaterialCommunityIcons
+                  name={toolSyncStatus === "syncing" ? "sync" : "cloud-download-outline"}
+                  size={14}
+                  color={C.cyan}
+                />
+                <Text style={[s.btnText, { color: C.cyan }]}>
+                  {toolSyncStatus === "syncing" ? "SYNCING…" : "RESYNC"}
+                </Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[s.btn, { backgroundColor: C.panel2, borderColor: C.mcpAccent }]}
+                onPress={() => setEditingTool({ name: "", command_template: "", wrap_mode: "auto", timeout_sec: 60, enabled: true, built_in: false })}
+              >
+                <MaterialCommunityIcons name="plus" size={14} color={C.mcpAccent} />
+                <Text style={[s.btnText, { color: C.mcpAccent }]}>NEW</Text>
+              </TouchableOpacity>
+            </View>
           </View>
+
+          {toolSyncStatus !== "idle" && toolSyncMsg ? (
+            <Text style={[s.helperFine, {
+              marginBottom: 10,
+              color: toolSyncStatus === "synced" ? C.green
+                : toolSyncStatus === "failed" ? C.red : C.yellow,
+            }]}>
+              {toolSyncStatus === "synced" ? "✓ " : toolSyncStatus === "failed" ? "✗ " : "↻ "}
+              {toolSyncMsg}
+            </Text>
+          ) : null}
 
           {tools.map((t) => (
             <View key={t.id} style={[s.card, { marginBottom: 10 }]}>
@@ -659,6 +997,11 @@ export default function MCPTab() {
                     {t.built_in && (
                       <View style={s.tag}>
                         <Text style={s.tagText}>BUILT-IN</Text>
+                      </View>
+                    )}
+                    {t.source === "server" && (
+                      <View style={[s.tag, { borderColor: C.cyan, marginLeft: 4 }]}>
+                        <Text style={[s.tagText, { color: C.cyan }]}>SERVER</Text>
                       </View>
                     )}
                   </View>

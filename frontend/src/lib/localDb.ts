@@ -22,7 +22,7 @@ let _db: SQLite.SQLiteDatabase | null = null;
 // pre-migration → re-run the seed → insert 9 attack + 5 AI profiles AGAIN.
 // With 8 concurrent callers that produced 72 attack profiles. Fun.
 let _dbPromise: Promise<SQLite.SQLiteDatabase> | null = null;
-const TARGET_VERSION = 6;
+const TARGET_VERSION = 7;
 
 export async function openLocalDb(): Promise<SQLite.SQLiteDatabase> {
   if (_db) return _db;
@@ -215,6 +215,29 @@ async function runMigrations(db: SQLite.SQLiteDatabase) {
           ALTER TABLE mcp_audit_log ADD COLUMN server_id INTEGER;
           CREATE INDEX IF NOT EXISTS idx_mcp_audit_server_id
             ON mcp_audit_log(server_id);
+        `);
+        break;
+      case 7:
+        // 1B.2b: cockpit auto-spawns the chroot MCP server on demand and
+        // syncs its tool registry. Three schema additions:
+        //   1. autospawn_enabled — opt-in switch (off by default; user
+        //      explicitly turns it on after they've verified the chroot
+        //      command works manually first).
+        //   2. autospawn_cmd — the full shell command the cockpit will
+        //      run via RootShell.executeStream when autospawn fires.
+        //      Default wraps with `nethunter -c "..."` so the python
+        //      server starts inside the chroot regardless of cockpit
+        //      exec_mode. User-editable for custom chroot wrappers.
+        //   3. mcp_tools.source — 'server' for entries upserted from the
+        //      server's /tools endpoint, 'local' for hand-added ones.
+        //      Lets us tell the user which tools came from where without
+        //      losing the existing built_in flag.
+        await db.execAsync(`
+          ALTER TABLE mcp_config ADD COLUMN autospawn_enabled INTEGER DEFAULT 0;
+          ALTER TABLE mcp_config ADD COLUMN autospawn_cmd TEXT
+            DEFAULT 'nethunter -c "cd /opt/enforcer-mcp && python3 server.py --config /etc/enforcer-mcp/config.yaml"';
+          ALTER TABLE mcp_tools ADD COLUMN source TEXT DEFAULT 'local';
+          ALTER TABLE mcp_tools ADD COLUMN last_synced_at TEXT;
         `);
         break;
       default:
@@ -717,13 +740,18 @@ export type MCPConfig = {
   server_enabled: boolean; port: number; bind_host: string;
   cockpit_probe_host: string;
   bearer_token: string; transport: "http_sse" | "stdio";
-  require_token: boolean; updated_at: string;
+  require_token: boolean;
+  autospawn_enabled: boolean;
+  autospawn_cmd: string;
+  updated_at: string;
 };
 export type MCPTool = {
   id: string; name: string; description: string;
   command_template: string; arg_schema_json: string;
   wrap_mode: "auto" | "kali" | "android" | "none";
   timeout_sec: number; enabled: boolean; built_in: boolean; created_at: string;
+  source?: "local" | "server";
+  last_synced_at?: string | null;
 };
 export type MCPAuditEntry = {
   id: string; ts: string; tool_name: string; args_json: string;
@@ -761,6 +789,8 @@ export const mcpLocal = {
       ...row,
       bearer_token: bearer || "",
       cockpit_probe_host: row.cockpit_probe_host || "127.0.0.1",
+      autospawn_enabled: !!row.autospawn_enabled,
+      autospawn_cmd: row.autospawn_cmd || 'nethunter -c "cd /opt/enforcer-mcp && python3 server.py --config /etc/enforcer-mcp/config.yaml"',
       server_enabled: !!row.server_enabled,
       require_token: !!row.require_token,
     };
@@ -777,7 +807,9 @@ export const mcpLocal = {
     }
     await db.runAsync(
       `UPDATE mcp_config SET server_enabled=?, port=?, bind_host=?, cockpit_probe_host=?,
-        bearer_token=?, transport=?, require_token=?, updated_at=? WHERE id = 1`,
+        bearer_token=?, transport=?, require_token=?,
+        autospawn_enabled=?, autospawn_cmd=?,
+        updated_at=? WHERE id = 1`,
       [
         merged.server_enabled ? 1 : 0,
         merged.port,
@@ -786,6 +818,8 @@ export const mcpLocal = {
         merged.bearer_token,
         merged.transport,
         merged.require_token ? 1 : 0,
+        merged.autospawn_enabled ? 1 : 0,
+        merged.autospawn_cmd,
         merged.updated_at,
       ],
     );
@@ -845,6 +879,69 @@ export const mcpLocal = {
     // Built-in tools can be disabled but not deleted — keeps the
     // restore-default path simple.
     await db.runAsync("DELETE FROM mcp_tools WHERE id = ? AND built_in = 0", [id]);
+  },
+
+  /**
+   * Bulk-upsert tool definitions pulled from the chroot server's
+   * GET /tools endpoint. Idempotent: keyed by `name` (which has a UNIQUE
+   * constraint), so re-running just refreshes descriptions / schemas /
+   * timeouts. Server-sourced tools get `source='server'` and `built_in=1`
+   * so they can't be accidentally deleted from the UI. Existing
+   * `enabled` flags are PRESERVED across syncs — disabling a tool in
+   * the cockpit shouldn't be undone by the next refresh.
+   *
+   * Returns counts so the UI can show "+3 new, 5 updated" feedback.
+   */
+  async syncToolsFromServer(serverTools: {
+    name: string; description?: string; command_template?: string;
+    arg_schema?: any; arg_schema_json?: string;
+    wrap_mode?: string; timeout_sec?: number;
+    internal?: boolean;
+  }[]): Promise<{ inserted: number; updated: number; total: number }> {
+    if (!Array.isArray(serverTools)) return { inserted: 0, updated: 0, total: 0 };
+    const db = await openLocalDb();
+    const ts = nowIso();
+    let inserted = 0;
+    let updated = 0;
+    for (const t of serverTools) {
+      if (!t || typeof t.name !== "string" || !t.name.trim()) continue;
+      const name = t.name.trim();
+      const schemaJson = t.arg_schema_json ?? JSON.stringify(t.arg_schema ?? {});
+      const cmd = t.command_template || "";
+      const desc = t.description || "";
+      const wrap = (t.wrap_mode as any) || "none";
+      const timeout = t.timeout_sec ?? 60;
+      const existing = await db.getFirstAsync<{ id: string; enabled: number }>(
+        "SELECT id, enabled FROM mcp_tools WHERE name = ?", [name],
+      );
+      if (existing) {
+        // Refresh definition. Preserve enabled flag (user's choice trumps server).
+        await db.runAsync(
+          `UPDATE mcp_tools
+             SET description=?, command_template=?, arg_schema_json=?,
+                 wrap_mode=?, timeout_sec=?, source='server',
+                 built_in=1, last_synced_at=?
+           WHERE id=?`,
+          [desc, cmd, schemaJson, wrap, timeout, ts, existing.id],
+        );
+        updated++;
+      } else {
+        await db.runAsync(
+          `INSERT INTO mcp_tools
+             (id, name, description, command_template, arg_schema_json,
+              wrap_mode, timeout_sec, enabled, built_in,
+              source, last_synced_at, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+          [uuid(), name, desc, cmd, schemaJson, wrap, timeout,
+           1, 1, "server", ts, ts],
+        );
+        inserted++;
+      }
+    }
+    const totalRow = await db.getFirstAsync<{ c: number }>(
+      "SELECT COUNT(*) as c FROM mcp_tools",
+    );
+    return { inserted, updated, total: totalRow?.c ?? 0 };
   },
 
   async listAudit(limit = 200): Promise<MCPAuditEntry[]> {
@@ -913,12 +1010,12 @@ export const mcpLocal = {
    * numeric `id` (server-side autoincrement) which we store as `server_id`
    * to dedupe across repeated polls. Returns count of NEWLY inserted rows.
    */
-  async syncAuditFromServer(events: Array<{
+  async syncAuditFromServer(events: {
     id: number; ts: string; tool_name: string;
     args?: any; args_json?: string;
     result_summary?: string; client_id?: string;
     duration_ms?: number; exit_code?: number; success?: boolean;
-  }>): Promise<number> {
+  }[]): Promise<number> {
     if (!events.length) return 0;
     const db = await openLocalDb();
     // Pre-fetch already-known server_ids to skip duplicates without
