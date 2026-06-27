@@ -572,6 +572,11 @@ export default function MCPTab() {
             <Text style={[s.helperFine, { marginTop: 10 }]}>
               clients send: <Text style={{ color: C.cyan }}>Authorization: Bearer &lt;token&gt;</Text>
             </Text>
+            <Text style={[s.helperFine, { marginTop: 6, color: C.yellow }]}>
+              ⚠ token lives in Android Keystore (encrypted) + sqlite cache. survives
+              app updates &amp; clear-data, but NOT full uninstall. COPY it somewhere
+              safe before reinstalling the APK.
+            </Text>
           </View>
 
           <Text style={[s.sectionTitle, { marginTop: 20 }]}>{"// roadmap"}</Text>

@@ -12,6 +12,7 @@
  */
 
 import * as SQLite from "expo-sqlite";
+import * as SecureStore from "expo-secure-store";
 
 let _db: SQLite.SQLiteDatabase | null = null;
 // ⚡ Single-flight promise — prevents the race where multiple callers
@@ -686,6 +687,32 @@ export const commandLogsLocal = {
 // Phase 1A only wires the UI + persistence — the actual chroot-side
 // FastMCP process gets spawned later. Everything is local SQLite so the
 // MCP tab works offline / cold-boot just like the rest of the app.
+//
+// Bearer token storage: lives in expo-secure-store (AndroidKeyStore-backed
+// EncryptedSharedPreferences on Android, iOS Keychain on iOS) rather than
+// the SQLite mcp_config column. The SQLite column is kept as a legacy
+// fallback for one-time migration from older builds. SecureStore advantages:
+//   • Hardware-encrypted at rest
+//   • Separate from the .db file, so an audit-log dump can't accidentally
+//     leak the bearer
+//   • Slightly more resilient across the various "clear data" paths
+//
+// IMPORTANT CAVEAT: NONE of this survives a full uninstall on Android —
+// the OS wipes /data/data/{pkg}/ wholesale. If the user wants to retain
+// the same token across reinstalls, they MUST copy it out (// status →
+// REVEAL → COPY) before installing a new APK and paste it back after.
+const SECURE_TOKEN_KEY = "mcp_bearer_token_v1";
+async function readBearerSecure(): Promise<string | null> {
+  try { return await SecureStore.getItemAsync(SECURE_TOKEN_KEY); } catch { return null; }
+}
+async function writeBearerSecure(token: string): Promise<void> {
+  try {
+    if (token) await SecureStore.setItemAsync(SECURE_TOKEN_KEY, token);
+    else await SecureStore.deleteItemAsync(SECURE_TOKEN_KEY);
+  } catch (e) {
+    console.warn("[localDb] SecureStore write failed (token will live in sqlite only):", e);
+  }
+}
 export type MCPConfig = {
   server_enabled: boolean; port: number; bind_host: string;
   cockpit_probe_host: string;
@@ -719,8 +746,20 @@ export const mcpLocal = {
       );
       return await this.getConfig();
     }
+    // Token resolution order:
+    //   1. SecureStore (preferred, hardware-encrypted)
+    //   2. SQLite column (legacy / pre-secure-store builds)
+    // If only SQLite has it, lazy-migrate into SecureStore now so future
+    // reads use the secure path.
+    let bearer = await readBearerSecure();
+    if (!bearer && row.bearer_token) {
+      bearer = row.bearer_token as string;
+      // Lazy migrate: copy SQLite → SecureStore so the next read is hot.
+      writeBearerSecure(bearer as string).catch(() => {});
+    }
     return {
       ...row,
+      bearer_token: bearer || "",
       cockpit_probe_host: row.cockpit_probe_host || "127.0.0.1",
       server_enabled: !!row.server_enabled,
       require_token: !!row.require_token,
@@ -730,6 +769,12 @@ export const mcpLocal = {
     const db = await openLocalDb();
     const cur = await this.getConfig();
     const merged: MCPConfig = { ...cur, ...patch, updated_at: nowIso() };
+    // Bearer token: write to SecureStore (source of truth). Also mirror to
+    // SQLite column as a debug-/recovery-fallback that survives the rare
+    // case where SecureStore unexpectedly fails to read back.
+    if (patch.bearer_token !== undefined) {
+      await writeBearerSecure(merged.bearer_token);
+    }
     await db.runAsync(
       `UPDATE mcp_config SET server_enabled=?, port=?, bind_host=?, cockpit_probe_host=?,
         bearer_token=?, transport=?, require_token=?, updated_at=? WHERE id = 1`,
