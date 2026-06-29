@@ -22,7 +22,7 @@ let _db: SQLite.SQLiteDatabase | null = null;
 // pre-migration → re-run the seed → insert 9 attack + 5 AI profiles AGAIN.
 // With 8 concurrent callers that produced 72 attack profiles. Fun.
 let _dbPromise: Promise<SQLite.SQLiteDatabase> | null = null;
-const TARGET_VERSION = 10;
+const TARGET_VERSION = 11;
 
 export async function openLocalDb(): Promise<SQLite.SQLiteDatabase> {
   if (_db) return _db;
@@ -318,6 +318,54 @@ async function runMigrations(db: SQLite.SQLiteDatabase) {
             SET autospawn_cmd = '/opt/enforcer-mcp/.venv/bin/python /opt/enforcer-mcp/server.py --config /etc/enforcer-mcp/config.yaml'
             WHERE autospawn_cmd = 'cd /opt/enforcer-mcp && python3 server.py --config /etc/enforcer-mcp/config.yaml'
                OR autospawn_cmd LIKE 'cd /opt/enforcer-mcp && python3 %';
+        `);
+        break;
+      case 11:
+        // Phase 2 — multi-node swarm. The .deb is built; now the cockpit
+        // needs to manage more than one MCP endpoint at a time. The local
+        // chroot stays in mcp_config (no behavioural change there) — this
+        // new table holds REMOTE nodes (VPS, Raspberry Pi, mini PCs over
+        // Tailscale). Each node has its own bearer token + host + port +
+        // tags + last-known health state.
+        //
+        // Design notes:
+        //   • bearer_token is mirrored to SecureStore under a key derived
+        //     from the node id (writeNodeBearerSecure / readNodeBearerSecure
+        //     below). The SQLite column is a fallback only.
+        //   • last_health_* fields are written by the per-node probe loop
+        //     in MCPTab. Snapshotting them in SQLite means the // nodes
+        //     view paints instantly on tab switch instead of waiting for
+        //     the first probe of every node.
+        //   • is_primary picks the node that the AI tab / Hermes loop will
+        //     default to when no explicit node is selected. Enforced via
+        //     setPrimary() (atomically clears the flag on all other rows).
+        //   • UNIQUE(host, port) prevents accidental duplicates; the user
+        //     would have to delete first to re-add.
+        await db.execAsync(`
+          CREATE TABLE IF NOT EXISTS mcp_nodes (
+            id              TEXT PRIMARY KEY,
+            name            TEXT NOT NULL,
+            host            TEXT NOT NULL,
+            port            INTEGER NOT NULL DEFAULT 8765,
+            bearer_token    TEXT DEFAULT '',
+            transport       TEXT NOT NULL DEFAULT 'http_sse',
+            enabled         INTEGER NOT NULL DEFAULT 1,
+            is_primary      INTEGER NOT NULL DEFAULT 0,
+            tags_json       TEXT NOT NULL DEFAULT '[]',
+            description     TEXT DEFAULT '',
+            last_seen_at    TEXT,
+            last_health_status TEXT,
+            last_health_info_json TEXT,
+            last_tool_sync_at TEXT,
+            last_tool_count INTEGER,
+            created_at      TEXT NOT NULL,
+            updated_at      TEXT NOT NULL,
+            UNIQUE (host, port)
+          );
+          CREATE INDEX IF NOT EXISTS idx_mcp_nodes_enabled
+            ON mcp_nodes(enabled);
+          CREATE INDEX IF NOT EXISTS idx_mcp_nodes_primary
+            ON mcp_nodes(is_primary);
         `);
         break;
       default:
@@ -1230,4 +1278,239 @@ export const mcpLocal = {
   },
 };
 
+// ─── Per-node bearer storage ─────────────────────────────────────────
+// Each remote node has its own bearer token (the .deb postinst generates
+// a fresh one per install). We mirror tokens to SecureStore keyed by
+// node id so they survive `clear-data` and aren't visible in plaintext
+// SQLite dumps. SQLite column is fallback only.
+const NODE_SECURE_PREFIX = "enforcer.mcp.node.bearer.";
+
+async function readNodeBearerSecure(nodeId: string): Promise<string | null> {
+  try { return await SecureStore.getItemAsync(NODE_SECURE_PREFIX + nodeId); }
+  catch { return null; }
+}
+async function writeNodeBearerSecure(nodeId: string, token: string): Promise<void> {
+  try {
+    if (token) await SecureStore.setItemAsync(NODE_SECURE_PREFIX + nodeId, token);
+    else await SecureStore.deleteItemAsync(NODE_SECURE_PREFIX + nodeId);
+  } catch { /* mirror-only; SQLite has the source of truth fallback */ }
+}
+
+// ─── Types ──────────────────────────────────────────────────────────
+export type MCPNode = {
+  id: string;
+  name: string;
+  host: string;
+  port: number;
+  bearer_token: string;
+  transport: "http_sse" | "stdio";
+  enabled: boolean;
+  is_primary: boolean;
+  tags: string[];
+  description: string;
+  last_seen_at: string | null;
+  last_health_status: string | null;
+  last_health_info: Record<string, unknown> | null;
+  last_tool_sync_at: string | null;
+  last_tool_count: number | null;
+  created_at: string;
+  updated_at: string;
+};
+
+type NodeRow = {
+  id: string; name: string; host: string; port: number;
+  bearer_token: string; transport: string;
+  enabled: number; is_primary: number;
+  tags_json: string; description: string;
+  last_seen_at: string | null;
+  last_health_status: string | null;
+  last_health_info_json: string | null;
+  last_tool_sync_at: string | null;
+  last_tool_count: number | null;
+  created_at: string; updated_at: string;
+};
+
+function rowToNode(row: NodeRow, bearerFromSecure?: string | null): MCPNode {
+  let tags: string[] = [];
+  try { tags = JSON.parse(row.tags_json || "[]"); }
+  catch { tags = []; }
+  let healthInfo: Record<string, unknown> | null = null;
+  if (row.last_health_info_json) {
+    try { healthInfo = JSON.parse(row.last_health_info_json); }
+    catch { healthInfo = null; }
+  }
+  return {
+    id: row.id,
+    name: row.name,
+    host: row.host,
+    port: row.port,
+    // SecureStore is the source of truth; fall back to SQLite column on miss.
+    bearer_token: bearerFromSecure ?? row.bearer_token ?? "",
+    transport: (row.transport as "http_sse" | "stdio") || "http_sse",
+    enabled: !!row.enabled,
+    is_primary: !!row.is_primary,
+    tags,
+    description: row.description || "",
+    last_seen_at: row.last_seen_at,
+    last_health_status: row.last_health_status,
+    last_health_info: healthInfo,
+    last_tool_sync_at: row.last_tool_sync_at,
+    last_tool_count: row.last_tool_count,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
+}
+
+// ─── nodesLocal — multi-node management ─────────────────────────────
+// Phase 2: each remote MCP endpoint (VPS, Pi, mini-PC swarm node) gets
+// its own row here. The cockpit's local chroot keeps using mcp_config
+// so existing UI continues to work unchanged.
+export const nodesLocal = {
+  async list(): Promise<MCPNode[]> {
+    const db = await openLocalDb();
+    const rows = await db.getAllAsync<NodeRow>(
+      `SELECT * FROM mcp_nodes ORDER BY is_primary DESC, created_at ASC`,
+    );
+    // Hydrate bearers from SecureStore in parallel (one round-trip each
+    // but they're tiny + run concurrently).
+    return Promise.all(rows.map(async (r) =>
+      rowToNode(r, await readNodeBearerSecure(r.id))));
+  },
+
+  async get(id: string): Promise<MCPNode | null> {
+    const db = await openLocalDb();
+    const row = await db.getFirstAsync<NodeRow>(
+      `SELECT * FROM mcp_nodes WHERE id = ?`, [id]);
+    if (!row) return null;
+    return rowToNode(row, await readNodeBearerSecure(id));
+  },
+
+  async create(input: {
+    name: string; host: string; port?: number;
+    bearer_token?: string; transport?: "http_sse" | "stdio";
+    enabled?: boolean; is_primary?: boolean;
+    tags?: string[]; description?: string;
+  }): Promise<MCPNode> {
+    const db = await openLocalDb();
+    const id = uuid();
+    const ts = nowIso();
+    const node: MCPNode = {
+      id, name: input.name.trim() || "node",
+      host: input.host.trim(),
+      port: input.port ?? 8765,
+      bearer_token: input.bearer_token || "",
+      transport: input.transport || "http_sse",
+      enabled: input.enabled ?? true,
+      is_primary: input.is_primary ?? false,
+      tags: input.tags || [],
+      description: input.description || "",
+      last_seen_at: null,
+      last_health_status: null,
+      last_health_info: null,
+      last_tool_sync_at: null,
+      last_tool_count: null,
+      created_at: ts, updated_at: ts,
+    };
+    // If this is the first node, force is_primary=true so something is
+    // always the default target.
+    const countRow = await db.getFirstAsync<{ c: number }>(
+      "SELECT COUNT(*) as c FROM mcp_nodes");
+    if ((countRow?.c ?? 0) === 0) node.is_primary = true;
+
+    await db.runAsync(
+      `INSERT INTO mcp_nodes
+        (id, name, host, port, bearer_token, transport, enabled, is_primary,
+         tags_json, description, created_at, updated_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [node.id, node.name, node.host, node.port, node.bearer_token,
+       node.transport, node.enabled ? 1 : 0, node.is_primary ? 1 : 0,
+       JSON.stringify(node.tags), node.description,
+       node.created_at, node.updated_at],
+    );
+    await writeNodeBearerSecure(id, node.bearer_token);
+    if (node.is_primary) await this.setPrimary(id);
+    return node;
+  },
+
+  async update(id: string, patch: Partial<MCPNode>): Promise<MCPNode> {
+    const cur = await this.get(id);
+    if (!cur) throw new Error(`unknown node: ${id}`);
+    const db = await openLocalDb();
+    const merged: MCPNode = { ...cur, ...patch, updated_at: nowIso() };
+    if (patch.bearer_token !== undefined) {
+      await writeNodeBearerSecure(id, merged.bearer_token);
+    }
+    await db.runAsync(
+      `UPDATE mcp_nodes SET
+         name=?, host=?, port=?, bearer_token=?, transport=?, enabled=?,
+         tags_json=?, description=?, updated_at=?
+       WHERE id=?`,
+      [merged.name, merged.host, merged.port, merged.bearer_token,
+       merged.transport, merged.enabled ? 1 : 0,
+       JSON.stringify(merged.tags), merged.description,
+       merged.updated_at, id],
+    );
+    // is_primary is managed via setPrimary() (atomic) — patch.is_primary
+    // here is intentionally ignored to avoid two-primary races.
+    return merged;
+  },
+
+  async setPrimary(id: string): Promise<void> {
+    const db = await openLocalDb();
+    await db.withTransactionAsync(async () => {
+      await db.runAsync(`UPDATE mcp_nodes SET is_primary = 0`);
+      await db.runAsync(`UPDATE mcp_nodes SET is_primary = 1 WHERE id = ?`, [id]);
+    });
+  },
+
+  async delete(id: string): Promise<void> {
+    const db = await openLocalDb();
+    await db.runAsync(`DELETE FROM mcp_nodes WHERE id = ?`, [id]);
+    await writeNodeBearerSecure(id, "");
+    // If we just deleted the primary, promote the oldest remaining row.
+    const remaining = await db.getFirstAsync<{ id: string }>(
+      `SELECT id FROM mcp_nodes WHERE is_primary = 1 LIMIT 1`);
+    if (!remaining) {
+      const first = await db.getFirstAsync<{ id: string }>(
+        `SELECT id FROM mcp_nodes ORDER BY created_at ASC LIMIT 1`);
+      if (first) await this.setPrimary(first.id);
+    }
+  },
+
+  /**
+   * Write a health-probe snapshot back to SQLite so the // nodes view
+   * paints instantly on tab switch instead of waiting for the first
+   * probe of every node.
+   *
+   * Status values mirror the existing MCPTab probe state machine:
+   *   "running" | "unreachable" | "error" | "unknown"
+   */
+  async updateHealth(id: string, snapshot: {
+    status: string;
+    info?: Record<string, unknown> | null;
+    tool_count?: number | null;
+  }): Promise<void> {
+    const db = await openLocalDb();
+    await db.runAsync(
+      `UPDATE mcp_nodes SET
+         last_seen_at = ?,
+         last_health_status = ?,
+         last_health_info_json = ?,
+         last_tool_count = COALESCE(?, last_tool_count),
+         updated_at = ?
+       WHERE id = ?`,
+      [nowIso(), snapshot.status,
+       snapshot.info ? JSON.stringify(snapshot.info) : null,
+       snapshot.tool_count ?? null,
+       nowIso(), id],
+    );
+  },
+
+  async markToolSync(id: string, toolCount: number): Promise<void> {
+    const db = await openLocalDb();
+    await db.runAsync(
+      `UPDATE mcp_nodes SET last_tool_sync_at = ?, last_tool_count = ?
+       WHERE id = ?`, [nowIso(), toolCount, id]);
+  },
+};
 export { kvGet, kvSet };

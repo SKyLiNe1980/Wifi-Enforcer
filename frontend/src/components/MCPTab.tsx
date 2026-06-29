@@ -22,8 +22,8 @@ import { MaterialCommunityIcons } from "@expo/vector-icons";
 import * as Clipboard from "expo-clipboard";
 import * as Crypto from "expo-crypto";
 import {
-  mcpLocal, settingsLocal,
-  type MCPConfig, type MCPTool, type MCPAuditEntry,
+  mcpLocal, settingsLocal, nodesLocal,
+  type MCPConfig, type MCPTool, type MCPAuditEntry, type MCPNode,
 } from "../lib/localDb";
 import { startStream, killStream, hasNativeStreaming, execReal, HAS_NATIVE_ROOT } from "../lib/rootShell";
 
@@ -56,13 +56,19 @@ function formatTs(iso: string): string {
   } catch { return iso; }
 }
 
-type SubTab = "status" | "tools" | "audit";
+type SubTab = "status" | "tools" | "nodes" | "audit";
 
 export default function MCPTab() {
   const [subTab, setSubTab] = useState<SubTab>("status");
   const [config, setConfig] = useState<MCPConfig | null>(null);
   const [tools, setTools] = useState<MCPTool[]>([]);
   const [audit, setAudit] = useState<MCPAuditEntry[]>([]);
+  const [nodes, setNodes] = useState<MCPNode[]>([]);
+  // Each node tracked separately so one slow VPS doesn't slow the others.
+  // Map<nodeId, "running"|"unreachable"|"error"|"probing"|"unknown">.
+  const [nodeHealth, setNodeHealth] = useState<Record<string, string>>({});
+  const [nodeToolCount, setNodeToolCount] = useState<Record<string, number>>({});
+  const [editingNode, setEditingNode] = useState<Partial<MCPNode> | null>(null);
   const [busy, setBusy] = useState(false);
   const [tokenVisible, setTokenVisible] = useState(false);
 
@@ -159,9 +165,14 @@ export default function MCPTab() {
   }, []);
 
   const refreshLists = useCallback(async () => {
-    const [t, a] = await Promise.all([mcpLocal.listTools(), mcpLocal.listAudit(200)]);
+    const [t, a, n] = await Promise.all([
+      mcpLocal.listTools(),
+      mcpLocal.listAudit(200),
+      nodesLocal.list(),
+    ]);
     setTools(t);
     setAudit(a);
+    setNodes(n);
   }, []);
 
   const refresh = useCallback(async () => {
@@ -537,6 +548,137 @@ export default function MCPTab() {
     await syncToolsNow(base, config.bearer_token, { silent: false });
   }, [config, syncToolsNow]);
 
+  // ─── Per-remote-node health probe ───────────────────────────────────
+  // Polls each enabled remote node's /health every 10s. Slower than the
+  // cockpit's own loopback probe (which can afford 5s loopback) because
+  // these are over Tailscale and we don't want to hammer a VPS. Runs all
+  // probes in parallel via Promise.allSettled so a 3.5s timeout on one
+  // dead node doesn't block the others. Snapshot results back to SQLite
+  // so the // nodes view paints instantly on tab switch.
+  const probeNode = useCallback(async (node: MCPNode) => {
+    if (!node.enabled) return;
+    setNodeHealth((p) => ({ ...p, [node.id]: "probing" }));
+    try {
+      const ctl = new AbortController();
+      const timer = setTimeout(() => ctl.abort(), 3500);
+      let r: Response;
+      try {
+        r = await fetch(`http://${node.host}:${node.port}/health`, {
+          signal: ctl.signal,
+        });
+      } finally {
+        clearTimeout(timer);
+      }
+      if (!r.ok) {
+        setNodeHealth((p) => ({ ...p, [node.id]: "error" }));
+        await nodesLocal.updateHealth(node.id, { status: "error" });
+        return;
+      }
+      const info = await r.json();
+      const toolCount = typeof info?.tools === "number" ? info.tools : null;
+      setNodeHealth((p) => ({ ...p, [node.id]: "running" }));
+      if (toolCount !== null) {
+        setNodeToolCount((p) => ({ ...p, [node.id]: toolCount }));
+      }
+      await nodesLocal.updateHealth(node.id, {
+        status: "running", info, tool_count: toolCount,
+      });
+    } catch (e: any) {
+      const msg = e?.message || String(e);
+      const isUnreachable = msg.includes("Network") || msg.includes("aborted") ||
+        msg.includes("Failed to fetch") || msg.includes("ECONNREFUSED") ||
+        msg.includes("connect");
+      const status = isUnreachable ? "unreachable" : "error";
+      setNodeHealth((p) => ({ ...p, [node.id]: status }));
+      await nodesLocal.updateHealth(node.id, { status });
+    }
+  }, []);
+
+  useEffect(() => {
+    if (nodes.length === 0) return;
+    let cancelled = false;
+    const probeAll = () => {
+      // Don't await — fire all in parallel; each settles independently.
+      Promise.allSettled(nodes.filter((n) => n.enabled).map(probeNode));
+    };
+    probeAll();
+    const t = setInterval(() => { if (!cancelled) probeAll(); }, 10_000);
+    return () => { cancelled = true; clearInterval(t); };
+  }, [nodes, probeNode]);
+
+  // ─── Node CRUD ──────────────────────────────────────────────────────
+  const handleSaveNode = useCallback(async () => {
+    if (!editingNode) return;
+    const name = (editingNode.name || "").trim();
+    const host = (editingNode.host || "").trim();
+    if (!name || !host) {
+      Alert.alert("Missing fields", "Node needs at least a name and a host.");
+      return;
+    }
+    try {
+      if (editingNode.id) {
+        await nodesLocal.update(editingNode.id, {
+          name, host, port: editingNode.port ?? 8765,
+          bearer_token: editingNode.bearer_token || "",
+          tags: editingNode.tags || [],
+          description: editingNode.description || "",
+          enabled: editingNode.enabled ?? true,
+        });
+      } else {
+        await nodesLocal.create({
+          name, host, port: editingNode.port ?? 8765,
+          bearer_token: editingNode.bearer_token || "",
+          tags: editingNode.tags || [],
+          description: editingNode.description || "",
+          enabled: editingNode.enabled ?? true,
+        });
+      }
+      setEditingNode(null);
+      refreshLists();
+    } catch (e: any) {
+      Alert.alert("Save failed",
+        (e?.message || "sqlite error") +
+        (String(e?.message || "").includes("UNIQUE") ?
+          "\n\nA node with this host:port already exists." : ""));
+    }
+  }, [editingNode, refreshLists]);
+
+  const handleDeleteNode = useCallback((node: MCPNode) => {
+    Alert.alert(
+      `Delete node "${node.name}"?`,
+      `Removes ${node.host}:${node.port} from the cockpit. The node itself keeps running.`,
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Delete", style: "destructive",
+          onPress: async () => {
+            await nodesLocal.delete(node.id);
+            refreshLists();
+          },
+        },
+      ],
+    );
+  }, [refreshLists]);
+
+  const handleSetPrimaryNode = useCallback(async (node: MCPNode) => {
+    await nodesLocal.setPrimary(node.id);
+    refreshLists();
+  }, [refreshLists]);
+
+  const handleResyncNodeTools = useCallback(async (node: MCPNode) => {
+    if (!node.bearer_token) {
+      Alert.alert("No bearer token", "Node needs a token before /tools can be fetched.");
+      return;
+    }
+    const base = `http://${node.host}:${node.port}`;
+    const res = await syncToolsNow(base, node.bearer_token, { silent: false });
+    if (res) {
+      await nodesLocal.markToolSync(node.id, res.total);
+      refreshLists();
+    }
+  }, [syncToolsNow, refreshLists]);
+
+
   // ─── Chroot YAML auto-import ────────────────────────────────────────
   // Shells out via RootShell.exec to read the chroot's config.yaml and
   // pulls bearer_token / port / bind_host into local SQLite. Solves the
@@ -754,7 +896,7 @@ export default function MCPTab() {
     <View style={s.container}>
       {/* SUB-TAB BAR */}
       <View style={s.subTabBar}>
-        {(["status", "tools", "audit"] as SubTab[]).map((st) => (
+        {(["status", "tools", "nodes", "audit"] as SubTab[]).map((st) => (
           <TouchableOpacity
             key={st}
             onPress={() => setSubTab(st)}
@@ -762,7 +904,10 @@ export default function MCPTab() {
             activeOpacity={0.7}
           >
             <Text style={[s.subTabText, subTab === st && { color: C.mcpAccent }]}>
-              {st === "status" ? "// status" : st === "tools" ? `// tools (${tools.length})` : `// audit (${audit.length})`}
+              {st === "status" ? "// status"
+                : st === "tools" ? `// tools (${tools.length})`
+                : st === "nodes" ? `// nodes (${nodes.length})`
+                : `// audit (${audit.length})`}
             </Text>
           </TouchableOpacity>
         ))}
@@ -1264,6 +1409,143 @@ export default function MCPTab() {
         </ScrollView>
       )}
 
+      {/* NODES PANE */}
+      {subTab === "nodes" && (
+        <ScrollView contentContainerStyle={{ padding: 14, paddingBottom: 90 }}>
+          <View style={[s.row, { justifyContent: "space-between", marginBottom: 12 }]}>
+            <Text style={s.sectionTitle}>{"// swarm nodes"}</Text>
+            <TouchableOpacity
+              style={[s.btn, { backgroundColor: C.panel2, borderColor: C.mcpAccent }]}
+              onPress={() => setEditingNode({
+                name: "", host: "", port: 8765, bearer_token: "",
+                tags: [], description: "", enabled: true,
+              })}
+            >
+              <MaterialCommunityIcons name="plus" size={14} color={C.mcpAccent} />
+              <Text style={[s.btnText, { color: C.mcpAccent }]}>ADD NODE</Text>
+            </TouchableOpacity>
+          </View>
+
+          {nodes.length === 0 ? (
+            <View style={s.card}>
+              <Text style={s.helper}>
+                No remote nodes yet. Deploy the{" "}
+                <Text style={{ color: C.cyan }}>enforcer-mcp_*.deb</Text> on a
+                Pi / VPS / mini-PC, grab the bearer token from its postinst
+                output, and tap{" "}
+                <Text style={{ color: C.mcpAccent }}>[+ ADD NODE]</Text> above.
+              </Text>
+              <Text style={[s.helperFine, { marginTop: 8 }]}>
+                The cockpit&apos;s own chroot MCP server stays managed under{" "}
+                <Text style={{ color: C.cyan }}>{"// status"}</Text>.
+              </Text>
+            </View>
+          ) : (
+            nodes.map((n) => {
+              const health = nodeHealth[n.id] || n.last_health_status || "unknown";
+              const toolCount = nodeToolCount[n.id] ?? n.last_tool_count;
+              const dotColor =
+                health === "running" ? C.green :
+                health === "probing" ? C.yellow :
+                health === "unreachable" ? C.textDim :
+                C.red;
+              return (
+                <View key={n.id} style={[s.card, { marginBottom: 10 }]}>
+                  <View style={[s.row, { justifyContent: "space-between" }]}>
+                    <View style={[s.row, { flexShrink: 1, flex: 1, paddingRight: 8 }]}>
+                      <View style={{
+                        width: 8, height: 8, borderRadius: 4,
+                        backgroundColor: dotColor, marginRight: 8,
+                      }} />
+                      <Text style={[s.toolName, { color: n.enabled ? C.mcpAccent : C.textDim }]}>
+                        {n.name}
+                      </Text>
+                      {n.is_primary && (
+                        <View style={[s.tag, { borderColor: C.yellow, marginLeft: 6 }]}>
+                          <Text style={[s.tagText, { color: C.yellow }]}>PRIMARY</Text>
+                        </View>
+                      )}
+                    </View>
+                    <Switch
+                      value={n.enabled}
+                      onValueChange={async (v) => {
+                        await nodesLocal.update(n.id, { enabled: v });
+                        refreshLists();
+                      }}
+                      trackColor={{ false: C.border, true: C.greenDim }}
+                      thumbColor={n.enabled ? C.green : C.textDim}
+                    />
+                  </View>
+
+                  <Text style={[s.helperFine, { marginTop: 6 }]}>
+                    <Text style={{ color: C.cyan }}>http://{n.host}:{n.port}</Text>
+                    {"  ·  "}
+                    <Text style={{ color: dotColor }}>{health.toUpperCase()}</Text>
+                    {toolCount !== null && toolCount !== undefined ? (
+                      <Text style={{ color: C.textDim }}>{`  ·  ${toolCount} tools`}</Text>
+                    ) : null}
+                  </Text>
+
+                  {n.description ? (
+                    <Text style={[s.helperFine, { marginTop: 4, color: C.textDim }]}>
+                      {n.description}
+                    </Text>
+                  ) : null}
+
+                  {n.tags.length > 0 && (
+                    <View style={[s.row, { marginTop: 6, flexWrap: "wrap", gap: 4 }]}>
+                      {n.tags.map((tag) => (
+                        <View key={tag} style={[s.tag, { borderColor: C.textDim }]}>
+                          <Text style={[s.tagText, { color: C.textDim }]}>{tag}</Text>
+                        </View>
+                      ))}
+                    </View>
+                  )}
+
+                  <View style={[s.row, { marginTop: 10, gap: 6, flexWrap: "wrap" }]}>
+                    {!n.is_primary && (
+                      <TouchableOpacity
+                        style={[s.smallBtn, { borderColor: C.yellow }]}
+                        onPress={() => handleSetPrimaryNode(n)}
+                      >
+                        <Text style={[s.smallBtnText, { color: C.yellow }]}>SET PRIMARY</Text>
+                      </TouchableOpacity>
+                    )}
+                    <TouchableOpacity
+                      style={[s.smallBtn, { borderColor: C.cyan }]}
+                      onPress={() => handleResyncNodeTools(n)}
+                      disabled={!n.bearer_token || health !== "running"}
+                    >
+                      <Text style={[s.smallBtnText, {
+                        color: (!n.bearer_token || health !== "running") ? C.textDim : C.cyan,
+                      }]}>SYNC TOOLS</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      style={[s.smallBtn, { borderColor: C.mcpAccent }]}
+                      onPress={() => setEditingNode({ ...n })}
+                    >
+                      <Text style={[s.smallBtnText, { color: C.mcpAccent }]}>EDIT</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      style={[s.smallBtn, { borderColor: C.red }]}
+                      onPress={() => handleDeleteNode(n)}
+                    >
+                      <Text style={[s.smallBtnText, { color: C.red }]}>DELETE</Text>
+                    </TouchableOpacity>
+                  </View>
+                </View>
+              );
+            })
+          )}
+
+          <Text style={[s.helperFine, { marginTop: 12, color: C.textDim }]}>
+            Probe interval: 10 s · Add each node&apos;s public Tailscale IP +
+            port + bearer (printed by postinst). The cockpit caches health
+            state in SQLite so this list paints instantly on tab switch.
+          </Text>
+        </ScrollView>
+      )}
+
       {/* AUDIT PANE */}
       {subTab === "audit" && (
         <ScrollView contentContainerStyle={{ padding: 14, paddingBottom: 90 }}>
@@ -1415,6 +1697,124 @@ export default function MCPTab() {
                 >
                   <MaterialCommunityIcons name="content-save" size={14} color={C.bg} />
                   <Text style={[s.btnText, { color: C.bg }]}>SAVE</Text>
+                </TouchableOpacity>
+              </View>
+            </ScrollView>
+          </View>
+        </View>
+      )}
+
+      {/* NODE EDIT MODAL */}
+      {editingNode && (
+        <View style={s.overlay} pointerEvents="auto">
+          <View style={s.sheet}>
+            <View style={s.sheetHeader}>
+              <Text style={s.sheetTitle}>
+                {`// ${editingNode.id ? "edit node" : "new node"}`}
+              </Text>
+              <TouchableOpacity onPress={() => setEditingNode(null)}>
+                <MaterialCommunityIcons name="close" size={22} color={C.green} />
+              </TouchableOpacity>
+            </View>
+            <ScrollView contentContainerStyle={{ paddingBottom: 20 }}>
+              <Text style={s.kvLabel}>name *</Text>
+              <TextInput
+                style={s.input}
+                value={editingNode.name || ""}
+                onChangeText={(v) => setEditingNode((p) => p ? { ...p, name: v } : p)}
+                placeholder="vps-1, pi-bedroom, etc."
+                placeholderTextColor={C.textDim}
+                autoCapitalize="none"
+                autoCorrect={false}
+              />
+
+              <Text style={[s.kvLabel, { marginTop: 12 }]}>host * (tailscale IP or hostname)</Text>
+              <TextInput
+                style={[s.input, { fontFamily: MONO }]}
+                value={editingNode.host || ""}
+                onChangeText={(v) => setEditingNode((p) => p ? { ...p, host: v.trim() } : p)}
+                placeholder="100.x.y.z or vps-1.tailnet.ts.net"
+                placeholderTextColor={C.textDim}
+                autoCapitalize="none"
+                autoCorrect={false}
+                keyboardType="url"
+              />
+
+              <Text style={[s.kvLabel, { marginTop: 12 }]}>port</Text>
+              <TextInput
+                style={[s.input, { fontFamily: MONO }]}
+                value={String(editingNode.port ?? 8765)}
+                onChangeText={(v) => {
+                  const n = parseInt(v.replace(/[^\d]/g, ""), 10);
+                  setEditingNode((p) => p ? {
+                    ...p, port: isNaN(n) ? 8765 : Math.min(65535, Math.max(1, n)),
+                  } : p);
+                }}
+                keyboardType="number-pad"
+                placeholder="8765"
+                placeholderTextColor={C.textDim}
+              />
+
+              <Text style={[s.kvLabel, { marginTop: 12 }]}>bearer token (from postinst)</Text>
+              <View style={s.row}>
+                <TextInput
+                  style={[s.input, { flex: 1, fontFamily: MONO, fontSize: 11 }]}
+                  value={editingNode.bearer_token || ""}
+                  onChangeText={(v) => setEditingNode((p) => p ? { ...p, bearer_token: v.trim() } : p)}
+                  placeholder="64-hex-char token"
+                  placeholderTextColor={C.textDim}
+                  autoCapitalize="none"
+                  autoCorrect={false}
+                  secureTextEntry={false}
+                />
+                <TouchableOpacity
+                  style={[s.smallBtn, { marginLeft: 6, borderColor: C.cyan }]}
+                  onPress={async () => {
+                    const t = (await Clipboard.getStringAsync()).trim();
+                    if (t) setEditingNode((p) => p ? { ...p, bearer_token: t } : p);
+                  }}
+                >
+                  <Text style={[s.smallBtnText, { color: C.cyan }]}>PASTE</Text>
+                </TouchableOpacity>
+              </View>
+
+              <Text style={[s.kvLabel, { marginTop: 12 }]}>tags (comma-separated)</Text>
+              <TextInput
+                style={s.input}
+                value={(editingNode.tags || []).join(", ")}
+                onChangeText={(v) => setEditingNode((p) => p ? {
+                  ...p,
+                  tags: v.split(",").map((s) => s.trim()).filter(Boolean),
+                } : p)}
+                placeholder="vps, amd64, public-cloud"
+                placeholderTextColor={C.textDim}
+                autoCapitalize="none"
+                autoCorrect={false}
+              />
+
+              <Text style={[s.kvLabel, { marginTop: 12 }]}>description</Text>
+              <TextInput
+                style={[s.input, { minHeight: 50 }]}
+                value={editingNode.description || ""}
+                onChangeText={(v) => setEditingNode((p) => p ? { ...p, description: v } : p)}
+                placeholder="optional — what's this node for?"
+                placeholderTextColor={C.textDim}
+                multiline
+              />
+
+              <View style={[s.row, { marginTop: 16, justifyContent: "space-between" }]}>
+                <TouchableOpacity
+                  style={[s.btn, { backgroundColor: C.panel2, borderColor: C.textDim, flex: 1, marginRight: 6 }]}
+                  onPress={() => setEditingNode(null)}
+                >
+                  <Text style={[s.btnText, { color: C.textDim }]}>CANCEL</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[s.btn, { backgroundColor: C.panel2, borderColor: C.mcpAccent, flex: 1, marginLeft: 6 }]}
+                  onPress={handleSaveNode}
+                >
+                  <MaterialCommunityIcons name="check" size={14} color={C.mcpAccent} />
+                  <Text style={[s.btnText, { color: C.mcpAccent }]}>SAVE</Text>
                 </TouchableOpacity>
               </View>
             </ScrollView>
