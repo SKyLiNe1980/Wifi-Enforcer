@@ -522,8 +522,30 @@ def main(argv: Optional[List[str]] = None) -> int:
     host = server_cfg.get("host", "127.0.0.1")
     port = int(server_cfg.get("port", 8765))
 
-    # Audit DB lives next to the config (writable by the enforcer user).
-    db_path = os.path.join(os.path.dirname(os.path.abspath(args.config)), "audit.db")
+    # Audit DB path resolution, in priority order:
+    #   1. Explicit `audit.db_path` (top-level YAML block — cleanest schema).
+    #   2. Explicit `server.db_path` (lazy-edit-friendly; matches the
+    #      flat-server layout in config.yaml.example where audit_max_entries
+    #      and allowed_origins also live under server:).
+    #   3. ENFORCER_MCP_DB_PATH env var (handy for one-shot overrides).
+    #   4. Next-to-config fallback — works for the original chroot install
+    #      where /etc/enforcer-mcp/ is writable by the running user.
+    #
+    # This matters because systemd's ProtectSystem=full makes /etc/
+    # read-only inside the service's mount namespace, which would crash
+    # the default fallback on a .deb install.
+    audit_cfg = cfg.get("audit", {}) or {}
+    db_path = (
+        audit_cfg.get("db_path")
+        or server_cfg.get("db_path")
+        or os.environ.get("ENFORCER_MCP_DB_PATH")
+        or os.path.join(os.path.dirname(os.path.abspath(args.config)),
+                        "audit.db")
+    )
+    # Make sure the parent dir exists — postinst handles this for the
+    # state dir on .deb installs, but defending the chroot path too is
+    # cheap insurance.
+    os.makedirs(os.path.dirname(db_path), exist_ok=True)
     conn = init_audit_db(db_path)
     log("info", "audit.db.opened", path=db_path)
 
