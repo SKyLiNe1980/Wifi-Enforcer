@@ -22,7 +22,7 @@ let _db: SQLite.SQLiteDatabase | null = null;
 // pre-migration → re-run the seed → insert 9 attack + 5 AI profiles AGAIN.
 // With 8 concurrent callers that produced 72 attack profiles. Fun.
 let _dbPromise: Promise<SQLite.SQLiteDatabase> | null = null;
-const TARGET_VERSION = 9;
+const TARGET_VERSION = 10;
 
 export async function openLocalDb(): Promise<SQLite.SQLiteDatabase> {
   if (_db) return _db;
@@ -235,7 +235,7 @@ async function runMigrations(db: SQLite.SQLiteDatabase) {
         await db.execAsync(`
           ALTER TABLE mcp_config ADD COLUMN autospawn_enabled INTEGER DEFAULT 0;
           ALTER TABLE mcp_config ADD COLUMN autospawn_cmd TEXT
-            DEFAULT 'cd /opt/enforcer-mcp && python3 server.py --config /etc/enforcer-mcp/config.yaml';
+            DEFAULT '/opt/enforcer-mcp/.venv/bin/python /opt/enforcer-mcp/server.py --config /etc/enforcer-mcp/config.yaml';
           ALTER TABLE mcp_tools ADD COLUMN source TEXT DEFAULT 'local';
           ALTER TABLE mcp_tools ADD COLUMN last_synced_at TEXT;
         `);
@@ -292,6 +292,32 @@ async function runMigrations(db: SQLite.SQLiteDatabase) {
           UPDATE mcp_config
             SET autospawn_cmd = 'cd /opt/enforcer-mcp && python3 server.py --config /etc/enforcer-mcp/config.yaml'
             WHERE autospawn_cmd LIKE 'nethunter -c %';
+        `);
+        break;
+      case 10:
+        // venv-aware autospawn. The previous default used `python3`
+        // which resolves to the chroot's system Python — but our
+        // dependencies (fastmcp, fastapi, uvicorn, jsonschema, yaml)
+        // live inside the project venv at /opt/enforcer-mcp/.venv per
+        // the README. Calling system python3 → instant
+        // ModuleNotFoundError before the server even gets to argparse.
+        //
+        // Fix: call .venv/bin/python directly. Skips the `source
+        // .venv/bin/activate` dance entirely (which is brittle in
+        // non-interactive bash anyway) and gets the right interpreter
+        // + sys.path in one shot. PATH inside the chroot is already
+        // set by the sudo -E wrapper so other tools (airodump-ng etc.)
+        // remain reachable.
+        //
+        // We only rewrite rows that still match the previous broken
+        // default, so a user who manually adapted their autospawn_cmd
+        // (e.g. to use a different venv, or no venv at all) is left
+        // alone.
+        await db.execAsync(`
+          UPDATE mcp_config
+            SET autospawn_cmd = '/opt/enforcer-mcp/.venv/bin/python /opt/enforcer-mcp/server.py --config /etc/enforcer-mcp/config.yaml'
+            WHERE autospawn_cmd = 'cd /opt/enforcer-mcp && python3 server.py --config /etc/enforcer-mcp/config.yaml'
+               OR autospawn_cmd LIKE 'cd /opt/enforcer-mcp && python3 %';
         `);
         break;
       default:
@@ -847,7 +873,7 @@ export const mcpLocal = {
       bearer_token: bearer || "",
       cockpit_probe_host: row.cockpit_probe_host || "127.0.0.1",
       autospawn_enabled: !!row.autospawn_enabled,
-      autospawn_cmd: row.autospawn_cmd || 'cd /opt/enforcer-mcp && python3 server.py --config /etc/enforcer-mcp/config.yaml',
+      autospawn_cmd: row.autospawn_cmd || '/opt/enforcer-mcp/.venv/bin/python /opt/enforcer-mcp/server.py --config /etc/enforcer-mcp/config.yaml',
       chroot_yaml_cmd: row.chroot_yaml_cmd || 'cat /etc/enforcer-mcp/config.yaml',
       chroot_autosync_enabled: !!row.chroot_autosync_enabled,
       last_chroot_sync_at: row.last_chroot_sync_at || null,
