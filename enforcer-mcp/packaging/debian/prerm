@@ -1,0 +1,15 @@
+#!/bin/sh
+# enforcer-mcp prerm — stop the service before files get yanked.
+set -e
+
+case "$1" in
+    remove|upgrade|deconfigure)
+        if [ -d /run/systemd/system ]; then
+            systemctl stop enforcer-mcp.service >/dev/null 2>&1 || true
+        fi
+        ;;
+    failed-upgrade)
+        ;;
+esac
+
+exit 0

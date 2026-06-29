@@ -1,0 +1,112 @@
+#!/bin/sh
+# enforcer-mcp postinst — runs after files are unpacked into the filesystem.
+# Responsibilities, in order:
+#   1. Create the `enforcer` system user/group (idempotent — adduser sees the
+#      account if it exists and does nothing).
+#   2. Lay down /var/lib/enforcer-mcp (audit DB + state) and chown to enforcer.
+#   3. Generate a fresh bearer token + write /etc/enforcer-mcp/config.yaml
+#      ONLY on first install. Upgrades preserve the existing token and any
+#      operator edits — that's the whole point of conffiles + this guard.
+#   4. Build the Python virtualenv at /opt/enforcer-mcp/.venv and pip-install
+#      requirements.txt. Done here (not at build time) because we can't ship
+#      arch-specific wheels in an arch-independent .deb without bloating it
+#      to multi-hundred-MB. Online install on first boot is the trade-off.
+#   5. systemd enable + start.
+#
+# Re-run safety: every step is idempotent. `apt install --reinstall` works.
+set -e
+
+USER_NAME=enforcer
+GROUP_NAME=enforcer
+INSTALL_DIR=/opt/enforcer-mcp
+CONFIG_DIR=/etc/enforcer-mcp
+STATE_DIR=/var/lib/enforcer-mcp
+CONFIG_FILE="$CONFIG_DIR/config.yaml"
+VENV_DIR="$INSTALL_DIR/.venv"
+
+case "$1" in
+    configure)
+        # ── 1. system user ──────────────────────────────────────────────
+        if ! getent group "$GROUP_NAME" >/dev/null; then
+            addgroup --system "$GROUP_NAME"
+        fi
+        if ! getent passwd "$USER_NAME" >/dev/null; then
+            adduser --system --ingroup "$GROUP_NAME" \
+                    --home "$STATE_DIR" --shell /usr/sbin/nologin \
+                    --gecos "Enforcer MCP swarm node" \
+                    "$USER_NAME"
+        fi
+
+        # ── 2. state directory ──────────────────────────────────────────
+        mkdir -p "$STATE_DIR"
+        chown -R "$USER_NAME:$GROUP_NAME" "$STATE_DIR"
+        chmod 0750 "$STATE_DIR"
+
+        # ── 3. config (first install only) ──────────────────────────────
+        mkdir -p "$CONFIG_DIR"
+        if [ ! -f "$CONFIG_FILE" ]; then
+            # Fresh install: generate a bearer token and write a minimal
+            # config from the bundled template. We use python3 because
+            # secrets.token_hex is the canonical safe source and openssl
+            # may not be installed on minimal arm images.
+            TOKEN=$(python3 -c 'import secrets; print(secrets.token_hex(32))')
+            sed "s/REPLACE_WITH_64_HEX_CHARS_FROM_COCKPIT_MCP_TAB/$TOKEN/" \
+                "$INSTALL_DIR/config.yaml.example" > "$CONFIG_FILE"
+            chown root:"$GROUP_NAME" "$CONFIG_FILE"
+            chmod 0640 "$CONFIG_FILE"
+            echo "enforcer-mcp: generated fresh bearer token in $CONFIG_FILE"
+            echo "enforcer-mcp:   bearer_token_hex: $TOKEN"
+            echo "enforcer-mcp: paste this into the cockpit's // mcp tab."
+        else
+            # Upgrade path: make sure group ownership is still right (dpkg
+            # may have created the file via conffiles handling).
+            chown root:"$GROUP_NAME" "$CONFIG_FILE" || true
+            chmod 0640 "$CONFIG_FILE" || true
+            echo "enforcer-mcp: existing config preserved at $CONFIG_FILE"
+        fi
+
+        # ── 4. virtualenv + pip deps ────────────────────────────────────
+        # We build the venv as the enforcer user so all the cached .pyc
+        # files end up owned correctly. If pip fails (offline node),
+        # surface it loudly but don't fail the install — operator can
+        # re-run with `dpkg-reconfigure enforcer-mcp` or just manually.
+        if [ ! -x "$VENV_DIR/bin/python" ]; then
+            echo "enforcer-mcp: creating virtualenv at $VENV_DIR ..."
+            python3 -m venv "$VENV_DIR"
+        fi
+        chown -R "$USER_NAME:$GROUP_NAME" "$VENV_DIR"
+
+        if [ -f "$INSTALL_DIR/requirements.txt" ]; then
+            echo "enforcer-mcp: installing python deps (this needs internet)..."
+            if ! su -s /bin/sh "$USER_NAME" -c \
+                "$VENV_DIR/bin/pip install --quiet --upgrade pip && \
+                 $VENV_DIR/bin/pip install --quiet -r $INSTALL_DIR/requirements.txt"
+            then
+                echo "enforcer-mcp: WARNING — pip install failed."
+                echo "enforcer-mcp:   The service will not start until you run:"
+                echo "enforcer-mcp:     sudo -u $USER_NAME $VENV_DIR/bin/pip install -r $INSTALL_DIR/requirements.txt"
+            fi
+        fi
+
+        # ── 5. systemd reload + enable + start ─────────────────────────
+        if [ -d /run/systemd/system ]; then
+            systemctl daemon-reload || true
+            systemctl enable enforcer-mcp.service >/dev/null 2>&1 || true
+            # Only auto-start on FRESH installs. Upgrade keeps the old
+            # state (already-running stays running, already-stopped stays
+            # stopped). The `try-restart` after deb-systemd would handle
+            # the actually-running case but we want zero surprise on
+            # upgrade so we skip it.
+            if [ -z "$2" ]; then
+                systemctl start enforcer-mcp.service || true
+            else
+                systemctl try-restart enforcer-mcp.service || true
+            fi
+        fi
+        ;;
+
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+esac
+
+exit 0

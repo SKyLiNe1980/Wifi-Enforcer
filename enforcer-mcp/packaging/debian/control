@@ -1,0 +1,21 @@
+Package: enforcer-mcp
+Section: net
+Priority: optional
+Architecture: all
+Maintainer: enforcer-swarm <enforcer@localhost>
+Depends: python3 (>= 3.11), python3-venv, python3-pip, adduser, systemd, ca-certificates
+Recommends: aircrack-ng, iw, wireless-tools
+Description: Enforcer MCP server for distributed wireless pentesting swarms
+ The enforcer-mcp service exposes a Model Context Protocol (MCP) endpoint
+ over HTTP+SSE so autonomous LLM agents (Hermes, Claude, etc.) can drive
+ offensive wireless tools — airodump-ng, wifite, aireplay-ng — across a
+ mesh of swarm nodes.
+ .
+ Designed to run on small ARM/x86 nodes (Raspberry Pi, mini PCs, spare
+ laptops) connected via Tailscale to a central cockpit (the enforcer
+ Android app). Each node advertises its tool registry and audit log
+ over its own bearer-token-secured MCP transport.
+ .
+ Features include real PTY-backed sessions for interactive curses tools,
+ a bounded SQLite audit log, and a YAML-driven tool registry that can
+ be live-synced from the cockpit.
