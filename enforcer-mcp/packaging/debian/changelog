@@ -1,0 +1,10 @@
+enforcer-mcp (0.1.0) unstable; urgency=medium
+
+  * Initial swarm-node release.
+  * MCP server (FastMCP / Streamable HTTP) with bearer-token auth.
+  * 16 tools out of the box: exec_command, list_ifaces, set_monitor_mode,
+    set_channel, wpasec_*, 6 PTY-backed session ops, internal audit reader.
+  * systemd-managed, runs as the `enforcer` user.
+  * Bearer token + audit DB persist across upgrades; never auto-overwritten.
+
+ -- enforcer-swarm <enforcer@localhost>  Sun, 29 Jun 2026 18:30:00 +0000

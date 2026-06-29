@@ -1,15 +1,46 @@
 # enforcer-mcp — Phase 1B server
 
 Streamable-HTTP Model Context Protocol server for the Enforcer cockpit.
-Runs in the Kali NetHunter chroot on the cockpit phone (and, later, on
-arm64 swarm nodes via the `enforcer-node` .deb).
+Runs in the Kali NetHunter chroot on the cockpit phone, on the cockpit
+itself via autospawn, and on arm64/amd64 **swarm nodes** via the
+`enforcer-mcp` .deb (this repo, `packaging/build-deb.sh`).
 
 Exposes the cockpit's root primitives (shell exec, iface mgmt, attack
 profiles, PTY sessions) as MCP tools that LLM agents can drive.
 
 ---
 
-## Quick install (inside Kali chroot)
+## Install option A: .deb (swarm nodes, headless boxes)
+
+```bash
+./packaging/build-deb.sh
+# → dist/enforcer-mcp_0.1.0_all.deb (~30 KB)
+
+scp dist/enforcer-mcp_*.deb node:/tmp/
+ssh node 'sudo apt install /tmp/enforcer-mcp_*.deb'
+```
+
+On first install the postinst:
+1. Creates the `enforcer` system user (no shell, home is `/var/lib/enforcer-mcp`)
+2. Generates a fresh `bearer_token_hex` — printed to stdout AND saved to `/etc/enforcer-mcp/config.yaml`
+3. Builds the venv at `/opt/enforcer-mcp/.venv` and pip-installs `requirements.txt` (needs internet)
+4. Enables + starts `enforcer-mcp.service` via systemd
+
+Verify:
+```bash
+sudo systemctl status enforcer-mcp
+sudo journalctl -u enforcer-mcp -f
+curl http://localhost:8765/health
+```
+
+`apt install --reinstall` is safe. `apt remove` keeps your config + audit
+DB. `apt purge` nukes everything including the system user.
+
+Helper scripts (`wpasec-upload`, `capcheck`) ship as symlinks in `/usr/bin`
+so they're in `$PATH` for both the `enforcer` user and anyone else on the
+box.
+
+## Install option B: manual (inside Kali chroot)
 
 ```bash
 # Pre-reqs: python3 ≥ 3.11, sudo

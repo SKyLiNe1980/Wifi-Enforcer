@@ -1,0 +1,54 @@
+[Unit]
+Description=Enforcer MCP swarm node — wireless pentesting MCP server
+Documentation=file:///opt/enforcer-mcp/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=enforcer
+Group=enforcer
+
+# venv-direct Python invocation — same pattern as the cockpit's autospawn.
+# Skips `source .venv/bin/activate` (brittle in non-interactive shells) and
+# gets the right interpreter + sys.path in one shot.
+ExecStart=/opt/enforcer-mcp/.venv/bin/python /opt/enforcer-mcp/server.py \
+          --config /etc/enforcer-mcp/config.yaml
+
+# Working directory = state dir. audit.db lands here next to the user's
+# home — keeps the read-only /opt tree clean.
+WorkingDirectory=/var/lib/enforcer-mcp
+
+# CAP_NET_RAW so downstream tools (airodump-ng, aireplay-ng, tcpdump) that
+# this server may eventually spawn via exec_command can open raw sockets
+# without needing the operator to chmod +s every binary in the chroot.
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+
+# Hardening — reasonable defaults for a service that pokes at network gear
+# but shouldn't be writing all over the system.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/lib/enforcer-mcp /opt/enforcer-mcp/.venv
+ProtectKernelTunables=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+
+# Long-running daemon — auto-restart on crash, with a small back-off so a
+# crash-loop doesn't pin the CPU.
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=10s
+
+# Send everything to journald with a clear identifier so `journalctl -u
+# enforcer-mcp` shows just our lines.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=enforcer-mcp
+
+[Install]
+WantedBy=multi-user.target

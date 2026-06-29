@@ -1,0 +1,38 @@
+#!/bin/sh
+# enforcer-mcp postrm — clean up systemd unit hooks on remove; purge state
+# (venv, audit DB, config) only on `dpkg --purge`.
+set -e
+
+USER_NAME=enforcer
+GROUP_NAME=enforcer
+INSTALL_DIR=/opt/enforcer-mcp
+CONFIG_DIR=/etc/enforcer-mcp
+STATE_DIR=/var/lib/enforcer-mcp
+
+case "$1" in
+    remove)
+        if [ -d /run/systemd/system ]; then
+            systemctl --no-reload disable enforcer-mcp.service >/dev/null 2>&1 || true
+            systemctl daemon-reload || true
+        fi
+        # Keep config, venv, state — operator can `apt purge` to wipe them.
+        ;;
+
+    purge)
+        # Nuclear: wipe the venv, state dir, generated config, and the user.
+        rm -rf "$INSTALL_DIR/.venv" || true
+        rm -rf "$STATE_DIR" || true
+        rm -rf "$CONFIG_DIR" || true
+        if getent passwd "$USER_NAME" >/dev/null; then
+            deluser --quiet --system "$USER_NAME" >/dev/null 2>&1 || true
+        fi
+        if getent group "$GROUP_NAME" >/dev/null; then
+            delgroup --quiet --system "$GROUP_NAME" >/dev/null 2>&1 || true
+        fi
+        ;;
+
+    upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+        ;;
+esac
+
+exit 0
