@@ -52,10 +52,23 @@ case "$1" in
             TOKEN=$(python3 -c 'import secrets; print(secrets.token_hex(32))')
             sed "s/REPLACE_WITH_64_HEX_CHARS_FROM_COCKPIT_MCP_TAB/$TOKEN/" \
                 "$INSTALL_DIR/config.yaml.example" > "$CONFIG_FILE"
+            # systemd's ProtectSystem=full makes /etc read-only inside the
+            # service's mount namespace — the default "next-to-config"
+            # audit DB path would crash on startup. Inject an explicit
+            # absolute path under the writable state dir.
+            if grep -q '^audit:' "$CONFIG_FILE"; then
+                # Insert db_path right after the `audit:` line.
+                sed -i "/^audit:/a\\  db_path: \"$STATE_DIR/audit.db\"" "$CONFIG_FILE"
+            else
+                # No audit: block in the template — append a fresh one.
+                printf '\naudit:\n  db_path: "%s/audit.db"\n' "$STATE_DIR" \
+                    >> "$CONFIG_FILE"
+            fi
             chown root:"$GROUP_NAME" "$CONFIG_FILE"
             chmod 0640 "$CONFIG_FILE"
             echo "enforcer-mcp: generated fresh bearer token in $CONFIG_FILE"
             echo "enforcer-mcp:   bearer_token_hex: $TOKEN"
+            echo "enforcer-mcp:   audit.db_path:    $STATE_DIR/audit.db"
             echo "enforcer-mcp: paste this into the cockpit's // mcp tab."
         else
             # Upgrade path: make sure group ownership is still right (dpkg
