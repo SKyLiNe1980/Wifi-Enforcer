@@ -523,11 +523,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     port = int(server_cfg.get("port", 8765))
 
     # Audit DB path resolution, in priority order:
-    #   1. Explicit `audit.db_path` in YAML (set by the .deb postinst to
-    #      /var/lib/enforcer-mcp/audit.db so it lives in the writable
-    #      state dir; the chroot install can also set it explicitly).
-    #   2. ENFORCER_MCP_DB_PATH env var (handy for one-shot overrides).
-    #   3. Next-to-config fallback — works for the original chroot install
+    #   1. Explicit `audit.db_path` (top-level YAML block — cleanest schema).
+    #   2. Explicit `server.db_path` (lazy-edit-friendly; matches the
+    #      flat-server layout in config.yaml.example where audit_max_entries
+    #      and allowed_origins also live under server:).
+    #   3. ENFORCER_MCP_DB_PATH env var (handy for one-shot overrides).
+    #   4. Next-to-config fallback — works for the original chroot install
     #      where /etc/enforcer-mcp/ is writable by the running user.
     #
     # This matters because systemd's ProtectSystem=full makes /etc/
@@ -536,6 +537,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     audit_cfg = cfg.get("audit", {}) or {}
     db_path = (
         audit_cfg.get("db_path")
+        or server_cfg.get("db_path")
         or os.environ.get("ENFORCER_MCP_DB_PATH")
         or os.path.join(os.path.dirname(os.path.abspath(args.config)),
                         "audit.db")
