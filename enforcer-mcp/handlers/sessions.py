@@ -226,18 +226,83 @@ class SessionManager:
         sid: str,
         tail_bytes: int = 4096,
         clear: bool = False,
+        since_byte: Optional[int] = None,
     ) -> Dict[str, Any]:
+        """Snapshot the session's ring buffer.
+
+        Two modes, controlled by `since_byte`:
+
+        1. **Tail mode** (default, `since_byte=None`)
+           Returns the last `tail_bytes` of the ring. Same behaviour as
+           Phase 1C — for "show me what's on screen right now" use cases.
+
+        2. **Cursor mode** (`since_byte=<int>`)
+           Returns ONLY bytes whose cumulative offset is `>= since_byte`.
+           Designed for incremental tailing — LLM polls every N seconds,
+           passes back the `next_cursor` from the previous response, and
+           gets ONLY the new bytes since then. Saves both bandwidth and
+           parsing effort on the client side, and avoids the dedup
+           gymnastics you'd otherwise need with `tail_bytes` polling.
+
+           Edge cases:
+             • If `since_byte < ring_start_byte` (i.e. the bytes you're
+               asking for fell off the ring), we set `truncated=true` and
+               return what we have starting from the oldest available byte.
+               The client should treat that as "I missed some output;
+               here's what's still in the buffer."
+             • If `since_byte >= bytes_total` (no new data since last poll),
+               returns an empty `bytes` payload with `next_cursor` ==
+               `since_byte`. The polling loop is a no-op for that round.
+             • If `since_byte` is negative, we clamp to 0 (read everything).
+
+        Always returns `next_cursor` — pass it back unchanged on the next
+        call to continue the stream cleanly.
+        """
         sess = self._require(sid)
-        tail_bytes = max(0, min(tail_bytes, sess.ring_cap))
-        snapshot = bytes(sess.ring[-tail_bytes:]) if tail_bytes else b""
+        # `bytes_total` is the cumulative cursor (running total of bytes
+        # that have ever flowed through the PTY). `ring_start_byte` is
+        # the offset of the OLDEST byte still alive in the ring buffer.
+        ring_len = len(sess.ring)
+        ring_start_byte = sess.bytes_total - ring_len
+
+        truncated = False
+        if since_byte is None:
+            # Tail mode (Phase 1C behaviour).
+            tail_bytes = max(0, min(tail_bytes, sess.ring_cap))
+            snapshot = bytes(sess.ring[-tail_bytes:]) if tail_bytes else b""
+        else:
+            # Cursor mode.
+            if since_byte < 0:
+                since_byte = 0
+            if since_byte >= sess.bytes_total:
+                # Caller is fully caught up — no new data.
+                snapshot = b""
+            elif since_byte < ring_start_byte:
+                # Caller fell behind — bytes they want have been GC'd.
+                # Hand back everything still in the ring and mark truncated
+                # so they know there's a gap.
+                snapshot = bytes(sess.ring)
+                truncated = True
+            else:
+                # Happy path — slice the portion of the ring at offset
+                # (since_byte - ring_start_byte) onward.
+                offset = since_byte - ring_start_byte
+                snapshot = bytes(sess.ring[offset:])
+
         if clear:
             sess.ring.clear()
+            # Important: clearing the ring does NOT reset bytes_total —
+            # next_cursor remains a valid forward reference. Subsequent
+            # reads with the returned cursor will get an empty payload
+            # until new bytes arrive (which is exactly correct).
         return {
             "session_id": sid,
             "bytes": snapshot.decode("utf-8", errors="replace"),
             "len": len(snapshot),
             "buffer_bytes": len(sess.ring),
             "total_bytes": sess.bytes_total,
+            "next_cursor": sess.bytes_total,
+            "truncated": truncated,
             "running": sess.running,
             "exit_code": sess.exit_code if not sess.running else None,
         }

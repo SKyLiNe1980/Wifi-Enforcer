@@ -153,7 +153,7 @@ tools:
     timeout_sec: 5
 
   - name: read_session
-    description: "Read the tail of a session's output ring buffer (UTF-8 decoded, replacement-char on invalid bytes). Returns running state + exit_code when applicable."
+    description: "Read session output. Two modes — TAIL (default, returns last `tail_bytes`) or CURSOR (pass `since_byte` from previous response's `next_cursor` to get ONLY new bytes since then; ideal for incremental polling by LLM agents). Always returns `next_cursor` + `truncated` flag (true if you fell behind the ring buffer)."
     command_template: "__internal:read_session"
     arg_schema_json: |
       {
@@ -161,8 +161,9 @@ tools:
         "required": ["session_id"],
         "properties": {
           "session_id": {"type": "string"},
-          "tail_bytes": {"type": "integer", "default": 4096, "minimum": 0, "maximum": 65536},
-          "clear": {"type": "boolean", "default": false, "description": "Empty the ring buffer after reading"}
+          "tail_bytes": {"type": "integer", "default": 4096, "minimum": 0, "maximum": 65536, "description": "Tail-mode only — ignored when since_byte is set"},
+          "since_byte": {"type": "integer", "minimum": 0, "description": "Cursor-mode: return only bytes whose cumulative offset is >= this value. Use the `next_cursor` from the previous read."},
+          "clear": {"type": "boolean", "default": false, "description": "Empty the ring buffer after reading (does not reset next_cursor)"}
         }
       }
     wrap_mode: none
