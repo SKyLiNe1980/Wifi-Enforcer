@@ -122,10 +122,14 @@ async def _write_stdin(args: Dict[str, Any], conn: sqlite3.Connection) -> Dict[s
 async def _read_session(args: Dict[str, Any], conn: sqlite3.Connection) -> Dict[str, Any]:
     mgr = get_session_manager()
     try:
+        # since_byte is optional — None means "tail mode" (Phase 1C
+        # behaviour). Any int >= 0 switches to incremental cursor mode.
+        since = args.get("since_byte")
         return await mgr.read(
             sid=str(args["session_id"]),
             tail_bytes=int(args.get("tail_bytes", 4096)),
             clear=bool(args.get("clear", False)),
+            since_byte=int(since) if since is not None else None,
         )
     except Exception as e:
         return _err(e)

@@ -1092,3 +1092,45 @@ agent_communication:
         NOTE: Same EAS build as 1B.2b autospawn + IMPORT button +
         tool-sync. ONE build for the user, lots of features lit up.
 
+
+    - agent: "main"
+      message: |
+        Parked for future session: in-app node deployment.
+
+        User proposed (great idea): the `// nodes` tab should have a
+        [DEPLOY NEW NODE] button that pushes the .deb to a target box
+        and installs it without the operator leaving the app. Current
+        flow (manually scp source → run build-deb.sh → apt install →
+        copy bearer → paste in cockpit) works for us but is hostile
+        to anyone else who installs the APK later.
+
+        Three implementation tiers planned:
+
+        🟢 Tier 1 (easy, ~1-2 sessions) — RECOMMENDED FIRST:
+          • Bundle prebuilt .deb in APK as a static asset
+            (EAS prebuild step: run packaging/build-deb.sh, copy
+            output into frontend/assets/)
+          • [DEPLOY NEW NODE] button generates copy-pasteable curl+apt
+            command pointing at a temp HTTP server the cockpit spins
+            up on its tailnet IP for ~5 min then shuts down.
+          • Zero SSH creds touch the app.
+          • Always-in-sync .deb (matches APK version).
+
+        🔵 Tier 2 (medium, ~3-4 sessions):
+          • Tier 1 + SSH key-based deploy via react-native-ssh2 or
+            equivalent. Operator adds key once, deploys are
+            click-button thereafter.
+
+        🟡 Tier 3 (full dream, ~5-6 sessions):
+          • Full SSH/SFTP push + apt install + postinst output tail
+            + auto-extract bearer token via regex + auto-create node
+            entry. Green dot before phone goes back in pocket.
+
+        Distribution note: regardless of tier, the .deb ships bundled
+        IN the APK. The repo's enforcer-mcp/ stays as source-of-truth
+        for developers. README becomes dev-facing. The eventual "How
+        to Use Enforcer Framework" doc just points at the in-app
+        DEPLOY button.
+
+        Action item when resumed: start with Tier 1.
+

@@ -122,13 +122,71 @@ async def test_unknown_session_id() -> None:
     raise AssertionError("expected KeyError for unknown session")
 
 
+async def test_cursor_mode() -> None:
+    """1D-B: incremental cursor read should return only new bytes per poll."""
+    mgr = init_session_manager(logger=_log)
+    sess = await mgr.start("cat", label="cursor-test")
+    await asyncio.sleep(0.1)
+
+    # First write — should appear in next_cursor delta
+    await mgr.write(sess.id, "alpha", newline=True)
+    await _wait_until(lambda: b"alpha" in sess.ring, timeout=2.0)
+
+    r1 = await mgr.read(sess.id, since_byte=0)
+    assert "alpha" in r1["bytes"], f"first read missed alpha: {r1!r}"
+    assert r1["next_cursor"] == sess.bytes_total, f"cursor mismatch: {r1!r}"
+    assert not r1["truncated"], f"shouldn't be truncated: {r1!r}"
+    cursor = r1["next_cursor"]
+
+    # Second write — cursor mode should return ONLY the new bytes
+    await mgr.write(sess.id, "bravo", newline=True)
+    await _wait_until(lambda: b"bravo" in sess.ring, timeout=2.0)
+
+    r2 = await mgr.read(sess.id, since_byte=cursor)
+    assert "bravo" in r2["bytes"], f"second read missed bravo: {r2!r}"
+    assert "alpha" not in r2["bytes"], \
+        f"cursor mode leaked old data: {r2!r}"
+    assert r2["next_cursor"] > cursor
+
+    # Third poll with same cursor — caught up, empty payload
+    r3 = await mgr.read(sess.id, since_byte=r2["next_cursor"])
+    assert r3["bytes"] == "", f"caught-up read should be empty: {r3!r}"
+    assert r3["next_cursor"] == r2["next_cursor"]
+    assert r3["len"] == 0
+
+    await mgr.stop(sess.id)
+    print("✓ test_cursor_mode")
+
+
+async def test_cursor_truncation() -> None:
+    """1D-B: caller falling behind the ring should get truncated=True."""
+    # Tiny ring so we can overflow easily
+    mgr = init_session_manager(ring_cap=512, logger=_log)
+    sess = await mgr.start("yes overflow-test", label="trunc-test")
+
+    # Wait long enough for `yes` to flood past the ring cap many times
+    await asyncio.sleep(0.5)
+    await mgr.stop(sess.id, sig_name="SIGKILL")
+
+    # Pass since_byte=0 — bytes 0..(bytes_total-512) have all been GC'd,
+    # so we should get the trailing 512 bytes back with truncated=True.
+    r = await mgr.read(sess.id, since_byte=0)
+    assert r["truncated"], f"expected truncated=True, got: {r!r}"
+    assert r["len"] > 0 and r["len"] <= 512, \
+        f"snapshot should fit ring cap: len={r['len']}"
+    assert "overflow-test" in r["bytes"]
+    print(f"✓ test_cursor_truncation (truncated={r['truncated']}, len={r['len']})")
+
+
 async def main() -> None:
     await test_one_shot_echo()
     await test_interactive_cat()
     await test_list_and_resize()
     await test_ring_overflow()
     await test_unknown_session_id()
-    print("\nAll Phase 1C session tests passed ✓")
+    await test_cursor_mode()
+    await test_cursor_truncation()
+    print("\nAll Phase 1C+1D-B session tests passed ✓")
 
 
 if __name__ == "__main__":
