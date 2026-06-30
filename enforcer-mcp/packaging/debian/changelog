@@ -1,3 +1,15 @@
+enforcer-mcp (0.2.0) unstable; urgency=medium
+
+  * Add in-app Tier 1 deployment helper: cockpit bundles this .deb as an
+    Expo asset, serves it via a Tailscale-bound busybox httpd, and renders
+    a copy-pasteable curl|dpkg one-liner for swarm onboarding.
+  * Postinst stays idempotent across upgrades — existing /etc/enforcer-mcp/
+    config.yaml (and therefore bearer token) is preserved.
+  * No code changes vs 0.1.0; version bump exists purely so dpkg -i over a
+    deployed 0.1.0 node performs a clean upgrade.
+
+ -- enforcer-swarm <enforcer@localhost>  Mon, 30 Jun 2026 10:00:00 +0000
+
 enforcer-mcp (0.1.0) unstable; urgency=medium
 
   * Initial swarm-node release.

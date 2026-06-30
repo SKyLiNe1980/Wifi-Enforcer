@@ -26,6 +26,11 @@ import {
   type MCPConfig, type MCPTool, type MCPAuditEntry, type MCPNode,
 } from "../lib/localDb";
 import { startStream, killStream, hasNativeStreaming, execReal, HAS_NATIVE_ROOT } from "../lib/rootShell";
+import {
+  prepareDebPayload, detectTailscaleIp, startHttpServer, stopHttpServer,
+  buildInstallOneLiner,
+  type DeployPayload, type HttpdHandle,
+} from "../lib/deployServer";
 
 // Keep palette identical to the rest of the cockpit so the tab feels native.
 const C = {
@@ -679,7 +684,120 @@ export default function MCPTab() {
   }, [syncToolsNow, refreshLists]);
 
 
-  // ─── Chroot YAML auto-import ────────────────────────────────────────
+  // ─── Tier 1 deploy state ────────────────────────────────────────────
+  // The user taps [DEPLOY NEW NODE], we:
+  //   1. stage the bundled .deb on /data/local/tmp via root
+  //   2. detect tailnet IP
+  //   3. start busybox httpd bound to that IP
+  //   4. show a copy-pasteable curl one-liner
+  // Modal stays open until user taps STOP — busybox httpd has no
+  // built-in auto-shutoff.
+  type DeployStage =
+    | "idle"
+    | "preparing"
+    | "ready"
+    | "serving"
+    | "stopped"
+    | "failed";
+  const [deployOpen, setDeployOpen] = useState(false);
+  const [deployStage, setDeployStage] = useState<DeployStage>("idle");
+  const [deployPayload, setDeployPayload] = useState<DeployPayload | null>(null);
+  const [deployTailnetIp, setDeployTailnetIp] = useState<string | null>(null);
+  const [deployPort, setDeployPort] = useState<string>("8088");
+  const [deployHandle, setDeployHandle] = useState<HttpdHandle | null>(null);
+  const [deployError, setDeployError] = useState<string>("");
+  const [deployAccessLog, setDeployAccessLog] = useState<string[]>([]);
+
+  const handleOpenDeploy = useCallback(async () => {
+    setDeployOpen(true);
+    setDeployError("");
+    setDeployAccessLog([]);
+    setDeployStage("preparing");
+    try {
+      const [payload, ip] = await Promise.all([
+        prepareDebPayload(),
+        detectTailscaleIp(),
+      ]);
+      setDeployPayload(payload);
+      setDeployTailnetIp(ip);
+      setDeployStage("ready");
+      if (!ip) {
+        setDeployError(
+          "tailscale0 interface not found — make sure Tailscale is up " +
+          "on this device. You can still deploy manually via scp.",
+        );
+      }
+    } catch (e: any) {
+      setDeployStage("failed");
+      setDeployError(e?.message || "stage prep failed");
+    }
+  }, []);
+
+  const handleStartDeployServer = useCallback(() => {
+    if (!deployTailnetIp) {
+      setDeployError("Cannot start: no tailnet IP detected.");
+      return;
+    }
+    const port = parseInt(deployPort, 10);
+    if (!Number.isInteger(port) || port < 1024 || port > 65535) {
+      setDeployError("Port must be 1024..65535.");
+      return;
+    }
+    setDeployError("");
+    setDeployAccessLog([]);
+    const h = startHttpServer({
+      ip: deployTailnetIp,
+      port,
+      onAccessLog: (line) => {
+        setDeployAccessLog((prev) => {
+          const next = [...prev, line];
+          return next.length > 80 ? next.slice(-80) : next;
+        });
+      },
+      onExit: (code) => {
+        setDeployStage((cur) => (cur === "serving" ? "stopped" : cur));
+        setDeployAccessLog((prev) => [...prev, `[exit ${code}]`]);
+      },
+      onError: (msg) => {
+        setDeployStage("failed");
+        setDeployError(msg);
+      },
+    });
+    setDeployHandle(h);
+    setDeployStage("serving");
+  }, [deployTailnetIp, deployPort]);
+
+  const handleStopDeployServer = useCallback(async () => {
+    if (deployHandle) {
+      await stopHttpServer(deployHandle.sessionId);
+      setDeployHandle(null);
+    }
+    setDeployStage("stopped");
+  }, [deployHandle]);
+
+  const handleCloseDeploy = useCallback(async () => {
+    // Be paranoid: if user closes the modal mid-serve, stop httpd so
+    // we don't leave a dangling listener bound to the tailnet IP.
+    if (deployHandle) {
+      await stopHttpServer(deployHandle.sessionId).catch(() => {});
+      setDeployHandle(null);
+    }
+    setDeployOpen(false);
+    setDeployStage("idle");
+    setDeployError("");
+    setDeployAccessLog([]);
+    setDeployPayload(null);
+  }, [deployHandle]);
+
+  const handleCopyOneLiner = useCallback(async () => {
+    if (!deployTailnetIp) return;
+    const port = parseInt(deployPort, 10) || 8088;
+    const oneLiner = buildInstallOneLiner(deployTailnetIp, port, { printToken: true });
+    await Clipboard.setStringAsync(oneLiner);
+    Alert.alert("Copied", "One-liner copied — paste into target node's shell over SSH.");
+  }, [deployTailnetIp, deployPort]);
+
+
   // Shells out via RootShell.exec to read the chroot's config.yaml and
   // pulls bearer_token / port / bind_host into local SQLite. Solves the
   // post-EAS-install reset problem AND the user's manual copy-token-to-
@@ -1301,10 +1419,13 @@ export default function MCPTab() {
               <Text style={{ color: C.green }}>✓</Text> 1A  · UI + persistence{"\n"}
               <Text style={{ color: C.green }}>✓</Text> 1B.1 · FastMCP server (chroot){"\n"}
               <Text style={{ color: C.green }}>✓</Text> 1B.2a · live probe + audit sync{"\n"}
-              <Text style={{ color: C.green }}>✓</Text> 1B.2b · cockpit autospawn + tool sync (this build){"\n"}
+              <Text style={{ color: C.green }}>✓</Text> 1B.2b · cockpit autospawn + tool sync{"\n"}
               <Text style={{ color: C.green }}>✓</Text> 1C  · real PTY-backed sessions (chroot){"\n"}
-              <Text style={{ color: C.textDim }}>·</Text> 1D  · local Hermes ↔ local MCP loop{"\n"}
-              <Text style={{ color: C.textDim }}>·</Text> 2   · Tailscale bridge + Nodes tab + enforcer-node .deb
+              <Text style={{ color: C.green }}>✓</Text> 1D-A · Hermes env injection (terminal){"\n"}
+              <Text style={{ color: C.green }}>✓</Text> 2.A · Nodes tab + enforcer-node .deb{"\n"}
+              <Text style={{ color: C.green }}>✓</Text> 2.B · Tier 1 in-app deploy (httpd over tailnet){"\n"}
+              <Text style={{ color: C.textDim }}>·</Text> 2.C · Tier 2/3 SSH push deploy{"\n"}
+              <Text style={{ color: C.textDim }}>·</Text> 3   · EUEF MCP wrapper · airodump live parser
             </Text>
           </View>
         </ScrollView>
@@ -1414,16 +1535,29 @@ export default function MCPTab() {
         <ScrollView contentContainerStyle={{ padding: 14, paddingBottom: 90 }}>
           <View style={[s.row, { justifyContent: "space-between", marginBottom: 12 }]}>
             <Text style={s.sectionTitle}>{"// swarm nodes"}</Text>
-            <TouchableOpacity
-              style={[s.btn, { backgroundColor: C.panel2, borderColor: C.mcpAccent }]}
-              onPress={() => setEditingNode({
-                name: "", host: "", port: 8765, bearer_token: "",
-                tags: [], description: "", enabled: true,
-              })}
-            >
-              <MaterialCommunityIcons name="plus" size={14} color={C.mcpAccent} />
-              <Text style={[s.btnText, { color: C.mcpAccent }]}>ADD NODE</Text>
-            </TouchableOpacity>
+            <View style={[s.row, { gap: 6 }]}>
+              <TouchableOpacity
+                style={[s.btn, { backgroundColor: C.panel2, borderColor: C.green }]}
+                onPress={handleOpenDeploy}
+                disabled={!HAS_NATIVE_ROOT}
+              >
+                <MaterialCommunityIcons name="rocket-launch-outline" size={14}
+                  color={HAS_NATIVE_ROOT ? C.green : C.textDim} />
+                <Text style={[s.btnText, { color: HAS_NATIVE_ROOT ? C.green : C.textDim }]}>
+                  DEPLOY NEW NODE
+                </Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[s.btn, { backgroundColor: C.panel2, borderColor: C.mcpAccent }]}
+                onPress={() => setEditingNode({
+                  name: "", host: "", port: 8765, bearer_token: "",
+                  tags: [], description: "", enabled: true,
+                })}
+              >
+                <MaterialCommunityIcons name="plus" size={14} color={C.mcpAccent} />
+                <Text style={[s.btnText, { color: C.mcpAccent }]}>ADD NODE</Text>
+              </TouchableOpacity>
+            </View>
           </View>
 
           {nodes.length === 0 ? (
@@ -1503,6 +1637,20 @@ export default function MCPTab() {
                   )}
 
                   <View style={[s.row, { marginTop: 10, gap: 6, flexWrap: "wrap" }]}>
+                    <TouchableOpacity
+                      style={[s.smallBtn, {
+                        borderColor: health === "probing" ? C.yellow : C.green,
+                      }]}
+                      onPress={() => probeNode(n)}
+                      disabled={!n.enabled || health === "probing"}
+                    >
+                      <Text style={[s.smallBtnText, {
+                        color: !n.enabled ? C.textDim
+                          : health === "probing" ? C.yellow : C.green,
+                      }]}>
+                        {health === "probing" ? "PROBING…" : "RETRY PROBE"}
+                      </Text>
+                    </TouchableOpacity>
                     {!n.is_primary && (
                       <TouchableOpacity
                         style={[s.smallBtn, { borderColor: C.yellow }]}
@@ -1821,6 +1969,197 @@ export default function MCPTab() {
           </View>
         </View>
       )}
+      {/* DEPLOY NEW NODE MODAL ───────────────────────────────────────── */}
+      {deployOpen && (
+        <View style={s.overlay} pointerEvents="auto">
+          <View style={s.sheet}>
+            <View style={s.sheetHeader}>
+              <Text style={s.sheetTitle}>{"// deploy new node"}</Text>
+              <TouchableOpacity onPress={handleCloseDeploy}>
+                <MaterialCommunityIcons name="close" size={22} color={C.green} />
+              </TouchableOpacity>
+            </View>
+            <ScrollView contentContainerStyle={{ paddingBottom: 20 }}>
+              <Text style={[s.helperFine, { marginBottom: 10 }]}>
+                Stages the bundled <Text style={{ color: C.cyan }}>enforcer-mcp.deb</Text> on
+                this phone and serves it over your tailnet so a target VPS /
+                Pi can {"\n"}<Text style={{ color: C.cyan }}>curl | dpkg -i</Text> it via
+                one SSH command.
+              </Text>
+
+              {/* STAGE: PAYLOAD ────────────────────────────────────── */}
+              <Text style={s.sectionTitle}>{"// payload"}</Text>
+              <View style={s.card}>
+                {deployStage === "preparing" ? (
+                  <Text style={[s.helperFine, { color: C.yellow }]}>
+                    ↻ staging .deb on /data/local/tmp …
+                  </Text>
+                ) : deployPayload ? (
+                  <>
+                    <Text style={s.helperFine}>
+                      path: <Text style={{ color: C.cyan }}>{deployPayload.debPath}</Text>
+                    </Text>
+                    <Text style={[s.helperFine, { marginTop: 2 }]}>
+                      size: <Text style={{ color: C.cyan }}>{(deployPayload.size / 1024).toFixed(1)} KB</Text>
+                      {"  ·  "}
+                      sha256: <Text style={{ color: C.cyan }}>
+                        {deployPayload.sha256.slice(0, 10)}…{deployPayload.sha256.slice(-6)}
+                      </Text>
+                    </Text>
+                    {deployPayload.sha256 === deployPayload.expectedSha256 ? (
+                      <Text style={[s.helperFine, { marginTop: 4, color: C.green }]}>
+                        ✓ integrity verified against bundled sidecar
+                      </Text>
+                    ) : (
+                      <Text style={[s.helperFine, { marginTop: 4, color: C.red }]}>
+                        ✗ sha mismatch — DO NOT proceed
+                      </Text>
+                    )}
+                  </>
+                ) : (
+                  <Text style={[s.helperFine, { color: C.red }]}>
+                    payload not staged (see error below)
+                  </Text>
+                )}
+              </View>
+
+              {/* STAGE: TAILNET ──────────────────────────────────── */}
+              <Text style={[s.sectionTitle, { marginTop: 16 }]}>{"// tailnet"}</Text>
+              <View style={s.card}>
+                <Text style={s.helperFine}>
+                  tailscale0 IPv4:{" "}
+                  {deployTailnetIp ? (
+                    <Text style={{ color: C.green }}>{deployTailnetIp}</Text>
+                  ) : (
+                    <Text style={{ color: C.red }}>(not detected)</Text>
+                  )}
+                </Text>
+                <Text style={[s.helperFine, { marginTop: 6 }]}>port to serve on</Text>
+                <TextInput
+                  style={[s.input, { fontFamily: MONO, marginTop: 4 }]}
+                  value={deployPort}
+                  onChangeText={setDeployPort}
+                  keyboardType="number-pad"
+                  placeholder="8088"
+                  placeholderTextColor={C.textDim}
+                  editable={deployStage !== "serving"}
+                />
+                <Text style={[s.helperFine, { marginTop: 6, color: C.textDim }]}>
+                  binds to {deployTailnetIp || "—"}:{deployPort || "?"} only — invisible to LAN/public.
+                </Text>
+              </View>
+
+              {/* STAGE: SERVE / ONE-LINER ────────────────────────────── */}
+              <Text style={[s.sectionTitle, { marginTop: 16 }]}>{"// install one-liner"}</Text>
+              <View style={s.card}>
+                {deployTailnetIp ? (
+                  <View style={s.tokenBox}>
+                    <Text style={[s.tokenText, { fontSize: 11, color: C.text }]} selectable>
+                      {buildInstallOneLiner(
+                        deployTailnetIp,
+                        parseInt(deployPort, 10) || 8088,
+                        { printToken: true },
+                      )}
+                    </Text>
+                  </View>
+                ) : (
+                  <Text style={[s.helperFine, { color: C.textDim }]}>
+                    waiting on tailnet IP…
+                  </Text>
+                )}
+                <View style={[s.row, { marginTop: 10, gap: 6 }]}>
+                  <TouchableOpacity
+                    style={[s.btn, { flex: 1, backgroundColor: C.panel2, borderColor: C.cyan }]}
+                    onPress={handleCopyOneLiner}
+                    disabled={!deployTailnetIp}
+                  >
+                    <MaterialCommunityIcons name="content-copy" size={14} color={C.cyan} />
+                    <Text style={[s.btnText, { color: C.cyan }]}>COPY ONE-LINER</Text>
+                  </TouchableOpacity>
+                </View>
+                <Text style={[s.helperFine, { marginTop: 10, color: C.textDim }]}>
+                  the last grep prints the new node&apos;s bearer token — copy that
+                  into [+ ADD NODE] when you&apos;re done.
+                </Text>
+              </View>
+
+              {/* STAGE: SERVER CONTROL ──────────────────────────────── */}
+              <Text style={[s.sectionTitle, { marginTop: 16 }]}>{"// http server"}</Text>
+              <View style={s.card}>
+                <Text style={s.helperFine}>
+                  status:{" "}
+                  <Text style={{
+                    color:
+                      deployStage === "serving" ? C.green :
+                      deployStage === "ready" ? C.yellow :
+                      deployStage === "preparing" ? C.yellow :
+                      deployStage === "stopped" ? C.textDim :
+                      deployStage === "failed" ? C.red : C.textDim,
+                  }}>{deployStage.toUpperCase()}</Text>
+                </Text>
+                <View style={[s.row, { marginTop: 10, gap: 6 }]}>
+                  {deployStage !== "serving" ? (
+                    <TouchableOpacity
+                      style={[s.btn, { flex: 1, backgroundColor: C.panel2, borderColor: C.green }]}
+                      onPress={handleStartDeployServer}
+                      disabled={!deployPayload || !deployTailnetIp}
+                    >
+                      <MaterialCommunityIcons name="play" size={14}
+                        color={(!deployPayload || !deployTailnetIp) ? C.textDim : C.green} />
+                      <Text style={[s.btnText, {
+                        color: (!deployPayload || !deployTailnetIp) ? C.textDim : C.green,
+                      }]}>START SERVING</Text>
+                    </TouchableOpacity>
+                  ) : (
+                    <TouchableOpacity
+                      style={[s.btn, { flex: 1, backgroundColor: C.panel2, borderColor: C.red }]}
+                      onPress={handleStopDeployServer}
+                    >
+                      <MaterialCommunityIcons name="stop" size={14} color={C.red} />
+                      <Text style={[s.btnText, { color: C.red }]}>STOP</Text>
+                    </TouchableOpacity>
+                  )}
+                </View>
+                {deployAccessLog.length > 0 && (
+                  <View style={[s.tokenBox, { marginTop: 10, maxHeight: 140 }]}>
+                    <ScrollView nestedScrollEnabled>
+                      {deployAccessLog.map((l, i) => (
+                        <Text key={i} style={[s.helperFine, {
+                          fontSize: 10, color: C.text,
+                        }]} selectable>{l}</Text>
+                      ))}
+                    </ScrollView>
+                  </View>
+                )}
+              </View>
+
+              {deployError ? (
+                <Text style={[s.helperFine, { marginTop: 12, color: C.red }]}>
+                  err: {deployError}
+                </Text>
+              ) : null}
+
+              <Text style={[s.helperFine, { marginTop: 16, color: C.textDim }]}>
+                Tip: leave this modal open while the target node runs the
+                one-liner — you&apos;ll see the GET request in the access log,
+                confirming the download. Then tap STOP and close.
+              </Text>
+
+              <View style={[s.row, { marginTop: 16, gap: 6 }]}>
+                <TouchableOpacity
+                  style={[s.btn, { flex: 1, backgroundColor: C.panel2, borderColor: C.textDim }]}
+                  onPress={handleCloseDeploy}
+                >
+                  <Text style={[s.btnText, { color: C.textDim }]}>
+                    {deployStage === "serving" ? "STOP & CLOSE" : "CLOSE"}
+                  </Text>
+                </TouchableOpacity>
+              </View>
+            </ScrollView>
+          </View>
+        </View>
+      )}
+
     </View>
   );
 }

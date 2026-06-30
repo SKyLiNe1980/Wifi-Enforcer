@@ -6,7 +6,7 @@ import {
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { sessionManager, SessionState } from "../lib/sessionManager";
 import { hasNativeStreaming, HAS_NATIVE_ROOT, writeStdin } from "../lib/rootShell";
-import { aiProfilesLocal } from "../lib/localDb";
+import { aiProfilesLocal, nodesLocal } from "../lib/localDb";
 import XTermView from "./XTermView";
 
 // ─── Palette: keep unified with LiveTab / Settings / Terminal ─────────────
@@ -281,6 +281,64 @@ export default function AITab(props: Props) {
       setActiveSessionId(id);
       force((n) => n + 1);
       // (ai-logs telemetry to backend deprecated — local-first migration.)
+
+      // Step 1.5: inject MCP env vars from the cockpit's PRIMARY node so
+      // the spawned agent's config.yaml `$ENFORCER_MCP_TOKEN` / `_URL`
+      // placeholders resolve at startup. We deliberately use shell-level
+      // `export` instead of writing the chroot's .env file because:
+      //   (a) Tokens never touch disk — they live only in this shell's
+      //       env, dying when the session ends.
+      //   (b) Rotating a node's token in // nodes immediately affects
+      //       the NEXT agent launch with zero file edits.
+      //   (c) Per-session targeting is trivial: switch the // nodes
+      //       PRIMARY star, start a new session, you're aimed at the
+      //       other node.
+      // Wait 400ms so the login-shell's rc-file chain has finished
+      // sourcing before our exports land — otherwise rc files (or
+      // direnv hooks) might clobber our values.
+      const enforcerExports: string[] = [];
+      try {
+        const allNodes = await nodesLocal.list();
+        const primary = allNodes.find((n) => n.is_primary && n.enabled);
+        if (primary && primary.bearer_token) {
+          const url = `http://${primary.host}:${primary.port}/mcp`;
+          enforcerExports.push(`export ENFORCER_MCP_URL='${url}'`);
+          enforcerExports.push(`export ENFORCER_MCP_TOKEN='${primary.bearer_token}'`);
+          enforcerExports.push(`export ENFORCER_MCP_NAME='${primary.name.replace(/'/g, "")}'`);
+        }
+        // Also expose every enabled node as ENFORCER_MCP_<TAG>_URL/_TOKEN
+        // so multi-node agent configs (advanced users) can target by
+        // tag. Tag chars are uppercased + non-alnum stripped so they're
+        // safe for shell var names.
+        for (const n of allNodes) {
+          if (!n.enabled || !n.bearer_token) continue;
+          const safeTag = n.name.replace(/[^a-zA-Z0-9]/g, "_").toUpperCase();
+          if (!safeTag) continue;
+          enforcerExports.push(
+            `export ENFORCER_MCP_${safeTag}_URL='http://${n.host}:${n.port}/mcp'`,
+          );
+          enforcerExports.push(
+            `export ENFORCER_MCP_${safeTag}_TOKEN='${n.bearer_token}'`,
+          );
+        }
+      } catch (e) {
+        console.warn("[AITab] enforcer mcp env injection skipped:", e);
+      }
+      if (enforcerExports.length > 0) {
+        setTimeout(() => {
+          // Bundle into one line so the prompt only sees ONE Return.
+          sessionManager.sendInput(id, enforcerExports.join("; "), true)
+            .catch(() => {});
+        }, 400);
+        // Surface what was injected so the user can verify primary
+        // selection without grepping the terminal scrollback.
+        const primaryNode = enforcerExports.find((l) => l.includes("ENFORCER_MCP_NAME="));
+        const primaryName = primaryNode
+          ? primaryNode.split("'")[1] : "(none)";
+        const nodeCount = enforcerExports.filter((l) =>
+          /ENFORCER_MCP_[A-Z0-9_]+_URL=/.test(l)).length;
+        console.log(`[AITab] injected MCP env: primary=${primaryName}, total nodes=${nodeCount}`);
+      }
 
       // Step 2: send the launcher command (and optional pre_command) into the
       // login shell's stdin. Wait ~800ms so bash has time to source its rc
