@@ -5,6 +5,17 @@ const { FileStore } = require('metro-cache');
 
 const config = getDefaultConfig(__dirname);
 
+// Bundle the enforcer-mcp .deb (and its sha256 sidecar) as Expo assets so
+// the cockpit's [DEPLOY NEW NODE] flow can ship it over Tailscale to swarm
+// targets. Purely additive — does NOT replace the default assetExts list
+// (which already covers fonts/images/db/zip). Required because Metro
+// otherwise treats unknown extensions as source modules and fails to bundle.
+config.resolver.assetExts = [
+  ...config.resolver.assetExts,
+  "deb",
+  "sha256",
+];
+
 // Use a stable on-disk store (shared across web/android)
 const root = process.env.METRO_CACHE_ROOT || path.join(__dirname, '.metro-cache');
 config.cacheStores = [

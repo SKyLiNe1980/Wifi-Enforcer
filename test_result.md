@@ -1134,3 +1134,53 @@ agent_communication:
 
         Action item when resumed: start with Tier 1.
 
+
+
+agent_communication:
+  - agent: "main"
+    message: |
+      Session 2026-06-30 #1 — batched changes for one EAS build:
+
+      ✓ Retry Probe button per remote node row (MCPTab.tsx).
+        Tap → immediately re-runs probeNode(); shows PROBING… while running.
+        Disabled when node row is OFF.
+
+      ✓ Tier 1 in-app deploy:
+        - Bumped .deb to 0.2.0 (changelog entry; no code delta).
+        - Rebuilt + bundled into /app/frontend/assets/enforcer-node/
+          (deb + sha256 sidecar). Metro now bundles them via
+          added `assetExts: [..., "deb", "sha256"]`.
+        - New helper: /app/frontend/src/lib/deployServer.ts
+            • prepareDebPayload() — expo-asset → /data/local/tmp via root cp,
+              SHA verifies against bundled sidecar.
+            • detectTailscaleIp() — `ip -o -4 addr show tailscale0`.
+            • startHttpServer({ip,port}) — busybox httpd -f bound to
+              Tailscale IP only. Tailscale ACLs = second layer of authz.
+            • stopHttpServer / buildInstallOneLiner.
+        - MCPTab `// nodes` pane: new [DEPLOY NEW NODE] button →
+          opens modal showing payload size+sha, tailnet IP, port input,
+          copyable one-liner, START/STOP, live access log.
+          Modal stops httpd on close even if user forgets.
+
+      Build/test status:
+        • eslint: clean (MCPTab.tsx, deployServer.ts).
+        • tsc --noEmit: clean.
+        • .deb verified: dpkg-deb --info OK · contents intact.
+        • Python pytest skipped: pytest-asyncio not in this CI venv
+          (pre-existing; tests target operator's chroot venv).
+        • Web bundling still broken on sqlite/worker (known/ignored).
+
+      Validation: user runs `eas build -p android` and tests:
+        1. Retry Probe button on a stuck node — should re-probe immediately.
+        2. // nodes → DEPLOY NEW NODE:
+           a. payload stages, sha verifies green
+           b. tailnet IP detected (100.x.y.z)
+           c. tap START SERVING — busybox httpd binds to tailnet IP only
+           d. copy one-liner, SSH into VPS, paste
+           e. access log shows the GET, dpkg installs, bearer printed
+           f. tap STOP, close modal
+           g. paste bearer into [+ ADD NODE]
+
+      Not changed: backend (FastAPI sessions API), audit handlers,
+      AITab env injection (already shipped last session — awaits user
+      build verify together with this batch).
