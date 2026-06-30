@@ -1413,21 +1413,12 @@ export default function MCPTab() {
             )}
           </View>
 
-          <Text style={[s.sectionTitle, { marginTop: 20 }]}>{"// roadmap"}</Text>
-          <View style={s.card}>
-            <Text style={s.helper}>
-              <Text style={{ color: C.green }}>✓</Text> 1A  · UI + persistence{"\n"}
-              <Text style={{ color: C.green }}>✓</Text> 1B.1 · FastMCP server (chroot){"\n"}
-              <Text style={{ color: C.green }}>✓</Text> 1B.2a · live probe + audit sync{"\n"}
-              <Text style={{ color: C.green }}>✓</Text> 1B.2b · cockpit autospawn + tool sync{"\n"}
-              <Text style={{ color: C.green }}>✓</Text> 1C  · real PTY-backed sessions (chroot){"\n"}
-              <Text style={{ color: C.green }}>✓</Text> 1D-A · Hermes env injection (terminal){"\n"}
-              <Text style={{ color: C.green }}>✓</Text> 2.A · Nodes tab + enforcer-node .deb{"\n"}
-              <Text style={{ color: C.green }}>✓</Text> 2.B · Tier 1 in-app deploy (httpd over tailnet){"\n"}
-              <Text style={{ color: C.textDim }}>·</Text> 2.C · Tier 2/3 SSH push deploy{"\n"}
-              <Text style={{ color: C.textDim }}>·</Text> 3   · EUEF MCP wrapper · airodump live parser
-            </Text>
-          </View>
+          <Text style={[s.sectionTitle, { marginTop: 20 }]}>{"// notes"}</Text>
+          <Text style={s.helper}>
+            primary node toggle in <Text style={{ color: C.cyan }}>{"// nodes"}</Text> sets where
+            shorthand calls (e.g. autospawn) land. health / tool roster auto-syncs every 60s
+            for enabled nodes.
+          </Text>
         </ScrollView>
       )}
 

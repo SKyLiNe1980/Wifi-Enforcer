@@ -1488,7 +1488,7 @@ export default function App() {
         <View style={s.header} testID="app-header">
           <View style={{ flexDirection: "row", alignItems: "center" }}>
             <MaterialCommunityIcons name="shield-lock" size={20} color={C.green} />
-            <Text style={[s.headerTitle, { marginLeft: 8 }]}>wifi-enforcer</Text>
+            <Text style={[s.headerTitle, { marginLeft: 8 }]}>enforcer</Text>
             <Text style={s.headerVer}>v0.1</Text>
           </View>
           <View style={{ flexDirection: "row", alignItems: "center" }}>
