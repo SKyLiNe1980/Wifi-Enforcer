@@ -72,6 +72,11 @@ agenthub/agents/youtube/db
 *.pack
 *.deb
 *.dylib
+# …but DO ship the bundled enforcer-node .deb that the cockpit serves
+# over Tailscale from [DEPLOY NEW NODE]. Without this, EAS clones the
+# repo and Metro fails: "Unable to resolve module …/enforcer-mcp.deb".
+!frontend/assets/enforcer-node/*.deb
+!frontend/assets/enforcer-node/*.deb.sha256
 
 # Build caches
 .cache/
