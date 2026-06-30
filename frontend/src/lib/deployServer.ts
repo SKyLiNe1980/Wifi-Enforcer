@@ -128,29 +128,50 @@ export async function prepareDebPayload(): Promise<DeployPayload> {
 }
 
 /**
- * Read the phone's Tailscale IPv4. Returns null if tailscale0 isn't up.
- * Format we expect from `ip -4 -o addr show tailscale0`:
+ * Read the phone's Tailscale IPv4.
  *
- *   N: tailscale0    inet 100.x.y.z/32 scope global tailscale0\       valid_lft ...
+ * Tailscale uses different interface names on every platform:
+ *   • Linux/Debian/Kali:   `tailscale0`
+ *   • Android (VpnService): `tun0` (or `tun1` if another VPN is up)
+ *   • iOS:                 `utun3` / `utun4` (varies)
+ *   • macOS:               `utun3` / `utun4` (varies)
  *
- * We grep for `inet ` + take the next token without the CIDR mask.
+ * Hard-coding any one of these is fragile. The robust signal is the IP
+ * itself: Tailscale always allocates from the CGNAT block 100.64.0.0/10
+ * (covers 100.64.x.x through 100.127.x.x). So we ask the kernel for ALL
+ * interfaces and grep for an IPv4 in that range.
+ *
+ * Returns null if Tailscale isn't up (or any VPN client other than TS).
  */
 export async function detectTailscaleIp(): Promise<string | null> {
   if (!HAS_NATIVE_ROOT) return null;
   try {
-    // -o = one-line output so parsing is trivial. We try a couple of `ip`
-    // locations because LineageOS sometimes mounts /system/bin first and
-    // sometimes /sbin. busybox provides `ip` as a fallback inside chroot
-    // but here we expect the Android-side ip binary.
+    // Try a few `ip` binary locations — LineageOS varies. We dump every
+    // interface in one-line form so parsing is trivial.
     const res = await execReal(
       `for B in /system/bin/ip /sbin/ip ip; do ` +
       `if command -v "$B" >/dev/null 2>&1 || [ -x "$B" ]; then ` +
-      `"$B" -4 -o addr show tailscale0 2>/dev/null; exit 0; fi; done; exit 1`,
+      `"$B" -4 -o addr show 2>/dev/null; exit 0; fi; done; exit 1`,
     );
     if (res.exit_code !== 0) return null;
     const out = res.output || "";
-    const m = out.match(/\binet\s+(\d+\.\d+\.\d+\.\d+)/);
-    return m ? m[1] : null;
+
+    // Each line looks like:
+    //   N: <iface>    inet <ip>/<mask> ... <iface>\       valid_lft ...
+    // Scan every line, pull (iface, ip), and return the first IP that
+    // falls inside 100.64.0.0/10 (Tailscale CGNAT).
+    for (const line of out.split(/\r?\n/)) {
+      const m = line.match(/^\s*\d+:\s*(\S+)\s+inet\s+(\d+)\.(\d+)\.(\d+)\.(\d+)/);
+      if (!m) continue;
+      const [, , a, b] = m;
+      const oct1 = parseInt(a, 10);
+      const oct2 = parseInt(b, 10);
+      // 100.64.0.0/10  →  100.64.x.x  ..  100.127.x.x
+      if (oct1 === 100 && oct2 >= 64 && oct2 <= 127) {
+        return `${m[2]}.${m[3]}.${m[4]}.${m[5]}`;
+      }
+    }
+    return null;
   } catch {
     return null;
   }

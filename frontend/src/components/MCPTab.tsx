@@ -2027,11 +2027,11 @@ export default function MCPTab() {
               <Text style={[s.sectionTitle, { marginTop: 16 }]}>{"// tailnet"}</Text>
               <View style={s.card}>
                 <Text style={s.helperFine}>
-                  tailscale0 IPv4:{" "}
+                  tailnet IPv4 (100.64/10):{" "}
                   {deployTailnetIp ? (
                     <Text style={{ color: C.green }}>{deployTailnetIp}</Text>
                   ) : (
-                    <Text style={{ color: C.red }}>(not detected)</Text>
+                    <Text style={{ color: C.red }}>(not detected — is Tailscale up?)</Text>
                   )}
                 </Text>
                 <Text style={[s.helperFine, { marginTop: 6 }]}>port to serve on</Text>
