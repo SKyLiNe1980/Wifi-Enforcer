@@ -1409,7 +1409,7 @@ export default function App() {
         </Text>
       </View>
 
-      <Text style={[s.helper, { marginTop: 24, textAlign: "center" }]}>wifi-enforcer · v0.1 · mocked preview</Text>
+      <Text style={[s.helper, { marginTop: 24, textAlign: "center" }]}>enforcer framework · v0.1</Text>
     </ScrollView>
   );
 
@@ -1488,7 +1488,7 @@ export default function App() {
         <View style={s.header} testID="app-header">
           <View style={{ flexDirection: "row", alignItems: "center" }}>
             <MaterialCommunityIcons name="shield-lock" size={20} color={C.green} />
-            <Text style={[s.headerTitle, { marginLeft: 8 }]}>enforcer</Text>
+            <Text style={[s.headerTitle, { marginLeft: 8 }]}>enforcer framework</Text>
             <Text style={s.headerVer}>v0.1</Text>
           </View>
           <View style={{ flexDirection: "row", alignItems: "center" }}>
