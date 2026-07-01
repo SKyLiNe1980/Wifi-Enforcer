@@ -1409,7 +1409,7 @@ export default function App() {
         </Text>
       </View>
 
-      <Text style={[s.helper, { marginTop: 24, textAlign: "center" }]}>enforcer framework · v0.1</Text>
+      <Text style={[s.helper, { marginTop: 24, textAlign: "center" }]}>Enforcer Framework · v0.7</Text>
     </ScrollView>
   );
 
@@ -1488,8 +1488,8 @@ export default function App() {
         <View style={s.header} testID="app-header">
           <View style={{ flexDirection: "row", alignItems: "center" }}>
             <MaterialCommunityIcons name="shield-lock" size={20} color={C.green} />
-            <Text style={[s.headerTitle, { marginLeft: 8 }]}>enforcer framework</Text>
-            <Text style={s.headerVer}>v0.1</Text>
+            <Text style={[s.headerTitle, { marginLeft: 8 }]}>Enforcer Framework</Text>
+            <Text style={s.headerVer}>v0.7</Text>
           </View>
           <View style={{ flexDirection: "row", alignItems: "center" }}>
             {running && <ActivityIndicator size="small" color={C.green} style={{ marginRight: 8 }} />}
