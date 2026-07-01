@@ -28,8 +28,8 @@ import {
 import { startStream, killStream, hasNativeStreaming, execReal, HAS_NATIVE_ROOT } from "../lib/rootShell";
 import {
   prepareDebPayload, detectTailscaleIp, startHttpServer, stopHttpServer,
-  buildInstallOneLiner,
-  type DeployPayload, type HttpdHandle,
+  buildInstallOneLiner, diagnoseDeploy,
+  type DeployPayload, type HttpdHandle, type DiagnosticsReport,
 } from "../lib/deployServer";
 
 // Keep palette identical to the rest of the cockpit so the tab feels native.
@@ -84,6 +84,21 @@ export default function MCPTab() {
   const [autospawnCmdInput, setAutospawnCmdInput] = useState("");
   const [chrootCmdInput, setChrootCmdInput] = useState("");
   const [showAutospawnLog, setShowAutospawnLog] = useState(false);
+
+  // ─── Shadow-input persistence guard ─────────────────────────────────
+  // TextInput.onBlur is unreliable when a component unmounts (e.g., user
+  // tab-switches away without dismissing the keyboard). If we relied on
+  // onBlur alone, typing "0.0.0.0" into cockpit probe host and then
+  // leaving the tab silently loses the value → next visit shows the
+  // stale DB row ("127.0.0.1" default). Fix: mirror the shadow inputs
+  // into refs and, on unmount, persist any diff back to SQLite.
+  const shadowRef = useRef({
+    portInput, bindInput, probeInput, autospawnCmdInput, chrootCmdInput,
+  });
+  shadowRef.current = {
+    portInput, bindInput, probeInput, autospawnCmdInput, chrootCmdInput,
+  };
+  const configRef = useRef<MCPConfig | null>(null);
 
   // Tool editor modal — null = closed, else current draft.
   const [editingTool, setEditingTool] = useState<Partial<MCPTool> | null>(null);
@@ -162,6 +177,7 @@ export default function MCPTab() {
   const refreshConfig = useCallback(async () => {
     const c = await mcpLocal.getConfig();
     setConfig(c);
+    configRef.current = c;
     setPortInput(String(c.port));
     setBindInput(c.bind_host);
     setProbeInput(c.cockpit_probe_host || "127.0.0.1");
@@ -233,6 +249,34 @@ export default function MCPTab() {
   useEffect(() => {
     refresh().catch((e) => console.warn("[MCPTab] refresh failed:", e));
   }, [refresh]);
+
+  // Save-on-unmount safety net: TextInput.onBlur is unreliable when a
+  // component unmounts (tab switch with keyboard still open, back-swipe,
+  // etc.). Refs let us reach the LATEST typed values without recreating
+  // the effect on every keystroke; the empty deps array means the cleanup
+  // fires exactly once, on unmount.
+  useEffect(() => {
+    return () => {
+      const cur = configRef.current;
+      const s = shadowRef.current;
+      if (!cur) return;
+      const patch: Partial<MCPConfig> = {};
+      const port = parseInt(s.portInput, 10);
+      if (Number.isInteger(port) && port > 0 && port !== cur.port) patch.port = port;
+      const bind = (s.bindInput || "").trim();
+      if (bind && bind !== cur.bind_host) patch.bind_host = bind;
+      let probe = (s.probeInput || "").trim().replace(/^https?:\/\//i, "");
+      probe = probe.split("/")[0].split(":")[0];
+      if (probe && probe !== cur.cockpit_probe_host) patch.cockpit_probe_host = probe;
+      if (s.autospawnCmdInput !== cur.autospawn_cmd) patch.autospawn_cmd = s.autospawnCmdInput;
+      if (s.chrootCmdInput !== cur.chroot_yaml_cmd) patch.chroot_yaml_cmd = s.chrootCmdInput;
+      if (Object.keys(patch).length > 0) {
+        mcpLocal.updateConfig(patch).catch((e) =>
+          console.warn("[MCPTab] unmount-flush save failed:", e),
+        );
+      }
+    };
+  }, []);
 
   // ─── Health probe + audit sync loop ────────────────────────────────────
   // Runs only while the MCP tab is mounted (index.tsx renders us
@@ -707,6 +751,20 @@ export default function MCPTab() {
   const [deployHandle, setDeployHandle] = useState<HttpdHandle | null>(null);
   const [deployError, setDeployError] = useState<string>("");
   const [deployAccessLog, setDeployAccessLog] = useState<string[]>([]);
+  const [deployDiag, setDeployDiag] = useState<DiagnosticsReport | null>(null);
+  const [deployDiagRunning, setDeployDiagRunning] = useState(false);
+
+  const handleRunDiagnostics = useCallback(async () => {
+    setDeployDiagRunning(true);
+    try {
+      const rep = await diagnoseDeploy();
+      setDeployDiag(rep);
+    } catch (e: any) {
+      setDeployError(`diagnose failed: ${e?.message || e}`);
+    } finally {
+      setDeployDiagRunning(false);
+    }
+  }, []);
 
   const handleOpenDeploy = useCallback(async () => {
     setDeployOpen(true);
@@ -733,7 +791,7 @@ export default function MCPTab() {
     }
   }, []);
 
-  const handleStartDeployServer = useCallback(() => {
+  const handleStartDeployServer = useCallback(async () => {
     if (!deployTailnetIp) {
       setDeployError("Cannot start: no tailnet IP detected.");
       return;
@@ -745,26 +803,31 @@ export default function MCPTab() {
     }
     setDeployError("");
     setDeployAccessLog([]);
-    const h = startHttpServer({
-      ip: deployTailnetIp,
-      port,
-      onAccessLog: (line) => {
-        setDeployAccessLog((prev) => {
-          const next = [...prev, line];
-          return next.length > 80 ? next.slice(-80) : next;
-        });
-      },
-      onExit: (code) => {
-        setDeployStage((cur) => (cur === "serving" ? "stopped" : cur));
-        setDeployAccessLog((prev) => [...prev, `[exit ${code}]`]);
-      },
-      onError: (msg) => {
-        setDeployStage("failed");
-        setDeployError(msg);
-      },
-    });
-    setDeployHandle(h);
-    setDeployStage("serving");
+    try {
+      const h = await startHttpServer({
+        ip: deployTailnetIp,
+        port,
+        onAccessLog: (line) => {
+          setDeployAccessLog((prev) => {
+            const next = [...prev, line];
+            return next.length > 80 ? next.slice(-80) : next;
+          });
+        },
+        onExit: (code) => {
+          setDeployStage((cur) => (cur === "serving" ? "stopped" : cur));
+          setDeployAccessLog((prev) => [...prev, `[exit ${code}]`]);
+        },
+        onError: (msg) => {
+          setDeployStage("failed");
+          setDeployError(msg);
+        },
+      });
+      setDeployHandle(h);
+      setDeployStage("serving");
+    } catch (e: any) {
+      setDeployStage("failed");
+      setDeployError(e?.message || "startHttpServer failed");
+    }
   }, [deployTailnetIp, deployPort]);
 
   const handleStopDeployServer = useCallback(async () => {
@@ -1136,7 +1199,7 @@ export default function MCPTab() {
               <Text style={[s.sectionTitle, { marginTop: 20 }]}>{"// connectivity"}</Text>
               <View style={s.card}>
                 <Text style={[s.helperFine]}>
-                  {"this cockpit's probe target:"}
+                  {"this cockpit's probe target (local mcp):"}
                 </Text>
                 <Text style={[s.helperFine, { marginTop: 2 }]}>
                   <Text style={{ color: C.cyan }}>
@@ -1150,7 +1213,7 @@ export default function MCPTab() {
                 </Text>
                 {serverInfo && (
                   <Text style={[s.helperFine, { marginTop: 4 }]}>
-                    server: <Text style={{ color: C.cyan }}>{serverInfo.service}@{serverInfo.version}</Text>
+                    local mcp: <Text style={{ color: C.cyan }}>{serverInfo.service}@{serverInfo.version}</Text>
                     {"  ·  "}tools: <Text style={{ color: C.cyan }}>{serverInfo.tools}</Text>
                     {"  ·  "}require_token: <Text style={{ color: serverInfo.require_token ? C.green : C.yellow }}>
                       {String(!!serverInfo.require_token)}
@@ -1413,21 +1476,12 @@ export default function MCPTab() {
             )}
           </View>
 
-          <Text style={[s.sectionTitle, { marginTop: 20 }]}>{"// roadmap"}</Text>
-          <View style={s.card}>
-            <Text style={s.helper}>
-              <Text style={{ color: C.green }}>✓</Text> 1A  · UI + persistence{"\n"}
-              <Text style={{ color: C.green }}>✓</Text> 1B.1 · FastMCP server (chroot){"\n"}
-              <Text style={{ color: C.green }}>✓</Text> 1B.2a · live probe + audit sync{"\n"}
-              <Text style={{ color: C.green }}>✓</Text> 1B.2b · cockpit autospawn + tool sync{"\n"}
-              <Text style={{ color: C.green }}>✓</Text> 1C  · real PTY-backed sessions (chroot){"\n"}
-              <Text style={{ color: C.green }}>✓</Text> 1D-A · Hermes env injection (terminal){"\n"}
-              <Text style={{ color: C.green }}>✓</Text> 2.A · Nodes tab + enforcer-node .deb{"\n"}
-              <Text style={{ color: C.green }}>✓</Text> 2.B · Tier 1 in-app deploy (httpd over tailnet){"\n"}
-              <Text style={{ color: C.textDim }}>·</Text> 2.C · Tier 2/3 SSH push deploy{"\n"}
-              <Text style={{ color: C.textDim }}>·</Text> 3   · EUEF MCP wrapper · airodump live parser
-            </Text>
-          </View>
+          <Text style={[s.sectionTitle, { marginTop: 20 }]}>{"// notes"}</Text>
+          <Text style={s.helper}>
+            primary node toggle in <Text style={{ color: C.cyan }}>{"// nodes"}</Text> sets where
+            shorthand calls (e.g. autospawn) land. health / tool roster auto-syncs every 60s
+            for enabled nodes.
+          </Text>
         </ScrollView>
       )}
 
@@ -2081,6 +2135,81 @@ export default function MCPTab() {
                   the last grep prints the new node&apos;s bearer token — copy that
                   into [+ ADD NODE] when you&apos;re done.
                 </Text>
+              </View>
+
+              {/* STAGE: DIAGNOSTICS ─────────────────────────────────── */}
+              <View style={[s.row, { marginTop: 16, justifyContent: "space-between" }]}>
+                <Text style={s.sectionTitle}>{"// diagnostics"}</Text>
+                <TouchableOpacity
+                  style={[s.smallBtn, { borderColor: C.yellow }]}
+                  onPress={handleRunDiagnostics}
+                  disabled={deployDiagRunning}
+                >
+                  <Text style={[s.smallBtnText, { color: C.yellow }]}>
+                    {deployDiagRunning ? "PROBING…" : "DIAGNOSE"}
+                  </Text>
+                </TouchableOpacity>
+              </View>
+              <View style={s.card}>
+                {deployDiag ? (
+                  <>
+                    <Text style={s.helperFine}>
+                      chroot wrapper:{" "}
+                      <Text style={{ color: deployDiag.chrootWrapperExists ? C.green : C.red }}>
+                        {deployDiag.chrootWrapperExists ? "OK" : "MISSING"}
+                      </Text>
+                    </Text>
+                    <Text style={s.helperFine}>
+                      stage dir:{" "}
+                      <Text style={{ color: deployDiag.stageDirExists ? C.green : C.red }}>
+                        {deployDiag.stageDirExists ? "OK" : "NOT CREATED YET"}
+                      </Text>
+                    </Text>
+                    <Text style={s.helperFine}>
+                      .deb staged:{" "}
+                      <Text style={{ color: deployDiag.debStaged ? C.green : C.red }}>
+                        {deployDiag.debStaged ? `YES (${(deployDiag.debSize / 1024).toFixed(1)} KB)` : "NO"}
+                      </Text>
+                    </Text>
+                    <Text style={s.helperFine}>
+                      python3 in chroot:{" "}
+                      <Text style={{ color: deployDiag.python3 ? C.green : C.red }}>
+                        {deployDiag.python3 || "NOT FOUND"}
+                      </Text>
+                    </Text>
+                    <Text style={s.helperFine}>
+                      ip binary:{" "}
+                      <Text style={{ color: deployDiag.ipBinary ? C.green : C.red }}>
+                        {deployDiag.ipBinary || "NOT FOUND"}
+                      </Text>
+                    </Text>
+                    <Text style={s.helperFine}>
+                      tailnet IP:{" "}
+                      <Text style={{ color: deployDiag.tailnetIp ? C.green : C.red }}>
+                        {deployDiag.tailnetIp || "NOT DETECTED"}
+                      </Text>
+                    </Text>
+                    {deployDiag.interfaces.length > 0 && (
+                      <Text style={[s.helperFine, { marginTop: 6, color: C.textDim }]}>
+                        interfaces w/ IPv4:{"\n"}
+                        {deployDiag.interfaces.map((i) => `  ${i}`).join("\n")}
+                      </Text>
+                    )}
+                    <View style={[s.tokenBox, { marginTop: 8, maxHeight: 160 }]}>
+                      <ScrollView nestedScrollEnabled>
+                        <Text style={[s.helperFine, { fontSize: 10, color: C.text }]} selectable>
+                          {deployDiag.raw}
+                        </Text>
+                      </ScrollView>
+                    </View>
+                  </>
+                ) : (
+                  <Text style={[s.helperFine, { color: C.textDim }]}>
+                    tap DIAGNOSE to probe chroot wrapper, python3, staged .deb,
+                    ip binary, and interface list. good idea before START SERVING
+                    if something feels off.
+                  </Text>
+                )}
               </View>
 
               {/* STAGE: SERVER CONTROL ──────────────────────────────── */}
