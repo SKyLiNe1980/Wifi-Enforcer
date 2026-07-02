@@ -188,6 +188,11 @@ export default function XTermView({ sessionId, onInput, resetToken }: Props) {
   // append-only byte stream.
   const lastLineNoRef = useRef<number>(0);
 
+  // Track whether we've ever written anything so the very first fresh
+  // batch doesn't get a spurious leading blank line (there's nothing to
+  // separate FROM if the initial replay was empty).
+  const hasWrittenRef = useRef<boolean>(false);
+
   // ── RN → Web: write bytes ─────────────────────────────────────────────
   const writeToTerm = useCallback((data: string) => {
     if (!data) return;
@@ -197,6 +202,7 @@ export default function XTermView({ sessionId, onInput, resetToken }: Props) {
     const encoded = JSON.stringify(data);
     if (readyRef.current && webRef.current) {
       webRef.current.injectJavaScript(`window.termWrite && window.termWrite(${encoded}); true;`);
+      hasWrittenRef.current = true;
     } else {
       pendingRef.current.push(data);
     }
@@ -206,17 +212,21 @@ export default function XTermView({ sessionId, onInput, resetToken }: Props) {
   useEffect(() => {
     if (!sessionId) {
       lastLineNoRef.current = 0;
+      hasWrittenRef.current = false;
       return;
     }
     // Replay whatever the session already has in its ring buffer (it may
     // have been running before the user switched tabs back to AI).
     const s0 = sessionManager.sessions.get(sessionId);
     if (s0 && s0.lines.length) {
-      // \r\n because xterm's convertEol is off — agents that emit just \n
-      // would otherwise stair-step. Most TUI agents emit \r\n themselves,
-      // but our line-splitter on the native side stripped the trailing
-      // \n. Adding \r\n is a no-op visually for those.
-      const initial = s0.lines.map((l) => l.line).join("\r\n") + "\r\n";
+      // Join lines with \r\n between them but NO trailing terminator —
+      // that used to double-space every batch because native's
+      // line-splitter emits ALL PTY newlines as separate lines already
+      // (including zsh's aesthetic blank line + prompt redraws), so
+      // appending our own \r\n meant every command left 2-5 extra blank
+      // rows before the next prompt. Now the last line's cursor lands
+      // exactly where zsh intended it.
+      const initial = s0.lines.map((l) => l.line).join("\r\n");
       writeToTerm(initial);
       lastLineNoRef.current = s0.lineCount;
     } else {
@@ -227,13 +237,13 @@ export default function XTermView({ sessionId, onInput, resetToken }: Props) {
       const s = sessionManager.sessions.get(sessionId);
       if (!s) return;
       if (s.lineCount <= lastLineNoRef.current) return;
-      // Pick out lines we haven't written yet. The ring may have evicted
-      // some — if so we just emit whatever's still around (the terminal
-      // already has the earlier content from this same session). Lines
-      // are stored in insertion order; we filter by line_no.
       const fresh = s.lines.filter((l) => l.line_no > lastLineNoRef.current);
       if (fresh.length) {
-        const chunk = fresh.map((l) => l.line).join("\r\n") + "\r\n";
+        // Prepend \r\n only if we've already written something. If this
+        // is the very first write (initial replay was empty), no leading
+        // separator is needed.
+        const prefix = hasWrittenRef.current ? "\r\n" : "";
+        const chunk = prefix + fresh.map((l) => l.line).join("\r\n");
         writeToTerm(chunk);
       }
       lastLineNoRef.current = s.lineCount;

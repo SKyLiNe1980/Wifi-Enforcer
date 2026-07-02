@@ -34,6 +34,7 @@ import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
 import { sessionManager, SessionState } from "../lib/sessionManager";
 import { hasNativeStreaming, RootShell, HAS_NATIVE_ROOT } from "../lib/rootShell";
 import { attackProfilesLocal, pcapEndpointsLocal } from "../lib/localDb";
+import { cleanAnsi } from "../lib/ansiUtils";
 import XTermView from "./XTermView";
 
 const C = {
@@ -573,7 +574,7 @@ export default function LiveTab(props: Props) {
                   selectable
                   style={[s.outLine, l.stream === "stderr" && { color: C.red }]}
                 >
-                  {l.line}
+                  {cleanAnsi(l.line)}
                 </Text>
               )}
               onScrollBeginDrag={() => setAutoScroll(false)}

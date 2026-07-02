@@ -28,7 +28,7 @@ import {
 import { startStream, killStream, hasNativeStreaming, execReal, HAS_NATIVE_ROOT } from "../lib/rootShell";
 import {
   prepareDebPayload, detectTailscaleIp, startHttpServer, stopHttpServer,
-  buildInstallOneLiner, diagnoseDeploy,
+  buildInstallOneLiner, diagnoseDeploy, reapStaleHttpServers,
   type DeployPayload, type HttpdHandle, type DiagnosticsReport,
 } from "../lib/deployServer";
 
@@ -766,10 +766,23 @@ export default function MCPTab() {
     }
   }, []);
 
+  const handleReapOrphans = useCallback(async () => {
+    try {
+      const n = await reapStaleHttpServers();
+      Alert.alert("Reaped", n > 0 ? `Killed ${n} orphaned deploy server(s).` : "No orphans found.");
+      // Refresh diagnostics so the panel reflects the new clean state.
+      const rep = await diagnoseDeploy();
+      setDeployDiag(rep);
+    } catch (e: any) {
+      setDeployError(`reap failed: ${e?.message || e}`);
+    }
+  }, []);
+
   const handleOpenDeploy = useCallback(async () => {
     setDeployOpen(true);
     setDeployError("");
     setDeployAccessLog([]);
+    setDeployDiag(null);
     setDeployStage("preparing");
     try {
       const [payload, ip] = await Promise.all([
@@ -785,6 +798,13 @@ export default function MCPTab() {
           "on this device. You can still deploy manually via scp.",
         );
       }
+      // Fire an immediate diagnostic pass so stale servers from a
+      // previous session surface without the operator having to think
+      // about it. Non-blocking — we don't want a slow ps scan to gate
+      // opening the modal.
+      diagnoseDeploy()
+        .then(setDeployDiag)
+        .catch((e) => console.warn("[deploy] initial diagnose failed:", e));
     } catch (e: any) {
       setDeployStage("failed");
       setDeployError(e?.message || "stage prep failed");
@@ -2189,6 +2209,36 @@ export default function MCPTab() {
                         {deployDiag.tailnetIp || "NOT DETECTED"}
                       </Text>
                     </Text>
+                    <Text style={s.helperFine}>
+                      stale http servers:{" "}
+                      <Text style={{
+                        color: deployDiag.staleServers.length === 0 ? C.green : C.yellow,
+                      }}>
+                        {deployDiag.staleServers.length === 0
+                          ? "NONE"
+                          : `${deployDiag.staleServers.length} FOUND — will auto-reap on START`}
+                      </Text>
+                    </Text>
+                    {deployDiag.staleServers.length > 0 && (
+                      <>
+                        {deployDiag.staleServers.slice(0, 4).map((sv) => (
+                          <Text key={sv.pid} style={[s.helperFine, {
+                            marginLeft: 12, fontSize: 10, color: C.textDim,
+                          }]} selectable>
+                            pid {sv.pid}: {sv.cmdline.slice(0, 120)}
+                            {sv.cmdline.length > 120 ? "…" : ""}
+                          </Text>
+                        ))}
+                        <TouchableOpacity
+                          style={[s.smallBtn, {
+                            marginTop: 6, alignSelf: "flex-start", borderColor: C.red,
+                          }]}
+                          onPress={handleReapOrphans}
+                        >
+                          <Text style={[s.smallBtnText, { color: C.red }]}>REAP NOW</Text>
+                        </TouchableOpacity>
+                      </>
+                    )}
                     {deployDiag.interfaces.length > 0 && (
                       <Text style={[s.helperFine, { marginTop: 6, color: C.textDim }]}>
                         interfaces w/ IPv4:{"\n"}

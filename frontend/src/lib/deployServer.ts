@@ -76,8 +76,99 @@ export type DiagnosticsReport = {
   ipBinary?: string;
   interfaces: string[];
   tailnetIp: string | null;
-  raw: string; // full unparsed output for the modal to display
+  /** PIDs of any lingering deploy-server processes from previous sessions. */
+  staleServers: { pid: string; cmdline: string }[];
+  /** Ports currently bound in the LISTEN state — helps spot conflicts. */
+  boundPorts: string[];
+  raw: string;
 };
+
+// Signature we use to identify OUR own http.server instances in ps.
+// Any process whose cmdline contains this exact substring is a deploy
+// server we spawned earlier — safe to reap. Deliberately narrow so we
+// don't nuke unrelated python http servers the operator may be running.
+const DEPLOY_SIGNATURE = `python3 -u -m http.server`;
+// Additional guard: cmdline must also mention our stage dir path OR
+// bind to a Tailscale CGNAT (100.64/10) address. Prevents false positives.
+function isOurProcess(cmdline: string): boolean {
+  if (!cmdline.includes(DEPLOY_SIGNATURE)) return false;
+  // Bind arg is "--bind 100.x.y.z" — Tailscale CGNAT.
+  const bindMatch = cmdline.match(/--bind\s+(\d+\.\d+\.\d+\.\d+)/);
+  if (bindMatch) {
+    const [, ip] = bindMatch;
+    const [a, b] = ip.split(".").map((n) => parseInt(n, 10));
+    if (a === 100 && b >= 64 && b <= 127) return true;
+  }
+  return cmdline.includes(STAGE_DIR_CHROOT);
+}
+
+/**
+ * Scan for orphaned deploy-server processes from previous sessions.
+ * These occur when the operator force-quits the app or closes the modal
+ * without pressing STOP — JS-side session handle vanishes but the OS
+ * process keeps serving forever. Returns [] if all clean.
+ */
+export async function findStaleHttpServers(): Promise<{ pid: string; cmdline: string }[]> {
+  if (!HAS_NATIVE_ROOT) return [];
+  try {
+    // Portable: `ps -eo pid,args` works on toybox (Android) and busybox alike.
+    // Fallback: /proc scan.
+    const res = await execReal(
+      `ps -eo pid,args 2>/dev/null | grep -F '${DEPLOY_SIGNATURE}' | grep -v grep || ` +
+      `for p in /proc/[0-9]*; do ` +
+      `  c=$(tr '\\0' ' ' <"$p/cmdline" 2>/dev/null); ` +
+      `  case "$c" in *"${DEPLOY_SIGNATURE}"*) echo "$(basename $p) $c";; esac; ` +
+      `done`,
+    );
+    const out = res.output || "";
+    const list: { pid: string; cmdline: string }[] = [];
+    for (const line of out.split(/\r?\n/)) {
+      const m = line.trim().match(/^(\d+)\s+(.+)$/);
+      if (!m) continue;
+      const [, pid, cmdline] = m;
+      if (isOurProcess(cmdline)) list.push({ pid, cmdline });
+    }
+    return list;
+  } catch { return []; }
+}
+
+/**
+ * SIGTERM (then SIGKILL after grace) all orphaned deploy servers. Returns
+ * how many we reaped. Called defensively before each START SERVING so we
+ * don't fight ourselves for the port.
+ */
+export async function reapStaleHttpServers(): Promise<number> {
+  const stale = await findStaleHttpServers();
+  if (stale.length === 0) return 0;
+  const pids = stale.map((s) => s.pid).join(" ");
+  // Try TERM first (lets Python's SIGTERM handler close listeners cleanly),
+  // then KILL after 800ms for anything stubborn. `2>/dev/null` swallows the
+  // "no such process" noise on the second pass.
+  await execReal(`kill -TERM ${pids} 2>/dev/null; sleep 0.8; kill -KILL ${pids} 2>/dev/null; true`);
+  return stale.length;
+}
+
+/**
+ * Read the list of ports currently in LISTEN state — useful to warn the
+ * operator that a port they want is already busy (by anything, not just us).
+ */
+export async function listBoundPorts(): Promise<string[]> {
+  if (!HAS_NATIVE_ROOT) return [];
+  try {
+    const res = await execReal(
+      // ss is the modern replacement for netstat; both usually present on
+      // Android via toybox. Fall through if neither exists.
+      `(ss -tln 2>/dev/null || netstat -tln 2>/dev/null || true) | awk 'NR>1 {print $4}'`,
+    );
+    const out = res.output || "";
+    const ports = new Set<string>();
+    for (const line of out.split(/\r?\n/)) {
+      const m = line.trim().match(/:(\d+)$/);
+      if (m) ports.add(m[1]);
+    }
+    return Array.from(ports).sort();
+  } catch { return []; }
+}
 
 /**
  * Hydrate the bundled .deb out of the JS bundle and mirror it into the
@@ -206,6 +297,8 @@ export async function diagnoseDeploy(): Promise<DiagnosticsReport> {
     if (m) interfaces.push(`${m[1]} → ${m[2]}`);
   }
   const tailnetIp = await detectTailscaleIp();
+  const staleServers = await findStaleHttpServers();
+  const boundPorts = await listBoundPorts();
 
   return {
     chrootPath,
@@ -217,6 +310,8 @@ export async function diagnoseDeploy(): Promise<DiagnosticsReport> {
     ipBinary: ipBinaryMatch ? ipBinaryMatch[1] : undefined,
     interfaces,
     tailnetIp,
+    staleServers,
+    boundPorts,
     raw: out,
   };
 }
@@ -248,10 +343,32 @@ export async function startHttpServer(opts: {
     throw new Error("settings.chroot_path is empty — cannot enter NetHunter chroot to run python3.");
   }
 
+  // Defensive housekeeping: if a previous session left orphaned deploy
+  // servers lying around (app was force-killed, modal closed without STOP,
+  // etc.) they'd hold our port and make bind() fail. Reap them BEFORE we
+  // check port availability so a legitimate previous instance doesn't
+  // look like a stranger.
+  const reaped = await reapStaleHttpServers();
+  if (reaped > 0) {
+    opts.onAccessLog?.(`[reaped ${reaped} orphaned deploy server(s) from previous session]`);
+    // Give the kernel a beat to release the TCP socket after SIGKILL,
+    // otherwise the fresh bind() races and we'd fail with EADDRINUSE.
+    await new Promise((r) => setTimeout(r, 400));
+  }
+
+  // Port-conflict check: someone ELSE (not us) might be using our port.
+  // If so, bail with a clear message instead of a silent bind failure.
+  const bound = await listBoundPorts();
+  if (bound.includes(String(opts.port))) {
+    throw new Error(
+      `Port ${opts.port} is already bound by something we don't recognise ` +
+      `(not one of our orphans). Pick a different port or free it up. ` +
+      `Currently bound ports: ${bound.slice(0, 20).join(", ")}${bound.length > 20 ? "…" : ""}`,
+    );
+  }
+
   const sessionId = `enforcer-httpd-${Date.now()}`;
   const inner = `cd '${STAGE_DIR_CHROOT}' && exec python3 -u -m http.server --bind '${opts.ip}' ${opts.port}`;
-  // Wrap in bash -c because chroot_path already ends with `sudo -E PATH=...`
-  // and we want a single argv element for the whole inner script.
   const cmd = `${chrootPath} bash -c ${JSON.stringify(inner)}`;
 
   startStream(sessionId, cmd, {
