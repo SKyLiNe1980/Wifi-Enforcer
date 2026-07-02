@@ -865,6 +865,7 @@ export default function MCPTab() {
     } finally { setCloudSyncBusy(false); }
   }, [cloudSyncUrl, cloudSyncToken, refreshLists]);
 
+  const handleReapOrphans = useCallback(async () => {
     try {
       const n = await reapStaleHttpServers();
       Alert.alert("Reaped", n > 0 ? `Killed ${n} orphaned deploy server(s).` : "No orphans found.");

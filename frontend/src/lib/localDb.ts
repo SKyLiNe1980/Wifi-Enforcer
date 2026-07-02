@@ -1512,5 +1512,40 @@ export const nodesLocal = {
       `UPDATE mcp_nodes SET last_tool_sync_at = ?, last_tool_count = ?
        WHERE id = ?`, [nowIso(), toolCount, id]);
   },
+
+  /**
+   * Idempotent create-or-update keyed on (host, port). Used by tailnet
+   * peer discovery restore: we want to re-add every enforcer node found
+   * on the tailscale mesh without duplicating rows the operator already
+   * has for the same IP.
+   *
+   * If a row with the same host+port exists → update its bearer_token,
+   * name, tags, description and re-enable it. Otherwise fall through to
+   * a normal create().
+   */
+  async upsert(input: {
+    name: string; host: string; port?: number;
+    bearer_token?: string; transport?: "http_sse" | "stdio";
+    enabled?: boolean; is_primary?: boolean;
+    tags?: string[]; description?: string;
+  }): Promise<MCPNode> {
+    const db = await openLocalDb();
+    const port = input.port ?? 8765;
+    const existing = await db.getFirstAsync<NodeRow>(
+      `SELECT * FROM mcp_nodes WHERE host = ? AND port = ? LIMIT 1`,
+      [input.host.trim(), port],
+    );
+    if (existing) {
+      return this.update(existing.id, {
+        name: input.name.trim() || existing.name,
+        bearer_token: input.bearer_token || existing.bearer_token,
+        transport: input.transport || (existing.transport as any),
+        enabled: input.enabled ?? true,
+        tags: input.tags ?? [],
+        description: input.description ?? existing.description ?? "",
+      });
+    }
+    return this.create({ ...input, port });
+  },
 };
 export { kvGet, kvSet };
