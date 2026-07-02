@@ -31,6 +31,12 @@ import {
   buildInstallOneLiner, diagnoseDeploy, reapStaleHttpServers,
   type DeployPayload, type HttpdHandle, type DiagnosticsReport,
 } from "../lib/deployServer";
+import {
+  loadUpstashToken, saveUpstashToken, clearUpstashToken,
+  loadUpstashUrl, saveUpstashUrl,
+  testConnection as upstashTest, fetchCurrentBearer,
+  discoverEnforcerPeers,
+} from "../lib/tokenStash";
 
 // Keep palette identical to the rest of the cockpit so the tab feels native.
 const C = {
@@ -766,7 +772,99 @@ export default function MCPTab() {
     }
   }, []);
 
-  const handleReapOrphans = useCallback(async () => {
+  // ─── Cloud sync (Upstash) state ─────────────────────────────────────
+  const [cloudSyncUrl, setCloudSyncUrl] = useState<string>("");
+  const [cloudSyncToken, setCloudSyncToken] = useState<string>("");
+  const [cloudSyncTokenSaved, setCloudSyncTokenSaved] = useState(false);
+  const [cloudSyncBusy, setCloudSyncBusy] = useState(false);
+  const [cloudSyncStatus, setCloudSyncStatus] = useState<string>("");
+
+  // Load persisted URL from config + saved-flag from SecureStore on mount.
+  // Actual token never leaves SecureStore — we only track whether one
+  // exists, so the UI can show "•• saved ••" instead of an empty field.
+  useEffect(() => {
+    (async () => {
+      try {
+        const [url, tk] = await Promise.all([loadUpstashUrl(), loadUpstashToken()]);
+        setCloudSyncUrl(url || "");
+        setCloudSyncTokenSaved(!!tk);
+      } catch (e) { console.warn("[cloudSync] init failed:", e); }
+    })();
+  }, []);
+
+  const handleSaveCloudSync = useCallback(async () => {
+    setCloudSyncBusy(true);
+    setCloudSyncStatus("");
+    try {
+      const url = cloudSyncUrl.trim().replace(/\/+$/, "");
+      if (url) await saveUpstashUrl(url);
+      setCloudSyncUrl(url);
+      if (cloudSyncToken.trim()) {
+        await saveUpstashToken(cloudSyncToken.trim());
+        setCloudSyncTokenSaved(true);
+        setCloudSyncToken("");
+      }
+      setCloudSyncStatus("ok: creds saved to keystore");
+    } catch (e: any) {
+      setCloudSyncStatus(`err: ${e?.message || e}`);
+    } finally { setCloudSyncBusy(false); }
+  }, [cloudSyncUrl, cloudSyncToken]);
+
+  const handleTestCloudSync = useCallback(async () => {
+    setCloudSyncBusy(true);
+    setCloudSyncStatus("");
+    try {
+      const url = (await loadUpstashUrl()) || cloudSyncUrl.trim();
+      const tok = cloudSyncToken.trim() || (await loadUpstashToken()) || "";
+      const r = await upstashTest(url, tok);
+      setCloudSyncStatus(`ok: PING → ${r}`);
+    } catch (e: any) {
+      setCloudSyncStatus(`err: ${e?.message || e}`);
+    } finally { setCloudSyncBusy(false); }
+  }, [cloudSyncUrl, cloudSyncToken]);
+
+  const handleClearCloudSync = useCallback(async () => {
+    await clearUpstashToken();
+    setCloudSyncUrl("");
+    setCloudSyncToken("");
+    setCloudSyncTokenSaved(false);
+    setCloudSyncStatus("ok: cleared");
+  }, []);
+
+  const handleDiscoverFromTailnet = useCallback(async () => {
+    setCloudSyncBusy(true);
+    setCloudSyncStatus("");
+    try {
+      const url = (await loadUpstashUrl()) || cloudSyncUrl.trim();
+      const tok = (await loadUpstashToken()) || cloudSyncToken.trim();
+      if (!url || !tok) throw new Error("save + set creds first (URL + R/W token)");
+      const peers = await discoverEnforcerPeers(execReal);
+      if (peers.length === 0) {
+        throw new Error("no enforcer peers on tailnet (hostname must match /node|enforcer/i)");
+      }
+      const rec = await fetchCurrentBearer(url, tok);
+      if (!rec?.token) {
+        throw new Error("no bearer in upstash yet — rotate one first, or paste manually via [+ ADD NODE]");
+      }
+      let added = 0;
+      for (const p of peers) {
+        try {
+          await nodesLocal.upsert({
+            name: p.hostname, host: p.tailIp, port: 8765,
+            bearer_token: rec.token, transport: "http_sse",
+            enabled: true, is_primary: false, tags: [p.dnsName],
+            description: `restored from tailnet ${new Date().toISOString().slice(0, 16)}`,
+          } as any);
+          added++;
+        } catch (e) { console.warn("[cloudSync] upsert failed for", p.hostname, e); }
+      }
+      await refreshLists();
+      setCloudSyncStatus(`ok: restored ${added}/${peers.length} peer(s) with current bearer`);
+    } catch (e: any) {
+      setCloudSyncStatus(`err: ${e?.message || e}`);
+    } finally { setCloudSyncBusy(false); }
+  }, [cloudSyncUrl, cloudSyncToken, refreshLists]);
+
     try {
       const n = await reapStaleHttpServers();
       Alert.alert("Reaped", n > 0 ? `Killed ${n} orphaned deploy server(s).` : "No orphans found.");
@@ -1346,6 +1444,74 @@ export default function MCPTab() {
               </View>
             </>
           )}
+
+          {/* ─── Cloud Sync (Upstash) ────────────────────────────────
+              Stores the cluster bearer + node roster in a shared Upstash
+              Redis so a reinstalled cockpit can recover its swarm from
+              tailnet peer discovery + one HTTPS lookup. R/W token lives
+              in expo-secure-store (Keystore-backed), never in SQLite.
+              ROTATION is disabled by default until nodes ship 0.3.0
+              with the poll+grace auth loop. RESTORE works today. */}
+          <Text style={[s.sectionTitle, { marginTop: 20 }]}>{"// cloud sync (upstash)"}</Text>
+          <View style={s.card}>
+            <Text style={s.helperFine}>REST URL</Text>
+            <TextInput
+              style={[s.input, { fontFamily: MONO, marginTop: 4 }]}
+              value={cloudSyncUrl}
+              onChangeText={setCloudSyncUrl}
+              placeholder="https://credible-starfish-140287.upstash.io"
+              placeholderTextColor={C.textDim}
+              autoCapitalize="none"
+              autoCorrect={false}
+            />
+            <Text style={[s.helperFine, { marginTop: 8 }]}>
+              R/W token <Text style={{ color: C.textDim }}>(stored in Android Keystore)</Text>
+            </Text>
+            <TextInput
+              style={[s.input, { fontFamily: MONO, marginTop: 4 }]}
+              value={cloudSyncToken}
+              onChangeText={setCloudSyncToken}
+              placeholder={cloudSyncTokenSaved ? "••• saved •••" : "paste bearer token"}
+              placeholderTextColor={C.textDim}
+              autoCapitalize="none"
+              autoCorrect={false}
+              secureTextEntry
+            />
+            <View style={[s.row, { marginTop: 10, gap: 6, flexWrap: "wrap" }]}>
+              <TouchableOpacity style={[s.smallBtn, { borderColor: C.cyan }]} onPress={handleSaveCloudSync}>
+                <Text style={[s.smallBtnText, { color: C.cyan }]}>SAVE CREDS</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={[s.smallBtn, { borderColor: C.yellow }]}
+                onPress={handleTestCloudSync}
+                disabled={cloudSyncBusy}>
+                <Text style={[s.smallBtnText, { color: C.yellow }]}>
+                  {cloudSyncBusy ? "…" : "TEST"}
+                </Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={[s.smallBtn, { borderColor: C.green }]}
+                onPress={handleDiscoverFromTailnet}
+                disabled={cloudSyncBusy}>
+                <Text style={[s.smallBtnText, { color: C.green }]}>
+                  DISCOVER + RESTORE
+                </Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={[s.smallBtn, { borderColor: C.red }]}
+                onPress={handleClearCloudSync}>
+                <Text style={[s.smallBtnText, { color: C.red }]}>CLEAR</Text>
+              </TouchableOpacity>
+            </View>
+            {!!cloudSyncStatus && (
+              <Text style={[s.helperFine, { marginTop: 8, color: cloudSyncStatus.startsWith("err") ? C.red : C.cyan }]} selectable>
+                {cloudSyncStatus}
+              </Text>
+            )}
+            <Text style={[s.helperFine, { marginTop: 8, color: C.textDim }]}>
+              rotation loop off until nodes ship enforcer-mcp 0.3.0. discover+restore
+              works today: greps <Text style={{ color: C.cyan }}>tailscale status</Text>{" "}
+              for <Text style={{ color: C.cyan }}>/node|enforcer/i</Text> hostnames,
+              fetches current bearer from upstash, inserts rows.
+            </Text>
+          </View>
 
           <Text style={[s.sectionTitle, { marginTop: 20 }]}>{"// auth · bearer token"}</Text>
           <View style={s.card}>

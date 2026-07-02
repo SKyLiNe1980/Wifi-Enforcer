@@ -40,6 +40,29 @@ const XTERM_VER = "5.5.0";
 const FIT_VER = "0.10.0";
 
 /**
+ * Collapse runs of ≥2 consecutive empty strings down to a single empty
+ * string. Rationale: the native line-splitter emits an entry for every
+ * `\n` in the PTY byte stream, including the ones zsh sprinkles for
+ * aesthetic vertical spacing around its prompt and the ones inside
+ * bracketed-paste toggles. Rejoining them naively produces walls of
+ * blank vertical space between commands (5+ blank rows was the
+ * observed baseline on Kali's default zsh setup). We preserve single
+ * intentional blank lines (harmless) but cap consecutive-empty runs at
+ * one so the terminal reads like an actual terminal.
+ */
+function collapseBlankRuns(lines: string[]): string[] {
+  const out: string[] = [];
+  let prevEmpty = false;
+  for (const l of lines) {
+    const isEmpty = l.length === 0;
+    if (isEmpty && prevEmpty) continue; // drop
+    out.push(l);
+    prevEmpty = isEmpty;
+  }
+  return out;
+}
+
+/**
  * Inline HTML loaded into the WebView. Kept as a `const` (not a template
  * with interpolated values) so the bundler doesn't have to re-encode it on
  * every render — every re-render with the same `source.html` is treated
@@ -219,14 +242,14 @@ export default function XTermView({ sessionId, onInput, resetToken }: Props) {
     // have been running before the user switched tabs back to AI).
     const s0 = sessionManager.sessions.get(sessionId);
     if (s0 && s0.lines.length) {
-      // Join lines with \r\n between them but NO trailing terminator —
-      // that used to double-space every batch because native's
-      // line-splitter emits ALL PTY newlines as separate lines already
-      // (including zsh's aesthetic blank line + prompt redraws), so
-      // appending our own \r\n meant every command left 2-5 extra blank
-      // rows before the next prompt. Now the last line's cursor lands
-      // exactly where zsh intended it.
-      const initial = s0.lines.map((l) => l.line).join("\r\n");
+      // Interactive PTY streams (zsh, wifite, etc.) emit a LOT of empty
+      // strings via the native line-splitter — one per zsh aesthetic
+      // blank line, one per prompt redraw, one per bracketed-paste
+      // toggle, and so on. Joining raw with \r\n produces walls of
+      // blank vertical space (5+ rows between commands on Kali). Fix:
+      // collapse runs of ≥2 consecutive empty lines down to 1. Genuine
+      // single blank lines pass through untouched.
+      const initial = collapseBlankRuns(s0.lines.map((l) => l.line)).join("\r\n");
       writeToTerm(initial);
       lastLineNoRef.current = s0.lineCount;
     } else {
@@ -243,7 +266,7 @@ export default function XTermView({ sessionId, onInput, resetToken }: Props) {
         // is the very first write (initial replay was empty), no leading
         // separator is needed.
         const prefix = hasWrittenRef.current ? "\r\n" : "";
-        const chunk = prefix + fresh.map((l) => l.line).join("\r\n");
+        const chunk = prefix + collapseBlankRuns(fresh.map((l) => l.line)).join("\r\n");
         writeToTerm(chunk);
       }
       lastLineNoRef.current = s.lineCount;

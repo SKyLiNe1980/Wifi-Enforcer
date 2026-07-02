@@ -37,39 +37,23 @@ const MONO = Platform.select({ ios: "Menlo", android: "monospace", default: "mon
 type ToggleState = "on" | "off" | "unknown" | "probing";
 
 /**
- * `iw dev` dumps a physical→interface tree. We just want the leaf
- * interface names (wlan0, wlan1, mon0…). Format we expect:
- *   phy#0
- *       Interface wlan0
- *           ifindex 42
- *           …
- *       Interface wlan1
- *           ifindex 43
+ * Bulk single-round-trip state probe — ONE root shell call, many parses.
+ * Now includes interface enumeration too, so a full state refresh costs
+ * exactly one `execReal` (and therefore at most one Magisk prompt if the
+ * user has it set to prompt-every-time).
  */
-async function listWlanInterfaces(): Promise<string[]> {
-  if (!HAS_NATIVE_ROOT) return [];
-  try {
-    const res = await execReal(`iw dev 2>/dev/null || true`);
-    const out = res.output || "";
-    const names = new Set<string>();
-    for (const line of out.split(/\r?\n/)) {
-      const m = line.trim().match(/^Interface\s+(\S+)/);
-      if (m) names.add(m[1]);
-    }
-    return Array.from(names).sort();
-  } catch { return []; }
-}
-
-/** Bulk single-round-trip state probe — one root shell call, many parses. */
 async function probeAllStates(iface: string, country: string): Promise<{
   wifiOn: ToggleState;
   ifaceUp: ToggleState;
   regDomain: ToggleState;
   monitor: ToggleState;
   info: { mode?: string; channel?: string; txpower?: string; mac?: string };
+  interfaces: string[];
   raw: string;
 }> {
   const cmd = [
+    `echo "=== ifaces ==="`,
+    `iw dev 2>/dev/null || true`,
     `echo "=== wifi_on ==="`,
     `settings get global wifi_on 2>/dev/null || echo unknown`,
     `echo "=== link ==="`,
@@ -81,6 +65,15 @@ async function probeAllStates(iface: string, country: string): Promise<{
   ].join(" ; ");
   const res = await execReal(cmd);
   const out = res.output || "";
+
+  // Interface list from `iw dev` block
+  const ifaceBlock = (out.match(/=== ifaces ===[\s\S]*?(?====|$)/) || [""])[0];
+  const interfacesSet = new Set<string>();
+  for (const line of ifaceBlock.split(/\r?\n/)) {
+    const m = line.trim().match(/^Interface\s+(\S+)/);
+    if (m) interfacesSet.add(m[1]);
+  }
+  const interfaces = Array.from(interfacesSet).sort();
 
   // wifi_on: `1` or `0` (Android setting)
   const wifiOnMatch = out.match(/=== wifi_on ===\s*\r?\n\s*(\d)/);
@@ -123,6 +116,7 @@ async function probeAllStates(iface: string, country: string): Promise<{
       txpower: txpowerMatch?.[1],
       mac: macMatch?.[1],
     },
+    interfaces,
     raw: out,
   };
 }
@@ -155,12 +149,12 @@ export default function WlanControl({
     if (!HAS_NATIVE_ROOT) return;
     setProbing(true);
     try {
-      const [ifaces, snap] = await Promise.all([
-        listWlanInterfaces(),
-        probeAllStates(iface, country),
-      ]);
+      const snap = await probeAllStates(iface, country);
       if (!mountedRef.current) return;
-      setDetected(ifaces);
+      // Interface list now comes from the same batched probe — no
+      // separate root call needed. Falls back to previous list if the
+      // probe returns empty (transient failure).
+      if (snap.interfaces.length > 0) setDetected(snap.interfaces);
       setState(snap);
     } catch (e) {
       console.warn("[WlanControl] probe failed:", e);
@@ -169,13 +163,14 @@ export default function WlanControl({
     }
   }, [iface, country]);
 
-  // Initial probe + periodic refresh while mounted. 4s cadence is a
-  // compromise: fast enough that toggle latency feels alive, slow enough
-  // that a chain of root shells doesn't hammer the device.
+  // Initial probe on mount, and re-probe whenever the target iface or
+  // country changes (both are legit user-initiated triggers). NO polling
+  // loop — a repeated root call every N seconds caused a firehose of
+  // Magisk prompts on some devices and flickered the sync chip. State
+  // is now only ever refreshed on: initial mount · iface/country change
+  // · after a toggle fires · manual "sync" tap.
   useEffect(() => {
     refresh();
-    const t = setInterval(refresh, 4000);
-    return () => clearInterval(t);
   }, [refresh]);
 
   const runAndRefresh = useCallback(async (cmd: string, label: string) => {
