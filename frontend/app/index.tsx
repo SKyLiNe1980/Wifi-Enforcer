@@ -28,6 +28,7 @@ import LiveTab from "../src/components/LiveTab";
 import AITab from "../src/components/AITab";
 import MCPTab from "../src/components/MCPTab";
 import TerminalShell from "../src/components/TerminalShell";
+import WlanControl from "../src/components/WlanControl";
 import {
   settingsLocal,
   profilesLocal,
@@ -196,19 +197,15 @@ type ExecMode = "mock" | "real" | "kali";
 
 const NETHUNTER_CHROOT = "/data_mirror/data_ce/null/0/com.offsec.nethunter/scripts/bin/busybox_nh chroot /data/local/nhsystem/kalifs /usr/bin/sudo -E PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
+// Diagnostic read-only queries. The stateful controls (WiFi service,
+// iface up/down, reg domain, monitor mode, channel) moved into
+// <WlanControl /> as glow-dot toggles — see quick tab render. What
+// remains here are pure introspection commands that get relocated to
+// the Settings tab's `// diagnostics` section.
 const QUICK_COMMANDS: { label: string; cmd: (c: Ctx) => string; icon: any }[] = [
-  { label: "Disable WiFi", cmd: () => "svc wifi disable", icon: "wifi-off" },
-  { label: "Enable WiFi", cmd: () => "svc wifi enable", icon: "wifi" },
-  { label: "Iface DOWN", cmd: (c) => `ifconfig ${c.iface} down`, icon: "arrow-down-bold" },
-  { label: "Iface UP", cmd: (c) => `ifconfig ${c.iface} up`, icon: "arrow-up-bold" },
-  { label: "Set Iface prop", cmd: (c) => `setprop wifi.interface ${c.iface}`, icon: "code-tags" },
-  { label: "iw reg set", cmd: (c) => `iw reg set ${c.country}`, icon: "earth" },
-  { label: "wifi.country", cmd: (c) => `setprop wifi.country ${c.country}`, icon: "flag" },
-  { label: "Force CC", cmd: (c) => `cmd wifi force-country-code enabled ${c.country}`, icon: "shield-check" },
-  { label: "Reset CC", cmd: () => "cmd wifi force-country-code disabled", icon: "shield-off" },
-  { label: "iw reg get", cmd: () => "iw reg get", icon: "magnify" },
-  { label: "iwconfig", cmd: () => "iwconfig", icon: "console-line" },
-  { label: "wifi status", cmd: () => "cmd wifi status", icon: "information" },
+  { label: "iw reg get",    cmd: () => "iw reg get",     icon: "magnify" },
+  { label: "iwconfig",      cmd: () => "iwconfig",       icon: "console-line" },
+  { label: "wifi status",   cmd: () => "cmd wifi status", icon: "information" },
 ];
 
 // ---------- Syntax tinting ----------
@@ -926,39 +923,32 @@ export default function App() {
       </View>
 
       <View style={[s.sectionRow, { marginTop: 24 }]}>
-        <Text style={s.sectionTitle}>// quick actions</Text>
+        <Text style={s.sectionTitle}>// wlan control</Text>
         <TouchableOpacity testID="btn-save-profile" onPress={() => setSaveOpen(true)} style={s.smallBtn}>
           <Ionicons name="bookmark-outline" size={12} color={C.green} />
           <Text style={s.smallBtnText}>save as profile</Text>
         </TouchableOpacity>
       </View>
 
-      <View style={s.grid}>
-        {QUICK_COMMANDS.map((q, i) => {
-          const cmd = q.cmd(ctxActive);
-          return (
-            <TouchableOpacity key={i} testID={`quick-${i}`} style={s.gridItem}
-              onPress={() => {
-                execute(cmd);
-                // Force Terminal into "classic" mode so the output is
-                // actually visible — previously, if the user had toggled
-                // to "shell" sub-tab the Quick command would fire silently
-                // into the void and confuse them.
-                setTerminalMode("classic");
-                setTab("terminal");
-              }} disabled={running} activeOpacity={0.7}>
-              <View style={{ flexDirection: "row", alignItems: "center", marginBottom: 4 }}>
-                <MaterialCommunityIcons name={q.icon} size={16} color={C.green} />
-                <Text style={[s.gridLabel, { marginLeft: 6 }]}>{q.label}</Text>
-              </View>
-              <Text style={s.gridCmd} numberOfLines={1}>{cmd}</Text>
-            </TouchableOpacity>
-          );
-        })}
-      </View>
+      <WlanControl
+        iface={primaryIface}
+        country={country}
+        onIfaceChange={(i) => setIface(i)}
+        disabled={running}
+        onExecCommand={async (cmd) => {
+          // Reuse the existing exec pipeline so command_logs, exec_mode
+          // wrapping, and the terminal jump-to-classic behavior all still
+          // apply. `wrap` is out of scope here (it's a closure in
+          // renderQuick's parent) — we invoke `execute` directly.
+          execute(cmd);
+          setTerminalMode("classic");
+          setTab("terminal");
+        }}
+      />
 
-      <Text style={[s.helper, { marginTop: 18 }]}>
-        tip: tapping any action runs it & jumps to the terminal&apos;s classic view.
+      <Text style={[s.helper, { marginTop: 18, color: C.textDim }]}>
+        diagnostics (iw reg get, iwconfig, wifi status) moved to{" "}
+        <Text style={{ color: C.cyan }}>set → // diagnostics</Text>.
       </Text>
     </ScrollView>
   );
@@ -1148,6 +1138,33 @@ export default function App() {
         <KV k="os" v={rootInfo?.android_version || "..."} vColor={C.cyan} />
         <KV k="active iface" v={activeIface === "ALL" ? `ALL (${activeIfaces.join(", ")})` : `${activeIface} · ${primaryIface}`} vColor={C.cyan} />
         <KV k="api" v={API} vColor={C.textDim} />
+      </View>
+
+      {/* ─── Diagnostics — read-only wlan queries relocated from the
+          Quick tab when the toggle-based redesign landed. These don't
+          fit the toggle pattern (no on/off state, just print info) so
+          they live here as one-shot introspection cards. ─── */}
+      <Text style={[s.sectionTitle, { marginTop: 18 }]}>{"// diagnostics"}</Text>
+      <View style={s.grid}>
+        {QUICK_COMMANDS.map((q, i) => {
+          const cmd = q.cmd(ctxActive);
+          return (
+            <TouchableOpacity
+              key={i}
+              testID={`diag-${i}`}
+              style={s.gridItem}
+              onPress={() => { execute(cmd); setTerminalMode("classic"); setTab("terminal"); }}
+              disabled={running}
+              activeOpacity={0.7}
+            >
+              <View style={{ flexDirection: "row", alignItems: "center", marginBottom: 4 }}>
+                <MaterialCommunityIcons name={q.icon} size={16} color={C.green} />
+                <Text style={[s.gridLabel, { marginLeft: 6 }]}>{q.label}</Text>
+              </View>
+              <Text style={s.gridCmd} numberOfLines={1}>{cmd}</Text>
+            </TouchableOpacity>
+          );
+        })}
       </View>
 
       {/* ─── Data load status — visibility into the previously-silent
