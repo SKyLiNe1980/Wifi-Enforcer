@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# enforcer-cloud-probe-commands — determine which Redis commands are
+# exposed via the Upstash REST proxy allowlist. Zero-payload, safe on
+# a production/multi-tenant Upstash instance because we never actually
+# invoke the target commands with real arguments; we only look at how
+# Upstash rejects a bare invocation.
+#
+# Strategy
+# --------
+# Send each command name with zero arguments to /pipeline. The response
+# type gives us four distinct signals:
+#
+#   {"error": "ERR unknown command …"}      → NOT SUPPORTED — Upstash's Redis fork doesn't have this
+#                                              command (either patched out or never present)
+#   {"error": "ERR wrong number of arguments …"} → PASSTHROUGH — command is exposed by the REST
+#                                              allowlist AND accepted by the Redis server; our
+#                                              zero-arg call bounced on argument parsing
+#   {"error": "ERR .*(forbidden|not allowed|blocked|blacklisted).*"}
+#                                            → FORBIDDEN — REST layer refuses to relay it
+#   {"result": …}                            → PASSTHROUGH — 0-arg version happened to succeed (rare)
+#
+# This does NOT actually attempt to trigger any CVE. It's purely a
+# capability discovery pass useful for Hermes / UEF workflows that need
+# to know what's reachable before designing test cases.
+#
+# Usage:
+#   enforcer-cloud-probe-commands                        # default probe set
+#   enforcer-cloud-probe-commands XACK XACKDEL XADD XLEN # explicit list
+#   enforcer-cloud-probe-commands --file cmds.txt        # one command per line
+#   enforcer-cloud-probe-commands --json                 # machine-parseable output
+#
+# Default probe set focuses on the Redis Streams family since that's
+# what most of the 8.x CVEs have concentrated on.
+
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./enforcer-cloud-common.sh
+. "$SCRIPT_DIR/enforcer-cloud-common.sh"
+
+cloud_parse_args "$@"
+
+if [[ -n "${ENFORCER_CLOUD_HELP:-}" ]]; then
+    sed -n '2,/^set -e/p' "$0" | sed 's/^# \?//' | head -n -1
+    exit 0
+fi
+cloud_require_creds
+
+# ─── Assemble the command list ────────────────────────────────────
+CMDS=()
+WANT_JSON=0
+FILE=""
+_ARGS=("${ENFORCER_CLOUD_POSITIONAL[@]:-}")
+i=0
+while [[ $i -lt ${#_ARGS[@]} ]]; do
+    case "${_ARGS[$i]}" in
+        --json)  WANT_JSON=1; i=$((i+1)) ;;
+        --file)  FILE="${_ARGS[$((i+1))]}"; i=$((i+2)) ;;
+        *)       CMDS+=("${_ARGS[$i]}"); i=$((i+1)) ;;
+    esac
+done
+if [[ -n "$FILE" ]]; then
+    while IFS= read -r line; do
+        # Skip comments + blank lines.
+        line="${line%%#*}"
+        line="${line//[[:space:]]/}"
+        [[ -n "$line" ]] && CMDS+=("$line")
+    done < "$FILE"
+fi
+if (( ${#CMDS[@]} == 0 )); then
+    # Default probe set — Streams-focused because of 8.x CVE clustering.
+    CMDS=(
+        # Core streams
+        XADD XREAD XREADGROUP XRANGE XREVRANGE XLEN XDEL XTRIM
+        XGROUP XPENDING XACK XCLAIM XAUTOCLAIM XINFO XSETID
+        # Interesting new-ish additions
+        XACKDEL
+        # Adjacent primitives that CVEs sometimes chain through
+        DEBUG COMMAND CONFIG LATENCY MEMORY MONITOR RESET
+        SUBSCRIBE PSUBSCRIBE PUBLISH
+        SCRIPT EVAL EVALSHA FUNCTION
+        MODULE OBJECT CLUSTER SLOWLOG
+    )
+fi
+
+cloud_log "probing ${#CMDS[@]} command(s) against $ENFORCER_CLOUD_URL"
+
+# ─── Ship the whole probe as one pipeline for speed ─────────────
+# Each cmd becomes ["<CMD>"] with no args; that's minimally invasive.
+pipeline_body=$(printf '%s\n' "${CMDS[@]}" | jq -Rn '[inputs] | map([.])')
+resp=$(curl --fail-with-body -sS \
+    -X POST "$ENFORCER_CLOUD_URL/pipeline" \
+    -H "Authorization: Bearer $ENFORCER_CLOUD_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d "$pipeline_body")
+
+# ─── Classify each response ─────────────────────────────────────
+# jq -c returns compact JSON lines; we then bash-classify to keep
+# regex logic readable.
+declare -A STATUS
+n=${#CMDS[@]}
+for ((k=0; k<n; k++)); do
+    cmd="${CMDS[$k]}"
+    entry=$(jq -c ".[${k}]" <<<"$resp")
+    err=$(jq -r '.error // empty' <<<"$entry")
+    if [[ -z "$err" ]]; then
+        STATUS["$cmd"]="passthrough"
+        continue
+    fi
+    # Canonical patterns:
+    #   ERR unknown command 'FOO'           → NOT SUPPORTED
+    #   ERR wrong number of arguments …     → PASSTHROUGH (existed, arg-parse failed)
+    #   ERR forbidden / not allowed / blocked → FORBIDDEN by REST allowlist
+    case "$err" in
+        *"unknown command"*)                    STATUS["$cmd"]="unknown" ;;
+        *"wrong number of arguments"*|*"syntax error"*)
+                                                STATUS["$cmd"]="passthrough" ;;
+        *forbidden*|*"not allowed"*|*blocked*|*blacklisted*|*disabled*)
+                                                STATUS["$cmd"]="forbidden" ;;
+        *)                                      STATUS["$cmd"]="error:${err:0:60}" ;;
+    esac
+done
+
+# ─── Render ────────────────────────────────────────────────────
+if (( WANT_JSON == 1 )); then
+    # Build a proper JSON object without bash-templating quotes.
+    out=$(jq -n '{}')
+    for cmd in "${CMDS[@]}"; do
+        out=$(jq --arg k "$cmd" --arg v "${STATUS[$cmd]}" '. + {($k): $v}' <<<"$out")
+    done
+    echo "$out"
+else
+    printf '\n%-16s %-14s %s\n' "COMMAND" "STATUS" "note"
+    printf '%-16s %-14s %s\n' "───────" "──────" "────"
+    for cmd in "${CMDS[@]}"; do
+        s="${STATUS[$cmd]}"
+        case "$s" in
+            passthrough) note="reachable — command exists and is allowlisted" ;;
+            unknown)     note="not present in Upstash's Redis fork (patched or older build)" ;;
+            forbidden)   note="REST allowlist refuses to relay" ;;
+            *)           note="see raw error" ;;
+        esac
+        printf '%-16s %-14s %s\n' "$cmd" "$s" "$note"
+    done
+    printf '\n'
+fi

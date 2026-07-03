@@ -33,6 +33,7 @@
 - 2.B · Tier 1 in-app deploy (bundled .deb → python3 http.server in chroot over Tailscale → curl|dpkg one-liner on target)
 - Deploy modal hardening: orphan reap · port conflict check · DIAGNOSE button · SHA verify against bundled sidecar
 - 2.C · Cloud OTA via Redis-as-registry (`enforcer-cloud-{push,pull,rollback,status}` scripts) — cockpit pushes .deb blob + meta to Upstash, nodes pull + sha256-verify + dpkg -i. Enables fleet-wide updates without SCP-per-node.
+- 2.D · Chroot-aware maintainer scripts (0.3.2) — postinst/postrm/prerm and `enforcer-mcp-set-bind` detect the NetHunter dpkg-divert stub via `/usr/bin/systemctl.real` marker. Real-systemd hosts (Kali VPS) still get the full lifecycle dance; chroot hosts silently defer to cockpit autospawn. `docs/NETHUNTER_TAILSCALE.md` captures the userspace-networking + DNS/nsswitch recipe for the S10 cockpit.
 
 ### 🔥 In progress / just shipped (this session)
 - Terminal spacing fix (XTermView join strategy)

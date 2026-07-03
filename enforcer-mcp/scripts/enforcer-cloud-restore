@@ -1,0 +1,189 @@
+#!/usr/bin/env bash
+# enforcer-cloud-restore — restore an enforcer:mcp:* snapshot back into
+# Upstash. The counterpart to enforcer-cloud-snapshot.
+#
+# Usage:
+#   enforcer-cloud-restore /path/to/snapshot.json.gz            # replay every key from the file
+#   enforcer-cloud-restore snapshot.json.gz --dry-run           # show what would be written
+#   enforcer-cloud-restore snapshot.json.gz --wipe              # DEL every enforcer:mcp:* key
+#                                                               #   first, then restore
+#
+# Safety:
+#   • Refuses to run without --force if any key in the snapshot already
+#     exists in the cloud with a DIFFERENT value (protects against
+#     accidentally overwriting a live registry with stale bytes).
+#   • Signal + latest pointer are written LAST, so if the pipeline
+#     dies mid-restore the fleet still points at whatever was live
+#     before this run.
+
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./enforcer-cloud-common.sh
+. "$SCRIPT_DIR/enforcer-cloud-common.sh"
+
+cloud_parse_args "$@"
+
+if [[ -n "${ENFORCER_CLOUD_HELP:-}" ]]; then
+    sed -n '2,/^set -e/p' "$0" | sed 's/^# \?//' | head -n -1
+    exit 0
+fi
+cloud_require_creds
+
+# First positional is the snapshot file. --wipe is opt-in.
+SNAPSHOT=""
+WIPE=0
+_ARGS=("${ENFORCER_CLOUD_POSITIONAL[@]:-}")
+i=0
+while [[ $i -lt ${#_ARGS[@]} ]]; do
+    case "${_ARGS[$i]}" in
+        --wipe) WIPE=1; i=$((i+1)) ;;
+        *)      [[ -z "$SNAPSHOT" ]] && SNAPSHOT="${_ARGS[$i]}"; i=$((i+1)) ;;
+    esac
+done
+
+if [[ -z "$SNAPSHOT" || ! -r "$SNAPSHOT" ]]; then
+    cloud_err "usage: enforcer-cloud-restore <snapshot.json.gz> [--wipe] [--force] [--dry-run]"
+    exit 2
+fi
+
+# ─── Load + validate snapshot ────────────────────────────────────────
+cloud_log "reading: $SNAPSHOT"
+# Support both .json.gz and plain .json for convenience.
+if [[ "$SNAPSHOT" == *.gz ]]; then
+    RAW=$(gunzip -c "$SNAPSHOT")
+else
+    RAW=$(cat "$SNAPSHOT")
+fi
+VERSION=$(jq -r '.version // 0' <<<"$RAW")
+if [[ "$VERSION" != "1" ]]; then
+    cloud_err "unsupported snapshot version: $VERSION (expected 1)"
+    exit 3
+fi
+PREFIX=$(jq -r '.prefix' <<<"$RAW")
+COUNT=$(jq -r '.key_count' <<<"$RAW")
+TAKEN_AT=$(jq -r '.taken_at' <<<"$RAW")
+cloud_log "snapshot taken:  $TAKEN_AT"
+cloud_log "prefix:          $PREFIX"
+cloud_log "keys in file:    $COUNT"
+
+# ─── Drift check: any live keys already differ from snapshot? ────────
+# We fetch the current values of every snapshot key in bulk and diff.
+# If ANY differ, we bail unless --force. This protects a busy live
+# registry from being clobbered by an ancient snapshot.
+if [[ -z "${ENFORCER_CLOUD_FORCE:-}" && "$COUNT" -gt 0 ]]; then
+    cloud_log "checking for drift against live cloud …"
+    keys_arr=$(jq -c '.keys | keys' <<<"$RAW")
+    cmds=$(jq -c '[.[] | ["GET", .]]' <<<"$keys_arr")
+    live=$(curl --fail-with-body -sS \
+        -X POST "$ENFORCER_CLOUD_URL/pipeline" \
+        -H "Authorization: Bearer $ENFORCER_CLOUD_TOKEN" \
+        -H "Content-Type: application/json" \
+        -d "$cmds")
+    drift=0
+    n=$(jq 'length' <<<"$keys_arr")
+    for ((k=0; k<n; k++)); do
+        key=$(jq -r ".[${k}]" <<<"$keys_arr")
+        snap_val=$(jq -r --arg k "$key" '.keys[$k]' <<<"$RAW")
+        live_val=$(jq -r ".[${k}].result // empty" <<<"$live")
+        # Empty live == key doesn't exist; that's fine, just restore.
+        if [[ -n "$live_val" && "$live_val" != "$snap_val" ]]; then
+            drift=$((drift+1))
+            [[ $drift -le 3 ]] && cloud_warn "drift: $key differs (--force to overwrite)"
+        fi
+    done
+    if (( drift > 0 )); then
+        cloud_err "$drift key(s) in cloud differ from snapshot. Pass --force to overwrite."
+        exit 4
+    fi
+fi
+
+# ─── Optional wipe: DEL every enforcer:mcp:* key first ───────────────
+if (( WIPE == 1 )); then
+    cloud_log "wiping keys matching $PREFIX* before restore …"
+    if [[ -z "${ENFORCER_CLOUD_FORCE:-}" && -z "${ENFORCER_CLOUD_DRY_RUN:-}" ]]; then
+        read -r -p "REALLY wipe all $PREFIX* keys in $ENFORCER_CLOUD_URL? (y/N) " ans
+        [[ "$ans" =~ ^[Yy]$ ]] || { cloud_warn "aborted"; exit 0; }
+    fi
+    # SCAN + DEL loop identical to snapshot's enumeration.
+    CURSOR="0"
+    while : ; do
+        resp=$(cloud_cmd SCAN "$CURSOR" MATCH "${PREFIX}*" COUNT 200)
+        CURSOR=$(echo "$resp" | jq -r '.result[0]')
+        batch_keys=$(echo "$resp" | jq -c '.result[1]')
+        if [[ "$batch_keys" != "null" && "$batch_keys" != "[]" ]]; then
+            if [[ -z "${ENFORCER_CLOUD_DRY_RUN:-}" ]]; then
+                # DEL k1 k2 k3 ...
+                del_cmd=$(jq -c '["DEL"] + .' <<<"$batch_keys")
+                curl --fail-with-body -sS \
+                    -X POST "$ENFORCER_CLOUD_URL" \
+                    -H "Authorization: Bearer $ENFORCER_CLOUD_TOKEN" \
+                    -H "Content-Type: application/json" \
+                    -d "$del_cmd" >/dev/null
+            fi
+        fi
+        [[ "$CURSOR" == "0" ]] && break
+    done
+    cloud_ok "wipe complete."
+fi
+
+# ─── Dry-run stops here ──────────────────────────────────────────────
+if [[ -n "${ENFORCER_CLOUD_DRY_RUN:-}" ]]; then
+    cloud_warn "dry-run — would restore $COUNT key(s) to $ENFORCER_CLOUD_URL"
+    exit 0
+fi
+
+# ─── Restore: writes done in chunks of 100 SETs per pipeline ─────────
+cloud_log "restoring $COUNT key(s) …"
+keys_arr=$(jq -c '.keys | keys' <<<"$RAW")
+n=$(jq 'length' <<<"$keys_arr")
+CHUNK=100
+IDX=0
+# Signal + latest pointer written last (they gate what nodes see).
+SIGNAL_KEY="${PREFIX}deb:signal"
+LATEST_KEY="${PREFIX}deb:latest"
+while (( IDX < n )); do
+    end=$((IDX + CHUNK))
+    (( end > n )) && end=$n
+    cmds="["
+    first=1
+    for ((k=IDX; k<end; k++)); do
+        key=$(jq -r ".[${k}]" <<<"$keys_arr")
+        # Defer signal + latest to a final pipeline.
+        [[ "$key" == "$SIGNAL_KEY" || "$key" == "$LATEST_KEY" ]] && continue
+        val=$(jq -r --arg k "$key" '.keys[$k]' <<<"$RAW")
+        (( first == 0 )) && cmds+=","
+        first=0
+        cmds+=$(jq -cn --arg k "$key" --arg v "$val" '["SET",$k,$v]')
+    done
+    cmds+="]"
+    if [[ "$cmds" != "[]" ]]; then
+        resp=$(curl --fail-with-body -sS \
+            -X POST "$ENFORCER_CLOUD_URL/pipeline" \
+            -H "Authorization: Bearer $ENFORCER_CLOUD_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$cmds")
+        if echo "$resp" | jq -e '.[] | select(.error)' >/dev/null 2>&1; then
+            cloud_err "pipeline rejected part of the batch:"
+            echo "$resp" | jq . >&2
+            exit 5
+        fi
+    fi
+    IDX=$end
+    cloud_log "  restored $IDX / $n"
+done
+
+# ─── Final: signal + latest (in that order) ─────────────────────────
+final=()
+sig_val=$(jq -r --arg k "$SIGNAL_KEY" '.keys[$k] // empty' <<<"$RAW")
+lat_val=$(jq -r --arg k "$LATEST_KEY" '.keys[$k] // empty' <<<"$RAW")
+if [[ -n "$lat_val" ]]; then
+    final+=("$(jq -cn --arg v "$lat_val" '["SET","'"$LATEST_KEY"'",$v]')")
+fi
+if [[ -n "$sig_val" ]]; then
+    final+=("$(jq -cn --arg v "$sig_val" '["SET","'"$SIGNAL_KEY"'",$v]')")
+fi
+if (( ${#final[@]} > 0 )); then
+    cloud_pipeline "${final[@]}" >/dev/null
+fi
+
+cloud_ok "restore complete: $COUNT key(s) written from $SNAPSHOT"

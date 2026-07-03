@@ -26,6 +26,7 @@ import {
   type MCPConfig, type MCPTool, type MCPAuditEntry, type MCPNode,
 } from "../lib/localDb";
 import { startStream, killStream, hasNativeStreaming, execReal, HAS_NATIVE_ROOT } from "../lib/rootShell";
+import { detectTailnetIp } from "../lib/tailnetDetect";
 import {
   prepareDebPayload, detectTailscaleIp, startHttpServer, stopHttpServer,
   buildInstallOneLiner, diagnoseDeploy, reapStaleHttpServers,
@@ -255,6 +256,40 @@ export default function MCPTab() {
   useEffect(() => {
     refresh().catch((e) => console.warn("[MCPTab] refresh failed:", e));
   }, [refresh]);
+
+  // ─── Auto-detect this device's tailnet IP on cockpit startup ────────
+  // If the probe host is still the loopback default (127.0.0.1 — never
+  // manually customized by the operator), take one shot at detecting
+  // the local tailnet IP and stuffing it into the field. This saves
+  // the operator from copy-pasting `tailscale ip -4` output every time
+  // they reinstall the APK.
+  //
+  // Guarded so we ONLY overwrite the default; if the operator has
+  // deliberately set something else (a specific chroot IP, a Docker
+  // bridge, etc.) we leave it alone. Detection runs once per mount,
+  // and silently no-ops if RootShell / tailscale aren't available
+  // (e.g. Expo Go preview, non-rooted device).
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      // Read the current value fresh — don't depend on `config` here
+      // because we don't want this effect firing on every config poke.
+      const c = await mcpLocal.getConfig();
+      const cur = (c.cockpit_probe_host || "").trim();
+      // Anything other than the loopback default means the operator
+      // has intentionally chosen a host — don't touch it.
+      if (cur !== "" && cur !== "127.0.0.1") return;
+      const detected = await detectTailnetIp();
+      if (!detected || cancelled) return;
+      await mcpLocal.updateConfig({ cockpit_probe_host: detected });
+      // Refresh the UI so the input shows the new value immediately.
+      if (!cancelled) {
+        setProbeInput(detected);
+        await refreshConfig();
+      }
+    })().catch((e) => console.warn("[MCPTab] tailnet auto-detect failed:", e));
+    return () => { cancelled = true; };
+  }, [refreshConfig]);
 
   // Save-on-unmount safety net: TextInput.onBlur is unreliable when a
   // component unmounts (tab switch with keyboard still open, back-swipe,

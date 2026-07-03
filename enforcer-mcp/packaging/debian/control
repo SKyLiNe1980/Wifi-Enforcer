@@ -3,8 +3,8 @@ Section: net
 Priority: optional
 Architecture: all
 Maintainer: enforcer-swarm <enforcer@localhost>
-Depends: python3 (>= 3.11), python3-venv, python3-pip, adduser, systemd, ca-certificates
-Recommends: aircrack-ng, iw, wireless-tools
+Depends: python3 (>= 3.11), python3-venv, python3-pip, adduser, ca-certificates, curl
+Recommends: jq, systemd, aircrack-ng, iw, wireless-tools
 Description: Enforcer MCP server for distributed wireless pentesting swarms
  The enforcer-mcp service exposes a Model Context Protocol (MCP) endpoint
  over HTTP+SSE so autonomous LLM agents (Hermes, Claude, etc.) can drive
@@ -19,3 +19,9 @@ Description: Enforcer MCP server for distributed wireless pentesting swarms
  Features include real PTY-backed sessions for interactive curses tools,
  a bounded SQLite audit log, and a YAML-driven tool registry that can
  be live-synced from the cockpit.
+ .
+ Runtime deps kept minimal: `curl` is the only required client used
+ by the cloud OTA helpers; `jq` is Recommended (needed for the
+ enforcer-cloud-* helper scripts). `systemd` is Recommended, not
+ Required, so the .deb installs cleanly inside Kali NetHunter chroots
+ where systemd is held via dpkg-divert — see docs/NETHUNTER_TAILSCALE.md.

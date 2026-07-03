@@ -76,6 +76,21 @@ case "$1" in
             chown root:"$GROUP_NAME" "$CONFIG_FILE" || true
             chmod 0640 "$CONFIG_FILE" || true
             echo "enforcer-mcp: existing config preserved at $CONFIG_FILE"
+            # ── 3b. loopback-bind trap (pre-0.3.1 default) ──────────────
+            # Fresh installs before 0.3.1 defaulted server.host to
+            # "127.0.0.1", which made the node invisible to remote
+            # cockpits probing over tailnet. If this node is one of
+            # those, print a big loud hint. We deliberately do NOT edit
+            # the file — Debian conffile etiquette says config edits are
+            # the operator's decision.
+            if grep -Eq '^[[:space:]]+host:[[:space:]]*"?127\.0\.0\.1"?' "$CONFIG_FILE" 2>/dev/null; then
+                echo ""
+                echo "enforcer-mcp: ⚠ server.host is 127.0.0.1 — this node will NOT be reachable"
+                echo "enforcer-mcp:   from a remote cockpit over Tailscale. To fix:"
+                echo "enforcer-mcp:     sudo enforcer-mcp-set-bind 0.0.0.0"
+                echo "enforcer-mcp:   (the helper takes a timestamped backup + restarts the service)"
+                echo ""
+            fi
         fi
 
         # ── 4. virtualenv + pip deps ────────────────────────────────────
@@ -101,20 +116,45 @@ case "$1" in
             fi
         fi
 
-        # ── 5. systemd reload + enable + start ─────────────────────────
-        if [ -d /run/systemd/system ]; then
+        # ── 5. Service lifecycle (init-system-aware) ──────────────────
+        # Fleet reality: nodes run on Debian-derived VPSes (real systemd)
+        # AND inside Kali NetHunter chroots (no systemd — the Kali team
+        # holds+diverts systemd/systemctl/dbus/polkit to keep dpkg happy,
+        # so /usr/bin/systemctl exists but is a no-op stub). We detect the
+        # difference so postinst does the right thing on both:
+        #
+        #   • real systemd   → daemon-reload + enable + start/try-restart
+        #   • diverted/none  → skip the systemctl dance and print a hint
+        #                      that lifecycle is owned by the cockpit's
+        #                      autospawn feature instead.
+        #
+        # Detection criteria:
+        #   1. /run/systemd/system exists (systemd's own presence marker)
+        #   2. systemctl binary present in PATH
+        #   3. NOT a dpkg-diverted stub (the divert leaves .real behind)
+        if [ -d /run/systemd/system ] \
+            && command -v systemctl >/dev/null 2>&1 \
+            && [ ! -f /usr/bin/systemctl.real ]
+        then
             systemctl daemon-reload || true
             systemctl enable enforcer-mcp.service >/dev/null 2>&1 || true
-            # Only auto-start on FRESH installs. Upgrade keeps the old
-            # state (already-running stays running, already-stopped stays
-            # stopped). The `try-restart` after deb-systemd would handle
-            # the actually-running case but we want zero surprise on
-            # upgrade so we skip it.
-            if [ -z "$2" ]; then
-                systemctl start enforcer-mcp.service || true
-            else
-                systemctl try-restart enforcer-mcp.service || true
-            fi
+            # ALWAYS start on both fresh install AND upgrade paths.
+            #
+            # Rationale: prerm on upgrade unconditionally stops the
+            # service (needed to release files during dpkg unpack).
+            # By the time postinst runs, the service is guaranteed
+            # stopped, so `try-restart` would be a no-op — the service
+            # would stay dead until manual intervention. This is a
+            # subtle Debian maintainer-script gotcha: try-restart only
+            # restarts if currently running, but on upgrade nothing
+            # ever is. `start` is idempotent (no-op if already active)
+            # so it's safe on both paths.
+            systemctl start enforcer-mcp.service || true
+        else
+            echo "enforcer-mcp: no real systemd detected — this looks like a"
+            echo "enforcer-mcp:   chroot / non-systemd environment. Lifecycle is"
+            echo "enforcer-mcp:   managed by the cockpit's autospawn (// mcp →"
+            echo "enforcer-mcp:   Autospawn toggle). Not touching systemctl."
         fi
         ;;
 

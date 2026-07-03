@@ -1,3 +1,95 @@
+enforcer-mcp (0.3.5) unstable; urgency=high
+
+  * FIX: postinst now unconditionally `start`s the service on both fresh
+    install AND upgrade paths. Previous versions used `try-restart` on
+    upgrade, which is state-conditional and no-oped because prerm had
+    already stopped the service — leaving nodes silently dead after
+    every enforcer-cloud-pull upgrade. Diagnosed by Hermes on a live
+    fleet: "clean SIGTERM at 07:34, never restarted".
+  * enforcer-cloud-pull's post-install service bounce is now
+    bulletproof: uses the same chroot-aware detection as postinst,
+    matches the exact unit filename via `list-unit-files --no-legend`
+    (previous grep pattern could miss on some formatting variants),
+    and verifies `systemctl is-active` after restart. If the unit
+    fails to come back up the script exits loudly with
+    diagnostic hints instead of silently claiming success.
+  * These two fixes together mean cloud-pull cycles are now guaranteed
+    to leave the fleet running unless there's a genuine daemon-side
+    fault.
+
+ -- enforcer-swarm <enforcer@localhost>  Fri, 03 Jul 2026 13:00:00 +0000
+
+enforcer-mcp (0.3.4) unstable; urgency=low
+
+  * New helper + MCP tool: enforcer-cloud-probe-commands /
+    cloud_probe_commands. Zero-payload capability discovery — sends
+    each candidate Redis command with no arguments and classifies the
+    response as passthrough / unknown / forbidden. Useful for UEF-style
+    recon of what a REST proxy (Upstash) actually allowlists. Default
+    probe set is Streams-focused (XACK, XACKDEL, XAUTOCLAIM, …) plus
+    adjacent CVE-adjacent primitives (DEBUG, SCRIPT, MODULE, PUBSUB).
+
+ -- enforcer-swarm <enforcer@localhost>  Fri, 03 Jul 2026 12:00:00 +0000
+
+enforcer-mcp (0.3.3) unstable; urgency=medium
+
+  * Five new first-class MCP tools for cloud OTA (Hermes-callable):
+    cloud_status, cloud_pull, cloud_rollback_local, cloud_snapshot,
+    cloud_restore. Each is schema-validated and audit-logged, so LLM
+    agents can drive fleet updates by prompt instead of shelling out
+    through exec_command.
+  * New enforcer-cloud-snapshot / enforcer-cloud-restore helpers.
+    SCAN-driven full-fidelity dump of every enforcer:mcp:* key to a
+    gzipped JSON file (default: /var/lib/enforcer-mcp/snapshots/
+    <UTC>.json.gz). Restore is drift-protected — refuses to run if any
+    live key differs from the snapshot unless --force is passed. Signal
+    + latest pointer are written LAST so mid-flight failures never
+    leave the fleet in a torn state.
+  * debian/control tidy: systemd moved from Depends to Recommends (so
+    the .deb installs cleanly inside NetHunter chroots where systemd
+    is held via dpkg-divert), jq moved from an implicit runtime dep to
+    Recommends (needed by the enforcer-cloud-* scripts but not the
+    daemon), curl explicitly Depends since the OTA scripts require it.
+
+ -- enforcer-swarm <enforcer@localhost>  Fri, 03 Jul 2026 09:30:00 +0000
+
+enforcer-mcp (0.3.2) unstable; urgency=medium
+
+  * Chroot-aware maintainer scripts. postinst / postrm / prerm now
+    detect the NetHunter dpkg-divert stub (looking for
+    /usr/bin/systemctl.real) in addition to the standard /run/systemd/
+    system marker. On a diverted / no-systemd host they skip every
+    systemctl call and print a hint pointing the operator at the
+    cockpit's Autospawn feature instead.
+  * enforcer-mcp-set-bind uses the same detection: on real-systemd
+    hosts it does the classic `systemctl restart`; in a chroot it
+    finds the running server.py via pgrep and SIGTERM/SIGKILLs it,
+    trusting the cockpit's autospawn to relaunch on the next probe
+    cycle.
+  * New docs/NETHUNTER_TAILSCALE.md — the exact userspace-networking
+    recipe for getting Tailscale + MagicDNS working inside the
+    chroot. Includes the DNS / nsswitch gotchas and the held-package
+    minefield.
+
+ -- enforcer-swarm <enforcer@localhost>  Fri, 03 Jul 2026 08:00:00 +0000
+
+enforcer-mcp (0.3.1) unstable; urgency=high
+
+  * Fix: default server.host in config.yaml.example flipped from
+    "127.0.0.1" to "0.0.0.0". Fresh installs on remote swarm nodes were
+    only listening on loopback, so the cockpit's tailnet health probe
+    could never reach them — nodes appeared permanently offline. The
+    daemon still requires a bearer token so this widened bind is safe
+    behind Tailscale ACLs.
+  * New helper: enforcer-mcp-set-bind. In-place safe edit of
+    /etc/enforcer-mcp/config.yaml (timestamped backup + service
+    restart) so existing 0.3.0 nodes can be repaired without a config
+    rewrite. Idempotent, supports --show to print current value.
+  * Postinst upgrade path now inspects the existing config and prints
+    a loud hint if it detects the pre-0.3.1 loopback default.
+
+ -- enforcer-swarm <enforcer@localhost>  Fri, 03 Jul 2026 07:15:00 +0000
+
 enforcer-mcp (0.3.0) unstable; urgency=medium
 
   * Ship the enforcer-cloud-{push,pull,rollback,status} scripts for
