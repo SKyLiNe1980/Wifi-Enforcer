@@ -102,35 +102,17 @@ ${xtermBundle.cssContent}
 <body>
 <div id="boot">// booting xterm.js…</div>
 <div id="t"></div>
-<script>
-// Bootstrap: decode + eval the two vendored payloads (xterm core + fit
-// addon). We keep this synchronous so subsequent code that references
-// Terminal / FitAddon sees them already global. Any decode / eval
-// failure is surfaced to RN via postMessage so the fallback path can
-// swap in a scrollback view instead.
-(function bootstrap() {
-  function b64ToStr(b64) {
-    // atob returns latin-1; xterm.js source is ASCII-safe so this is fine.
-    return atob(b64);
-  }
-  function loadInline(name, b64) {
-    try {
-      // eslint-disable-next-line no-eval
-      (0, eval)(b64ToStr(b64));
-    } catch (e) {
-      if (window.ReactNativeWebView && window.ReactNativeWebView.postMessage) {
-        window.ReactNativeWebView.postMessage(JSON.stringify({
-          type: "load_error",
-          message: "eval failed for " + name + ": " + (e && e.message ? e.message : String(e))
-        }));
-      }
-      throw e;
-    }
-  }
-  loadInline("xterm.min.js",     ${JSON.stringify(xtermBundle.xtermJsB64)});
-  loadInline("addon-fit.min.js", ${JSON.stringify(xtermBundle.fitAddonB64)});
-})();
-</script>
+<!--
+  Load xterm.js + fit addon via data:base64 URLs. The browser's native
+  <script src> loader decodes and executes them in global scope — no
+  eval(), no atob() dance, no IIFE that could fail silently. If the
+  data URL fails to parse, the second script below still runs and
+  displays the fallback message (since Terminal won't be defined).
+  Data URLs on Android WebView support ~2 MB payload; our combined
+  xterm + fit is ~ 300 KB base64, well under the limit.
+-->
+<script src="data:text/javascript;base64,${xtermBundle.xtermJsB64}"></script>
+<script src="data:text/javascript;base64,${xtermBundle.fitAddonB64}"></script>
 <script>
 (function () {
   // Helper that talks back to React Native.

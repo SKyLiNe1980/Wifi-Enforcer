@@ -36,6 +36,7 @@ import {
   loadUpstashToken, saveUpstashToken, clearUpstashToken,
   loadUpstashUrl, saveUpstashUrl,
   testConnection as upstashTest, fetchCurrentBearer,
+  rotateBearer,
   discoverEnforcerPeers,
 } from "../lib/tokenStash";
 
@@ -725,6 +726,25 @@ export default function MCPTab() {
       }
       setEditingNode(null);
       refreshLists();
+      // Belt-and-suspenders backup: if the operator has Cloud Sync
+      // configured, mirror this node's bearer to Upstash. Fire-and-forget
+      // — a network failure here shouldn't block the DB save that just
+      // succeeded. This is what closes the "APK reinstall wiped my nodes"
+      // hole: next reinstall, Discover-from-Tailnet + fetchCurrentBearer
+      // can rehydrate every node without SSH.
+      const bearer = (editingNode.bearer_token || "").trim();
+      if (bearer) {
+        (async () => {
+          try {
+            const [url, tok] = await Promise.all([loadUpstashUrl(), loadUpstashToken()]);
+            if (!url || !tok) return; // Cloud Sync not configured — silently skip.
+            await rotateBearer(url, tok, bearer);
+            console.log("[MCPTab] bearer mirrored to Upstash");
+          } catch (e) {
+            console.warn("[MCPTab] Upstash bearer mirror failed:", e);
+          }
+        })();
+      }
     } catch (e: any) {
       Alert.alert("Save failed",
         (e?.message || "sqlite error") +
