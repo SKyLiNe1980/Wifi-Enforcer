@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+# enforcer-cloud-pull — fetch the current cloud .deb and install it.
+#
+# Usage:
+#   enforcer-cloud-pull            # only install if cloud version > installed
+#   enforcer-cloud-pull --force    # re-install even if versions match
+#   enforcer-cloud-pull --dry-run  # download + verify, don't dpkg -i
+#
+# Exit codes:
+#   0  updated (or already up-to-date, or dry-run OK)
+#   2  bad creds / config
+#   3  cloud has nothing to offer
+#   4  sha256 mismatch — refuses to install
+#   5  dpkg install failed
+#
+# The pull side is deliberately paranoid:
+#   • sha256 is checked against the meta record BEFORE dpkg touches the
+#     filesystem. If Upstash returns a corrupted blob, we bail.
+#   • The downloaded .deb is written to a tmpfile with mktemp so a partial
+#     write never becomes a partial install.
+#   • If `enforcer-mcp.service` exists we bounce it after install so the
+#     new server.py actually loads (dpkg does NOT restart services by
+#     default on Debian; only postinst's own systemctl call would, and
+#     ours does that already, but this is the belt-and-suspenders pass).
+
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./enforcer-cloud-common.sh
+. "$SCRIPT_DIR/enforcer-cloud-common.sh"
+
+cloud_parse_args "$@"
+
+if [[ -n "${ENFORCER_CLOUD_HELP:-}" ]]; then
+    sed -n '2,/^set -e/p' "$0" | sed 's/^# \?//' | head -n -1
+    exit 0
+fi
+cloud_require_creds
+
+# ─── Read signal + installed ────────────────────────────────────────
+CLOUD_VERSION=$(cloud_get "enforcer:mcp:deb:signal" || true)
+if [[ -z "$CLOUD_VERSION" ]]; then
+    cloud_err "no signal key in cloud — push a .deb first (or wrong creds)"
+    exit 3
+fi
+INSTALLED=$(cloud_installed_version)
+cloud_log "cloud:     $CLOUD_VERSION"
+cloud_log "installed: ${INSTALLED:-<none>}"
+
+# ─── Skip if already current ────────────────────────────────────────
+if [[ -n "$INSTALLED" && "$INSTALLED" == "$CLOUD_VERSION" && -z "${ENFORCER_CLOUD_FORCE:-}" ]]; then
+    cloud_ok "already at $INSTALLED — nothing to do (use --force to reinstall)"
+    exit 0
+fi
+# Guard against accidental downgrade unless --force.
+if [[ -n "$INSTALLED" && -z "${ENFORCER_CLOUD_FORCE:-}" ]]; then
+    if ! cloud_version_gt "$CLOUD_VERSION" "$INSTALLED"; then
+        cloud_warn "cloud version $CLOUD_VERSION is not newer than installed $INSTALLED"
+        cloud_warn "pass --force to install anyway (downgrade)"
+        exit 0
+    fi
+fi
+
+# ─── Fetch meta + blob ───────────────────────────────────────────────
+cloud_log "fetching meta …"
+META=$(cloud_get "enforcer:mcp:deb:latest" || true)
+if [[ -z "$META" ]]; then
+    cloud_err "signal is $CLOUD_VERSION but latest meta key is empty — fleet is in a torn state"
+    exit 3
+fi
+EXPECTED_SHA=$(echo "$META" | jq -r '.sha256')
+EXPECTED_SIZE=$(echo "$META" | jq -r '.size')
+FILENAME=$(echo "$META" | jq -r '.filename')
+CHANGELOG=$(echo "$META" | jq -r '.changelog // ""')
+[[ -n "$CHANGELOG" ]] && cloud_log "changelog: $CHANGELOG"
+
+cloud_log "fetching blob (~$EXPECTED_SIZE bytes) …"
+B64=$(cloud_get "enforcer:mcp:deb:blob:$CLOUD_VERSION" || true)
+if [[ -z "$B64" ]]; then
+    cloud_err "no blob for version $CLOUD_VERSION — upload was truncated?"
+    exit 3
+fi
+
+# ─── Materialize + verify ───────────────────────────────────────────
+TMPDIR=$(mktemp -d -t enforcer-cloud-pull.XXXXXX)
+trap 'rm -rf "$TMPDIR"' EXIT
+OUT="$TMPDIR/${FILENAME:-enforcer-mcp_${CLOUD_VERSION}_all.deb}"
+echo "$B64" | base64 -d > "$OUT"
+
+ACTUAL_SHA=$(sha256sum "$OUT" | awk '{print $1}')
+ACTUAL_SIZE=$(stat -c%s "$OUT" 2>/dev/null || wc -c < "$OUT")
+if [[ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]]; then
+    cloud_err "sha256 mismatch — refusing to install"
+    cloud_err "  expected: $EXPECTED_SHA"
+    cloud_err "  got:      $ACTUAL_SHA"
+    exit 4
+fi
+if [[ "$ACTUAL_SIZE" != "$EXPECTED_SIZE" ]]; then
+    cloud_warn "size mismatch (expected $EXPECTED_SIZE, got $ACTUAL_SIZE) — continuing since sha256 matched"
+fi
+cloud_ok "verified sha256 → $OUT"
+
+# ─── Dry run stops here ──────────────────────────────────────────────
+if [[ -n "${ENFORCER_CLOUD_DRY_RUN:-}" ]]; then
+    cloud_ok "dry-run — blob downloaded and verified, not installing"
+    cloud_ok "file kept at: $OUT (temp dir will be cleaned when this script exits)"
+    # Move out of the temp dir so it survives the trap.
+    KEEP="/tmp/${FILENAME:-enforcer-mcp_${CLOUD_VERSION}_all.deb}"
+    cp "$OUT" "$KEEP"
+    cloud_ok "copied to $KEEP for inspection"
+    exit 0
+fi
+
+# ─── Install ───────────────────────────────────────────────────────────
+cloud_log "installing via dpkg …"
+if [[ $EUID -ne 0 ]]; then
+    if command -v sudo >/dev/null 2>&1; then
+        SUDO="sudo"
+    else
+        cloud_err "need root to dpkg -i and sudo not available. Re-run as root."
+        exit 5
+    fi
+else
+    SUDO=""
+fi
+if ! $SUDO dpkg -i "$OUT"; then
+    cloud_err "dpkg install failed"
+    exit 5
+fi
+
+# ─── Belt-and-suspenders service bounce ─────────────────────────────
+if systemctl list-unit-files 2>/dev/null | grep -q '^enforcer-mcp\.service'; then
+    cloud_log "restarting enforcer-mcp.service"
+    $SUDO systemctl restart enforcer-mcp.service || cloud_warn "restart returned non-zero — check systemctl status"
+fi
+
+cloud_ok "installed enforcer-mcp $CLOUD_VERSION"

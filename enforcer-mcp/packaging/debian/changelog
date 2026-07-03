@@ -1,3 +1,17 @@
+enforcer-mcp (0.3.0) unstable; urgency=medium
+
+  * Ship the enforcer-cloud-{push,pull,rollback,status} scripts for
+    Redis-as-registry OTA updates. Cockpit pushes the .deb blob (base64)
+    + sha256 meta to Upstash; nodes pull, verify, and dpkg -i without
+    needing SCP-per-node. Rollback is one command (swaps latest ↔
+    previous keys atomically). See README §Cloud OTA.
+  * Scripts auto-source creds from /etc/enforcer-mcp/cloud.env,
+    ~/.enforcer-cloud.env, env vars, or --url/--token CLI flags.
+  * jq + coreutils base64 are the only new runtime deps (already
+    installed on Kali / Debian / NetHunter).
+
+ -- enforcer-swarm <enforcer@localhost>  Fri, 03 Jul 2026 02:00:00 +0000
+
 enforcer-mcp (0.2.0) unstable; urgency=medium
 
   * Add in-app Tier 1 deployment helper: cockpit bundles this .deb as an

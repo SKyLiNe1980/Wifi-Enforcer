@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# enforcer-cloud-rollback — flip the fleet back to the version stored
+# in `enforcer:mcp:deb:previous`. Two flavors:
+#
+#   enforcer-cloud-rollback           # cockpit side: promote previous → latest
+#                                     # in the cloud (so any node's next pull
+#                                     # will fetch the older version).
+#   enforcer-cloud-rollback --local   # node side: just re-install the previous
+#                                     # version locally without touching cloud.
+#
+# Behavior of the cloud rollback:
+#   • SWAP latest ↔ previous meta records
+#   • Update signal to the (now-current) rolled-back version
+#   • Blob keys are untouched — both versions remain retrievable
+#
+# This is intentionally NOT atomic across two `cloud rollback` calls
+# (a second rollback would swap them right back, which is what you'd
+# want mid-outage anyway).
+
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./enforcer-cloud-common.sh
+. "$SCRIPT_DIR/enforcer-cloud-common.sh"
+
+cloud_parse_args "$@"
+
+if [[ -n "${ENFORCER_CLOUD_HELP:-}" ]]; then
+    sed -n '2,/^set -e/p' "$0" | sed 's/^# \?//' | head -n -1
+    exit 0
+fi
+cloud_require_creds
+
+# --local means "reinstall the previous version on THIS node, don't touch cloud"
+LOCAL_MODE=0
+for arg in "${ENFORCER_CLOUD_POSITIONAL[@]:-}"; do
+    [[ "$arg" == "--local" ]] && LOCAL_MODE=1
+done
+
+PREVIOUS=$(cloud_get "enforcer:mcp:deb:previous" || true)
+if [[ -z "$PREVIOUS" ]]; then
+    cloud_err "no previous version in cloud — nothing to roll back to"
+    cloud_err "(this is normal if you've only ever pushed one version)"
+    exit 3
+fi
+PREV_VERSION=$(echo "$PREVIOUS" | jq -r '.version')
+PREV_SHA=$(echo "$PREVIOUS" | jq -r '.sha256')
+cloud_log "previous available: $PREV_VERSION (sha256 $PREV_SHA)"
+
+if (( LOCAL_MODE == 1 )); then
+    # Re-use pull with a version override by setting the signal locally.
+    # Simpler path: fetch previous blob directly, verify, install.
+    cloud_log "local rollback — installing $PREV_VERSION on this node only"
+    B64=$(cloud_get "enforcer:mcp:deb:blob:$PREV_VERSION" || true)
+    if [[ -z "$B64" ]]; then
+        cloud_err "blob for $PREV_VERSION not in cloud"
+        exit 3
+    fi
+    TMPDIR=$(mktemp -d -t enforcer-cloud-rollback.XXXXXX)
+    trap 'rm -rf "$TMPDIR"' EXIT
+    OUT="$TMPDIR/enforcer-mcp_${PREV_VERSION}_all.deb"
+    echo "$B64" | base64 -d > "$OUT"
+    ACTUAL_SHA=$(sha256sum "$OUT" | awk '{print $1}')
+    if [[ "$ACTUAL_SHA" != "$PREV_SHA" ]]; then
+        cloud_err "sha256 mismatch on rollback blob — refusing to install"
+        exit 4
+    fi
+    SUDO=""
+    [[ $EUID -ne 0 ]] && SUDO="sudo"
+    $SUDO dpkg -i --force-downgrades "$OUT"
+    if systemctl list-unit-files 2>/dev/null | grep -q '^enforcer-mcp\.service'; then
+        $SUDO systemctl restart enforcer-mcp.service || true
+    fi
+    cloud_ok "rolled back this node to $PREV_VERSION"
+    exit 0
+fi
+
+# ─── Cloud-side swap ────────────────────────────────────────────────
+LATEST=$(cloud_get "enforcer:mcp:deb:latest" || true)
+if [[ -z "$LATEST" ]]; then
+    cloud_err "latest is empty — there's nothing to demote"
+    exit 3
+fi
+LATEST_VERSION=$(echo "$LATEST" | jq -r '.version')
+
+cloud_warn "about to swap:"
+cloud_warn "  latest   $LATEST_VERSION  →  previous slot"
+cloud_warn "  previous $PREV_VERSION  →  latest slot + signal"
+if [[ -z "${ENFORCER_CLOUD_FORCE:-}" && -z "${ENFORCER_CLOUD_DRY_RUN:-}" ]]; then
+    read -r -p "proceed? (y/N) " ans
+    [[ "$ans" =~ ^[Yy]$ ]] || { cloud_warn "aborted"; exit 0; }
+fi
+
+if [[ -n "${ENFORCER_CLOUD_DRY_RUN:-}" ]]; then
+    cloud_warn "dry-run — not writing"
+    exit 0
+fi
+
+cmds=(
+    "$(jq -cn --arg v "$LATEST"       '["SET","enforcer:mcp:deb:previous",$v]')"
+    "$(jq -cn --arg v "$PREVIOUS"     '["SET","enforcer:mcp:deb:latest",$v]')"
+    "$(jq -cn --arg v "$PREV_VERSION" '["SET","enforcer:mcp:deb:signal",$v]')"
+)
+resp=$(cloud_pipeline "${cmds[@]}")
+if echo "$resp" | jq -e '.[] | select(.error)' >/dev/null 2>&1; then
+    cloud_err "upstash rejected the swap:"
+    echo "$resp" | jq . >&2
+    exit 5
+fi
+cloud_ok "rolled back cloud to $PREV_VERSION (signal + latest updated)"
+cloud_ok "nodes will pull $PREV_VERSION on their next enforcer-cloud-pull"
