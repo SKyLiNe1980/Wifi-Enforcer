@@ -74,11 +74,21 @@ rm -f "$CFG.tmp"
 
 echo "updated server.host: ${current_host:-<not-set>} → $NEW_HOST"
 
-# Restart the service so the new bind takes effect. `try-restart` is a
-# no-op if the unit isn't running (which is the desired behavior for a
-# freshly-provisioned box that hasn't started enforcer-mcp yet).
-if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files 2>/dev/null | grep -q '^enforcer-mcp\.service'; then
-    echo "restarting enforcer-mcp.service …"
+# ─── Restart the server so the new bind takes effect ───────────────────
+# Fleet reality: nodes run on Debian VPSes (real systemd) AND inside Kali
+# NetHunter chroots (dpkg-diverted systemctl stub + no init pid 1). We do
+# a proper capability check so the systemd path fires on real init hosts
+# and the chroot path bounces the process directly via kill+respawn.
+has_real_systemd() {
+    [ -d /run/systemd/system ] \
+        && command -v systemctl >/dev/null 2>&1 \
+        && [ ! -f /usr/bin/systemctl.real ]
+}
+
+if has_real_systemd \
+    && systemctl list-unit-files 2>/dev/null | grep -q '^enforcer-mcp\.service'
+then
+    echo "restarting enforcer-mcp.service via systemd …"
     systemctl restart enforcer-mcp.service
     sleep 1
     if systemctl is-active --quiet enforcer-mcp.service; then
@@ -86,5 +96,41 @@ if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files 2>/dev/null
     else
         echo "! service failed to come up — check: journalctl -u enforcer-mcp -n 40" >&2
         exit 3
+    fi
+else
+    # No real systemd: NetHunter chroot / minimal Alpine-adjacent /
+    # dpkg-divert stub. The cockpit's autospawn is what owns the
+    # process lifecycle here. We can't `systemctl restart` — but we
+    # CAN find and kill any running server.py so autospawn's next
+    # health-probe cycle notices unreachable + relaunches with the
+    # new config.
+    echo "no real systemd detected — bouncing the enforcer-mcp process directly"
+    # pgrep is portable; the pattern matches only the actual python
+    # invocation, not the sudo/bash wrapper (which will exit when its
+    # child dies anyway).
+    if command -v pgrep >/dev/null 2>&1; then
+        pids=$(pgrep -f '/opt/enforcer-mcp/(\.venv/bin/)?python.*server\.py' || true)
+    else
+        pids=$(ps -eo pid,args 2>/dev/null \
+               | awk '/\/opt\/enforcer-mcp\/(\.venv\/bin\/)?python.*server\.py/ && !/awk/ {print $1}')
+    fi
+    if [ -n "$pids" ]; then
+        # SIGTERM first, then SIGKILL after a grace second. That mirrors
+        # what systemd would do internally.
+        echo "  killing pids: $pids"
+        kill $pids 2>/dev/null || true
+        sleep 1
+        # Only SIGKILL survivors.
+        for p in $pids; do
+            if kill -0 "$p" 2>/dev/null; then
+                kill -9 "$p" 2>/dev/null || true
+            fi
+        done
+        echo "✓ old process(es) stopped."
+        echo "  cockpit autospawn will relaunch within ~30 s on next"
+        echo "  health-probe failure. Watch the // mcp tab for status."
+    else
+        echo "  no running server.py found — nothing to bounce."
+        echo "  bring it up from the cockpit's // mcp tab (Autospawn toggle)."
     fi
 fi

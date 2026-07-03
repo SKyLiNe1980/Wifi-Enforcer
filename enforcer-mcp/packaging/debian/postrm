@@ -11,7 +11,12 @@ STATE_DIR=/var/lib/enforcer-mcp
 
 case "$1" in
     remove)
-        if [ -d /run/systemd/system ]; then
+        # Only touch systemd if it's the real deal (not a NetHunter-style
+        # dpkg-divert stub). See postinst for the full rationale.
+        if [ -d /run/systemd/system ] \
+            && command -v systemctl >/dev/null 2>&1 \
+            && [ ! -f /usr/bin/systemctl.real ]
+        then
             systemctl --no-reload disable enforcer-mcp.service >/dev/null 2>&1 || true
             systemctl daemon-reload || true
         fi

@@ -116,8 +116,26 @@ case "$1" in
             fi
         fi
 
-        # ── 5. systemd reload + enable + start ─────────────────────────
-        if [ -d /run/systemd/system ]; then
+        # ── 5. Service lifecycle (init-system-aware) ──────────────────
+        # Fleet reality: nodes run on Debian-derived VPSes (real systemd)
+        # AND inside Kali NetHunter chroots (no systemd — the Kali team
+        # holds+diverts systemd/systemctl/dbus/polkit to keep dpkg happy,
+        # so /usr/bin/systemctl exists but is a no-op stub). We detect the
+        # difference so postinst does the right thing on both:
+        #
+        #   • real systemd   → daemon-reload + enable + start/try-restart
+        #   • diverted/none  → skip the systemctl dance and print a hint
+        #                      that lifecycle is owned by the cockpit's
+        #                      autospawn feature instead.
+        #
+        # Detection criteria:
+        #   1. /run/systemd/system exists (systemd's own presence marker)
+        #   2. systemctl binary present in PATH
+        #   3. NOT a dpkg-diverted stub (the divert leaves .real behind)
+        if [ -d /run/systemd/system ] \
+            && command -v systemctl >/dev/null 2>&1 \
+            && [ ! -f /usr/bin/systemctl.real ]
+        then
             systemctl daemon-reload || true
             systemctl enable enforcer-mcp.service >/dev/null 2>&1 || true
             # Only auto-start on FRESH installs. Upgrade keeps the old
@@ -130,6 +148,11 @@ case "$1" in
             else
                 systemctl try-restart enforcer-mcp.service || true
             fi
+        else
+            echo "enforcer-mcp: no real systemd detected — this looks like a"
+            echo "enforcer-mcp:   chroot / non-systemd environment. Lifecycle is"
+            echo "enforcer-mcp:   managed by the cockpit's autospawn (// mcp →"
+            echo "enforcer-mcp:   Autospawn toggle). Not touching systemctl."
         fi
         ;;
 

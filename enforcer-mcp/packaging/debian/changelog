@@ -1,3 +1,23 @@
+enforcer-mcp (0.3.2) unstable; urgency=medium
+
+  * Chroot-aware maintainer scripts. postinst / postrm / prerm now
+    detect the NetHunter dpkg-divert stub (looking for
+    /usr/bin/systemctl.real) in addition to the standard /run/systemd/
+    system marker. On a diverted / no-systemd host they skip every
+    systemctl call and print a hint pointing the operator at the
+    cockpit's Autospawn feature instead.
+  * enforcer-mcp-set-bind uses the same detection: on real-systemd
+    hosts it does the classic `systemctl restart`; in a chroot it
+    finds the running server.py via pgrep and SIGTERM/SIGKILLs it,
+    trusting the cockpit's autospawn to relaunch on the next probe
+    cycle.
+  * New docs/NETHUNTER_TAILSCALE.md — the exact userspace-networking
+    recipe for getting Tailscale + MagicDNS working inside the
+    chroot. Includes the DNS / nsswitch gotchas and the held-package
+    minefield.
+
+ -- enforcer-swarm <enforcer@localhost>  Fri, 03 Jul 2026 08:00:00 +0000
+
 enforcer-mcp (0.3.1) unstable; urgency=high
 
   * Fix: default server.host in config.yaml.example flipped from
