@@ -128,9 +128,36 @@ if ! $SUDO dpkg -i "$OUT"; then
 fi
 
 # ─── Belt-and-suspenders service bounce ─────────────────────────────
-if systemctl list-unit-files 2>/dev/null | grep -q '^enforcer-mcp\.service'; then
+# This handles the real-systemd case (VPS / bare-metal nodes). Chroots
+# have no systemd — their lifecycle is autospawn-driven from the cockpit
+# and dpkg's own postinst prints a hint saying so, no restart needed.
+#
+# Guard: same detection as postinst — /run/systemd/system present AND
+# systemctl not a NetHunter dpkg-divert stub. On a hit we `restart`
+# (not `try-restart`) because at this point the service is DEFINITELY
+# stopped: prerm on upgrade always stops it, and try-restart's semantics
+# ("only restart if currently running") would then no-op. `restart` is
+# unconditional and idempotent, which is exactly what we want.
+if [ -d /run/systemd/system ] \
+    && command -v systemctl >/dev/null 2>&1 \
+    && [ ! -f /usr/bin/systemctl.real ] \
+    && systemctl list-unit-files --no-pager --no-legend 2>/dev/null \
+        | awk '{print $1}' | grep -qx 'enforcer-mcp.service'
+then
     cloud_log "restarting enforcer-mcp.service"
-    $SUDO systemctl restart enforcer-mcp.service || cloud_warn "restart returned non-zero — check systemctl status"
+    $SUDO systemctl restart enforcer-mcp.service || \
+        cloud_warn "restart returned non-zero — check: journalctl -u enforcer-mcp -n 30"
+    # Post-restart verification — this is what would have caught the
+    # 07:34 SIGTERM-and-forget bug immediately. sleep gives systemd
+    # a beat to run ExecStart before we ask "is it up?".
+    sleep 1
+    if $SUDO systemctl is-active --quiet enforcer-mcp.service; then
+        cloud_ok "enforcer-mcp.service is ACTIVE"
+    else
+        cloud_warn "enforcer-mcp.service is NOT active after restart."
+        cloud_warn "  diagnostics:  journalctl -u enforcer-mcp -n 40 --no-pager"
+        cloud_warn "  manual bring-up:  sudo systemctl start enforcer-mcp"
+    fi
 fi
 
 cloud_ok "installed enforcer-mcp $CLOUD_VERSION"

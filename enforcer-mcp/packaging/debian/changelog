@@ -1,3 +1,24 @@
+enforcer-mcp (0.3.5) unstable; urgency=high
+
+  * FIX: postinst now unconditionally `start`s the service on both fresh
+    install AND upgrade paths. Previous versions used `try-restart` on
+    upgrade, which is state-conditional and no-oped because prerm had
+    already stopped the service — leaving nodes silently dead after
+    every enforcer-cloud-pull upgrade. Diagnosed by Hermes on a live
+    fleet: "clean SIGTERM at 07:34, never restarted".
+  * enforcer-cloud-pull's post-install service bounce is now
+    bulletproof: uses the same chroot-aware detection as postinst,
+    matches the exact unit filename via `list-unit-files --no-legend`
+    (previous grep pattern could miss on some formatting variants),
+    and verifies `systemctl is-active` after restart. If the unit
+    fails to come back up the script exits loudly with
+    diagnostic hints instead of silently claiming success.
+  * These two fixes together mean cloud-pull cycles are now guaranteed
+    to leave the fleet running unless there's a genuine daemon-side
+    fault.
+
+ -- enforcer-swarm <enforcer@localhost>  Fri, 03 Jul 2026 13:00:00 +0000
+
 enforcer-mcp (0.3.4) unstable; urgency=low
 
   * New helper + MCP tool: enforcer-cloud-probe-commands /
