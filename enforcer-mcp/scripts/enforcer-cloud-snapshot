@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+# enforcer-cloud-snapshot — dump every enforcer:mcp:* key from Upstash to
+# a local gzipped JSON file. Portable full-fidelity backup that survives
+# migrating Redis providers or losing your Upstash account. Complements
+# the native Upstash mgmt-API backups (which are quicker but locked to
+# the Upstash platform).
+#
+# Usage:
+#   enforcer-cloud-snapshot                     # to /var/lib/enforcer-mcp/snapshots/
+#   enforcer-cloud-snapshot --out /path/foo.json.gz
+#   enforcer-cloud-snapshot --prefix enforcer:  # override key prefix (default enforcer:mcp:)
+#   enforcer-cloud-snapshot --dry-run           # count matching keys, don't download
+#
+# Output format (uncompressed for readability):
+#   {
+#     "version": 1,
+#     "prefix":  "enforcer:mcp:",
+#     "taken_at": "2026-07-03T09:00:00Z",
+#     "upstash_url": "https://credible-starfish-140287.upstash.io",
+#     "key_count": 42,
+#     "keys": {
+#       "enforcer:mcp:deb:signal": "0.3.2",
+#       "enforcer:mcp:deb:blob:0.3.2": "<base64>",
+#       ...
+#     }
+#   }
+#
+# Restore with enforcer-cloud-restore /path/to/snapshot.json.gz.
+
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./enforcer-cloud-common.sh
+. "$SCRIPT_DIR/enforcer-cloud-common.sh"
+
+cloud_parse_args "$@"
+
+if [[ -n "${ENFORCER_CLOUD_HELP:-}" ]]; then
+    sed -n '2,/^set -e/p' "$0" | sed 's/^# \?//' | head -n -1
+    exit 0
+fi
+cloud_require_creds
+
+PREFIX="${ENFORCER_CLOUD_PREFIX:-enforcer:mcp:}"
+OUT=""
+# Pull optional --out / --prefix flags out of the positional args that
+# common.sh's parser collected. We do this cleanly here instead of
+# extending cloud_parse_args because both flags are snapshot-specific.
+_ARGS=("${ENFORCER_CLOUD_POSITIONAL[@]:-}")
+i=0
+while [[ $i -lt ${#_ARGS[@]} ]]; do
+    case "${_ARGS[$i]}" in
+        --out)    OUT="${_ARGS[$((i+1))]}";    i=$((i+2)) ;;
+        --prefix) PREFIX="${_ARGS[$((i+1))]}"; i=$((i+2)) ;;
+        *)                                     i=$((i+1)) ;;
+    esac
+done
+
+DRY=0
+if [[ -n "${ENFORCER_CLOUD_DRY_RUN:-}" ]]; then DRY=1; fi
+
+# Default output path: /var/lib/enforcer-mcp/snapshots/<UTC>.json.gz
+if [[ -z "$OUT" ]]; then
+    STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+    OUT="/var/lib/enforcer-mcp/snapshots/${STAMP}.json.gz"
+    mkdir -p "$(dirname "$OUT")" 2>/dev/null || true
+fi
+
+cloud_log "prefix:      $PREFIX"
+cloud_log "destination: ${OUT}"
+
+# ─── Enumerate matching keys via SCAN ─────────────────────────────────
+# Upstash REST supports SCAN natively. We paginate with the returned
+# cursor until it's "0". `MATCH` filters server-side; `COUNT` is a hint
+# and Upstash may return fewer/more per call.
+CURSOR="0"
+KEYS_JSON="[]"
+BATCH=0
+while : ; do
+    resp=$(cloud_cmd SCAN "$CURSOR" MATCH "${PREFIX}*" COUNT 200)
+    if echo "$resp" | jq -e '.error' >/dev/null 2>&1; then
+        cloud_err "SCAN failed: $(echo "$resp" | jq -r .error)"
+        exit 5
+    fi
+    # Upstash returns .result as ["<next-cursor>", ["k1","k2",...]]
+    CURSOR=$(echo "$resp" | jq -r '.result[0]')
+    batch_keys=$(echo "$resp" | jq -c '.result[1]')
+    if [[ "$batch_keys" != "null" && "$batch_keys" != "[]" ]]; then
+        KEYS_JSON=$(jq -c --argjson add "$batch_keys" '. + $add' <<<"$KEYS_JSON")
+    fi
+    BATCH=$((BATCH+1))
+    if [[ "$CURSOR" == "0" ]]; then break; fi
+    # Safety net: bail if SCAN somehow loops forever (500+ batches = ~100k keys).
+    if (( BATCH > 500 )); then
+        cloud_err "SCAN exceeded 500 batches — aborting to avoid runaway. Adjust --prefix."
+        exit 5
+    fi
+done
+COUNT=$(jq 'length' <<<"$KEYS_JSON")
+cloud_log "found $COUNT key(s) matching $PREFIX*"
+
+if (( DRY == 1 )); then
+    cloud_warn "dry-run — would have snapshotted $COUNT key(s) to $OUT"
+    exit 0
+fi
+if (( COUNT == 0 )); then
+    cloud_warn "no keys to snapshot — writing empty snapshot anyway"
+fi
+
+# ─── Fetch values in chunks via /pipeline (avoids URL length limits) ──
+# 100 keys per pipeline is well under Upstash's 1000-command pipeline
+# cap and keeps each response body small.
+declare -A KV
+CHUNK=100
+IDX=0
+TOTAL=$COUNT
+while (( IDX < TOTAL )); do
+    end=$((IDX + CHUNK))
+    (( end > TOTAL )) && end=$TOTAL
+    # Build a GET command per key in this chunk.
+    slice=$(jq -c ".[${IDX}:${end}]" <<<"$KEYS_JSON")
+    cmds=$(jq -c '[.[] | ["GET", .]]' <<<"$slice")
+    resp=$(curl --fail-with-body -sS \
+        -X POST "$ENFORCER_CLOUD_URL/pipeline" \
+        -H "Authorization: Bearer $ENFORCER_CLOUD_TOKEN" \
+        -H "Content-Type: application/json" \
+        -d "$cmds")
+    # Zip keys with their GET results.
+    len=$(jq 'length' <<<"$slice")
+    for ((k=0; k<len; k++)); do
+        key=$(jq -r ".[${k}]" <<<"$slice")
+        val=$(jq -r ".[${k}].result // empty" <<<"$resp")
+        KV["$key"]="$val"
+    done
+    IDX=$end
+    cloud_log "  fetched $IDX / $TOTAL"
+done
+
+# ─── Serialize + gzip ────────────────────────────────────────────────
+# jq --null-input builds the final object; --rawfile is not portable
+# so we build the keys object incrementally via a temp file.
+TMPJSON=$(mktemp)
+{
+    echo "{"
+    printf '  "version": 1,\n'
+    printf '  "prefix": %s,\n' "$(jq -Rn --arg p "$PREFIX" '$p')"
+    printf '  "taken_at": %s,\n' "$(jq -Rn --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '$t')"
+    printf '  "upstash_url": %s,\n' "$(jq -Rn --arg u "$ENFORCER_CLOUD_URL" '$u')"
+    printf '  "key_count": %d,\n' "$COUNT"
+    printf '  "keys": {\n'
+    first=1
+    for k in "${!KV[@]}"; do
+        if (( first == 0 )); then printf ',\n'; fi
+        first=0
+        printf '    %s: %s' \
+            "$(jq -Rn --arg s "$k" '$s')" \
+            "$(jq -Rn --arg s "${KV[$k]}" '$s')"
+    done
+    printf '\n  }\n'
+    echo "}"
+} > "$TMPJSON"
+
+# Gzip in-place; the .gz extension is expected by enforcer-cloud-restore.
+gzip -c "$TMPJSON" > "$OUT"
+rm -f "$TMPJSON"
+SIZE=$(stat -c%s "$OUT" 2>/dev/null || wc -c < "$OUT")
+
+cloud_ok "snapshot written: $OUT ($SIZE bytes, $COUNT keys)"
+echo "$OUT"

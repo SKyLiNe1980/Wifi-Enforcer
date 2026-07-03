@@ -277,3 +277,86 @@ tools:
       }
     wrap_mode: none
     timeout_sec: 5
+
+  # ─── Cloud OTA registry (Upstash Redis-as-registry) ──────────────────
+  # First-class MCP tools around the enforcer-cloud-* shell helpers so
+  # Hermes (or any LLM agent) can drive fleet OTA updates by prompt
+  # instead of having to shell out via exec_command. Full audit trail
+  # per invocation, JSON-schema-validated args, safer than raw bash.
+  #
+  # All these read Upstash creds from the same cascade as the CLI:
+  #   /etc/enforcer-mcp/cloud.env → ~/.enforcer-cloud.env → env vars.
+  # If creds are missing the tool fails cleanly with exit 2.
+
+  - name: cloud_status
+    description: "Show what's currently in the Upstash OTA registry (signal, latest meta, previous meta) and what version is installed locally. Read-only, safe to call with the read-only Upstash token."
+    command_template: "enforcer-cloud-status --json"
+    arg_schema_json: |
+      {"type": "object", "properties": {}}
+    wrap_mode: none
+    timeout_sec: 15
+
+  - name: cloud_pull
+    description: "Self-update this node from the cloud OTA registry. Fetches enforcer:mcp:deb:blob:<signal-version>, sha256-verifies it against the meta record, then dpkg installs. No-op if the node is already at the cloud version, unless force=true."
+    command_template: "enforcer-cloud-pull {flags}"
+    arg_schema_json: |
+      {
+        "type": "object",
+        "properties": {
+          "flags": {
+            "type": "string",
+            "default": "",
+            "description": "Extra CLI flags. Common: '--force' to reinstall same version, '--dry-run' to download + verify without dpkg -i.",
+            "enum": ["", "--force", "--dry-run"]
+          }
+        }
+      }
+    wrap_mode: none
+    timeout_sec: 120
+
+  - name: cloud_rollback_local
+    description: "Reinstall the PREVIOUS version stored in the cloud registry on THIS node only. Does not touch the cloud's latest pointer — other nodes keep pulling the current release. Use for surgical single-node rollback after a bad deploy."
+    command_template: "enforcer-cloud-rollback --local --force"
+    arg_schema_json: |
+      {"type": "object", "properties": {}}
+    wrap_mode: none
+    timeout_sec: 120
+
+  - name: cloud_snapshot
+    description: "Dump every enforcer:mcp:* key from Upstash to a portable gzipped JSON file. Full-fidelity backup; complements Upstash's native mgmt-API backups. Default output path is /var/lib/enforcer-mcp/snapshots/<UTC>.json.gz. Returns the file path on stdout."
+    command_template: "enforcer-cloud-snapshot {out_flag}"
+    arg_schema_json: |
+      {
+        "type": "object",
+        "properties": {
+          "out_flag": {
+            "type": "string",
+            "default": "",
+            "description": "Optional explicit output flag like '--out /path/to/file.json.gz'. Leave empty for auto-named snapshot in /var/lib/enforcer-mcp/snapshots/. Pass '--dry-run' to count matching keys without downloading."
+          }
+        }
+      }
+    wrap_mode: none
+    timeout_sec: 60
+
+  - name: cloud_restore
+    description: "Restore an enforcer:mcp:* snapshot back into Upstash. Refuses to run if live keys differ from snapshot (unless force=true). Signal + latest pointer are written last, so a mid-flight failure never leaves the fleet in a torn state."
+    command_template: "enforcer-cloud-restore {snapshot} {flags}"
+    arg_schema_json: |
+      {
+        "type": "object",
+        "required": ["snapshot"],
+        "properties": {
+          "snapshot": {
+            "type": "string",
+            "description": "Absolute path to the .json.gz snapshot produced by cloud_snapshot."
+          },
+          "flags": {
+            "type": "string",
+            "default": "",
+            "description": "Optional flags. '--dry-run' shows the plan, '--force' overrides drift protection, '--wipe' DEL's every enforcer:mcp:* key first (destructive)."
+          }
+        }
+      }
+    wrap_mode: none
+    timeout_sec: 300

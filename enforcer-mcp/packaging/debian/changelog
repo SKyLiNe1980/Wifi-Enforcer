@@ -1,3 +1,25 @@
+enforcer-mcp (0.3.3) unstable; urgency=medium
+
+  * Five new first-class MCP tools for cloud OTA (Hermes-callable):
+    cloud_status, cloud_pull, cloud_rollback_local, cloud_snapshot,
+    cloud_restore. Each is schema-validated and audit-logged, so LLM
+    agents can drive fleet updates by prompt instead of shelling out
+    through exec_command.
+  * New enforcer-cloud-snapshot / enforcer-cloud-restore helpers.
+    SCAN-driven full-fidelity dump of every enforcer:mcp:* key to a
+    gzipped JSON file (default: /var/lib/enforcer-mcp/snapshots/
+    <UTC>.json.gz). Restore is drift-protected — refuses to run if any
+    live key differs from the snapshot unless --force is passed. Signal
+    + latest pointer are written LAST so mid-flight failures never
+    leave the fleet in a torn state.
+  * debian/control tidy: systemd moved from Depends to Recommends (so
+    the .deb installs cleanly inside NetHunter chroots where systemd
+    is held via dpkg-divert), jq moved from an implicit runtime dep to
+    Recommends (needed by the enforcer-cloud-* scripts but not the
+    daemon), curl explicitly Depends since the OTA scripts require it.
+
+ -- enforcer-swarm <enforcer@localhost>  Fri, 03 Jul 2026 09:30:00 +0000
+
 enforcer-mcp (0.3.2) unstable; urgency=medium
 
   * Chroot-aware maintainer scripts. postinst / postrm / prerm now
