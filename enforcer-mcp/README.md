@@ -89,6 +89,64 @@ You should see JSON log lines like:
 
 `SIGTERM` and `Ctrl-C` shut it down cleanly.
 
+## Cloud OTA (Redis-as-registry)
+
+To distribute a new `.deb` to a fleet of nodes without SCP'ing to each one
+individually, use the four `enforcer-cloud-*` helper scripts. They talk
+directly to Upstash Redis over the REST API — no additional daemon
+required. The cockpit stores the .deb as a base64 blob under a set of
+versioned keys and each node pulls the latest version on demand.
+
+Setup (once):
+
+```bash
+cp scripts/enforcer-cloud.env.example ~/.enforcer-cloud.env
+chmod 600 ~/.enforcer-cloud.env
+# edit and paste your Upstash REST URL + token
+```
+
+Cockpit side (push a new build to the cloud):
+
+```bash
+packaging/build-deb.sh                       # produces dist/enforcer-mcp_X.Y.Z_all.deb
+scripts/enforcer-cloud-push                  # auto-picks newest .deb in dist/
+scripts/enforcer-cloud-push --changelog "fix rotate-token race"
+scripts/enforcer-cloud-status                # verify what's in the registry now
+```
+
+Node side (pull + install the current version):
+
+```bash
+enforcer-cloud-pull                          # no-op if already current
+enforcer-cloud-pull --force                  # reinstall even if versions match
+enforcer-cloud-pull --dry-run                # download + verify sha256, don't install
+```
+
+Roll a fleet back a version if a release borks something:
+
+```bash
+enforcer-cloud-rollback                      # cockpit: promote previous → latest
+                                             # nodes will pull the older version
+enforcer-cloud-rollback --local              # local-only: reinstall previous on THIS node
+```
+
+All four scripts read Upstash creds from (in override order):
+`--url` / `--token` CLI args → `ENFORCER_CLOUD_URL` / `ENFORCER_CLOUD_TOKEN`
+env vars → `/etc/enforcer-mcp/cloud.env` → `~/.enforcer-cloud.env`.
+
+Redis key layout:
+
+```
+enforcer:mcp:deb:signal              # cheap-to-poll pointer, e.g. "0.3.0"
+enforcer:mcp:deb:latest              # JSON meta {version, sha256, size, uploaded_at, ...}
+enforcer:mcp:deb:previous            # same shape — rollback target
+enforcer:mcp:deb:blob:<version>      # base64-encoded .deb bytes
+```
+
+sha256 is verified on the pull side before `dpkg -i` ever runs, so a
+compromised or corrupted upload cannot install anything on a node.
+
+
 ## Smoke tests
 
 Open a second shell *inside the chroot* and run:

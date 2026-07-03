@@ -32,6 +32,7 @@
 - 2.A · Nodes tab (`// mcp → // nodes`) + `mcp_nodes` schema + `enforcer-node_*.deb` packaging
 - 2.B · Tier 1 in-app deploy (bundled .deb → python3 http.server in chroot over Tailscale → curl|dpkg one-liner on target)
 - Deploy modal hardening: orphan reap · port conflict check · DIAGNOSE button · SHA verify against bundled sidecar
+- 2.C · Cloud OTA via Redis-as-registry (`enforcer-cloud-{push,pull,rollback,status}` scripts) — cockpit pushes .deb blob + meta to Upstash, nodes pull + sha256-verify + dpkg -i. Enables fleet-wide updates without SCP-per-node.
 
 ### 🔥 In progress / just shipped (this session)
 - Terminal spacing fix (XTermView join strategy)

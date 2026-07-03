@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# enforcer-cloud-status — show what's in the cloud registry and what's
+# installed locally. Read-only, safe to run anywhere, safe to run with
+# the RO token.
+#
+# Output is a small human-readable table + a --json flag for machine use.
+
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./enforcer-cloud-common.sh
+. "$SCRIPT_DIR/enforcer-cloud-common.sh"
+
+WANT_JSON=0
+for arg in "$@"; do
+    [[ "$arg" == "--json" ]] && WANT_JSON=1
+done
+cloud_parse_args "$@"
+cloud_require_creds
+
+SIGNAL=$(cloud_get "enforcer:mcp:deb:signal" || true)
+LATEST=$(cloud_get "enforcer:mcp:deb:latest" || true)
+PREVIOUS=$(cloud_get "enforcer:mcp:deb:previous" || true)
+INSTALLED=$(cloud_installed_version)
+
+if (( WANT_JSON == 1 )); then
+    jq -cn \
+        --arg signal    "$SIGNAL" \
+        --arg installed "$INSTALLED" \
+        --argjson latest   "${LATEST:-null}" \
+        --argjson previous "${PREVIOUS:-null}" \
+        '{signal:$signal, installed:$installed, latest:$latest, previous:$previous}'
+    exit 0
+fi
+
+printf '\n\e[1menforcer-cloud registry\e[0m  \e[2m(%s)\e[0m\n' "$ENFORCER_CLOUD_URL"
+printf '  %-14s %s\n' "signal:" "${SIGNAL:-—}"
+printf '  %-14s %s\n' "installed:" "${INSTALLED:-—}"
+if [[ -n "$LATEST" ]]; then
+    lv=$(echo "$LATEST" | jq -r '.version')
+    lsz=$(echo "$LATEST" | jq -r '.size')
+    lup=$(echo "$LATEST" | jq -r '.uploaded_at')
+    lsh=$(echo "$LATEST" | jq -r '.sha256 | .[0:12]')
+    lch=$(echo "$LATEST" | jq -r '.changelog // ""')
+    printf '  %-14s %s  (%s bytes, %s, sha %s…)\n' "latest:" "$lv" "$lsz" "$lup" "$lsh"
+    [[ -n "$lch" ]] && printf '  %-14s %s\n' "changelog:" "$lch"
+else
+    printf '  %-14s %s\n' "latest:" "— (nothing pushed)"
+fi
+if [[ -n "$PREVIOUS" ]]; then
+    pv=$(echo "$PREVIOUS" | jq -r '.version')
+    pup=$(echo "$PREVIOUS" | jq -r '.uploaded_at')
+    printf '  %-14s %s  (%s)\n' "previous:" "$pv" "$pup"
+else
+    printf '  %-14s %s\n' "previous:" "— (no rollback target)"
+fi
+printf '\n'
+
+# Drift hint
+if [[ -n "$INSTALLED" && -n "$SIGNAL" && "$INSTALLED" != "$SIGNAL" ]]; then
+    cloud_warn "drift: cloud has $SIGNAL, this node has $INSTALLED. run enforcer-cloud-pull to sync."
+fi

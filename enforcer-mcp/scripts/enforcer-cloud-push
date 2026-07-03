@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# enforcer-cloud-push — upload the latest local .deb to Upstash Redis
+# so nodes can pull-and-install it via `enforcer-cloud-pull`.
+#
+# Usage:
+#   enforcer-cloud-push                       # newest .deb in ./dist/
+#   enforcer-cloud-push --deb path/to/foo.deb # explicit file
+#   enforcer-cloud-push --changelog "fixes X" # attach a note
+#   enforcer-cloud-push --dry-run             # show what would happen
+#
+# Redis writes (in one atomic pipeline):
+#   1. If a `latest` meta already exists → copy it to `previous` (rollback).
+#   2. SET blob:<version> = base64(.deb)
+#   3. SET latest = new meta JSON
+#   4. SET signal = <version>            (this is what nodes poll)
+#
+# Idempotency: pushing the same version twice re-uploads the blob but
+# does NOT rotate previous → keeps the rollback target one release back,
+# not "the last thing I re-pushed".
+
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./enforcer-cloud-common.sh
+. "$SCRIPT_DIR/enforcer-cloud-common.sh"
+
+cloud_parse_args "$@"
+
+if [[ -n "${ENFORCER_CLOUD_HELP:-}" ]]; then
+    sed -n '2,/^set -e/p' "$0" | sed 's/^# \?//' | head -n -1
+    exit 0
+fi
+cloud_require_creds
+
+# ─── Locate the .deb to push ────────────────────────────────────────
+DEB="${ENFORCER_CLOUD_DEB:-}"
+if [[ -z "$DEB" ]]; then
+    DIST_DIR="${ENFORCER_CLOUD_DIST_DIR:-$SCRIPT_DIR/../dist}"
+    if [[ ! -d "$DIST_DIR" ]]; then
+        cloud_err "no --deb given and dist dir not found: $DIST_DIR"
+        exit 3
+    fi
+    # Sort by version (natural sort) and take the newest. `ls -v` handles
+    # multi-digit versions correctly (0.10.0 > 0.2.0).
+    DEB=$(ls -v "$DIST_DIR"/enforcer-mcp_*.deb 2>/dev/null | tail -n1 || true)
+    if [[ -z "$DEB" ]]; then
+        cloud_err "no enforcer-mcp_*.deb found in $DIST_DIR"
+        cloud_err "run packaging/build-deb.sh first, or pass --deb <path>"
+        exit 3
+    fi
+fi
+if [[ ! -r "$DEB" ]]; then
+    cloud_err "can't read .deb: $DEB"
+    exit 3
+fi
+
+# ─── Extract version from filename OR from control metadata ───────────
+# We prefer control metadata because operators can rename files during
+# transit. `dpkg-deb --field` is available wherever dpkg is.
+VERSION=""
+if command -v dpkg-deb >/dev/null 2>&1; then
+    VERSION=$(dpkg-deb --field "$DEB" Version 2>/dev/null || true)
+fi
+if [[ -z "$VERSION" ]]; then
+    # Filename fallback: enforcer-mcp_<version>_<arch>.deb
+    VERSION=$(basename "$DEB" | sed -nE 's/^enforcer-mcp_([^_]+)_.*\.deb$/\1/p')
+fi
+if [[ -z "$VERSION" ]]; then
+    cloud_err "couldn't determine version from $DEB"
+    exit 3
+fi
+
+# ─── Compute hash + base64 + size ──────────────────────────────────
+SHA256=$(sha256sum "$DEB" | awk '{print $1}')
+SIZE=$(stat -c%s "$DEB" 2>/dev/null || wc -c < "$DEB")
+# `base64 -w0` → single-line output; jq wraps in quotes cleanly.
+B64=$(base64 -w0 < "$DEB")
+FILENAME=$(basename "$DEB")
+CHANGELOG="${ENFORCER_CLOUD_CHANGELOG:-}"
+UPLOADED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+# Upstash rejects payloads > 100MB record size. base64 is ~4/3 of raw,
+# so raw must stay under ~75MB. Warn well before the ceiling.
+B64_SIZE=${#B64}
+if (( B64_SIZE > 90 * 1024 * 1024 )); then
+    cloud_err "base64 payload ($B64_SIZE bytes) exceeds Upstash free-tier 100MB record cap"
+    cloud_err "split into chunks or upgrade the Upstash plan"
+    exit 4
+fi
+
+cloud_log "deb:       $FILENAME"
+cloud_log "version:   $VERSION"
+cloud_log "size:      $SIZE bytes  (base64 $B64_SIZE)"
+cloud_log "sha256:    $SHA256"
+[[ -n "$CHANGELOG" ]] && cloud_log "changelog: $CHANGELOG"
+
+# ─── Build the meta JSON ────────────────────────────────────────────
+META_JSON=$(jq -cn \
+    --arg version "$VERSION" \
+    --arg sha256 "$SHA256" \
+    --argjson size "$SIZE" \
+    --arg uploaded_at "$UPLOADED_AT" \
+    --arg filename "$FILENAME" \
+    --arg changelog "$CHANGELOG" \
+    '{version:$version, sha256:$sha256, size:$size, uploaded_at:$uploaded_at, filename:$filename, changelog:$changelog}')
+
+# ─── Dry run ──────────────────────────────────────────────────────────
+if [[ -n "${ENFORCER_CLOUD_DRY_RUN:-}" ]]; then
+    cloud_warn "dry-run — would push meta:"
+    echo "$META_JSON" | jq .
+    exit 0
+fi
+
+# ─── Rotate previous ───────────────────────────────────────────────────
+# If there's an existing latest and it's a DIFFERENT version, copy it
+# to previous. If it's the same version, we're re-pushing — leave
+# previous untouched (see idempotency note in header).
+current_latest=$(cloud_get "enforcer:mcp:deb:latest" || echo "")
+rotate_previous=0
+if [[ -n "$current_latest" ]]; then
+    current_version=$(echo "$current_latest" | jq -r '.version // ""')
+    if [[ -n "$current_version" && "$current_version" != "$VERSION" ]]; then
+        rotate_previous=1
+        cloud_log "rotating previous $current_version → previous slot"
+    fi
+fi
+
+# ─── Push (pipeline for atomicity) ──────────────────────────────────
+cloud_log "pushing to Upstash …"
+cmds=()
+if (( rotate_previous == 1 )); then
+    cmds+=("$(jq -cn --arg v "$current_latest" '["SET","enforcer:mcp:deb:previous",$v]')")
+fi
+cmds+=("$(jq -cn --arg k "enforcer:mcp:deb:blob:$VERSION" --arg v "$B64" '["SET",$k,$v]')")
+cmds+=("$(jq -cn --arg v "$META_JSON" '["SET","enforcer:mcp:deb:latest",$v]')")
+cmds+=("$(jq -cn --arg v "$VERSION" '["SET","enforcer:mcp:deb:signal",$v]')")
+
+resp=$(cloud_pipeline "${cmds[@]}")
+# Each result should be {"result":"OK"}. Detect any errors.
+if echo "$resp" | jq -e '.[] | select(.error)' >/dev/null 2>&1; then
+    cloud_err "upstash rejected part of the pipeline:"
+    echo "$resp" | jq . >&2
+    exit 5
+fi
+
+cloud_ok "pushed enforcer-mcp $VERSION ($SIZE bytes) to cloud"
+cloud_ok "nodes will see signal = $VERSION on next poll"
