@@ -39,6 +39,8 @@ import {
   testConnection as upstashTest, fetchCurrentBearer,
   rotateBearer,
   discoverEnforcerPeers,
+  pushRoster, fetchRoster,
+  type RosterEntry,
 } from "../lib/tokenStash";
 
 // Keep palette identical to the rest of the cockpit so the tab feels native.
@@ -699,6 +701,37 @@ export default function MCPTab() {
   }, [nodes, probeNode]);
 
   // ─── Node CRUD ──────────────────────────────────────────────────────
+  /**
+   * Fire-and-forget push of the CURRENT roster (from SQLite) to Upstash.
+   * Called after every node CRUD so Redis always mirrors local state.
+   * No-op if Cloud Sync isn't configured (silent — this is a background
+   * sync, not something the user has opted into for the current op).
+   *
+   * We intentionally re-read from SQLite each time instead of relying on
+   * the `nodes` React state — the state can be a tick behind after a
+   * mutation, and we'd rather sync the durable truth.
+   */
+  const mirrorRosterToCloud = useCallback(async (): Promise<void> => {
+    try {
+      const [url, tok] = await Promise.all([loadUpstashUrl(), loadUpstashToken()]);
+      if (!url || !tok) return; // Cloud Sync not configured — silent no-op.
+      const rows = await nodesLocal.list();
+      const roster: RosterEntry[] = rows.map((n) => ({
+        name: n.name,
+        host: n.host,
+        port: n.port,
+        transport: n.transport,
+        is_primary: n.is_primary,
+        tags: n.tags,
+        description: n.description,
+      }));
+      await pushRoster(url, tok, roster);
+      console.log(`[cloudSync] mirrored ${roster.length} node(s) to Upstash`);
+    } catch (e) {
+      console.warn("[cloudSync] mirrorRosterToCloud failed:", e);
+    }
+  }, []);
+
   const handleSaveNode = useCallback(async () => {
     if (!editingNode) return;
     const name = (editingNode.name || "").trim();
@@ -727,32 +760,33 @@ export default function MCPTab() {
       }
       setEditingNode(null);
       refreshLists();
-      // Belt-and-suspenders backup: if the operator has Cloud Sync
-      // configured, mirror this node's bearer to Upstash. Fire-and-forget
-      // — a network failure here shouldn't block the DB save that just
-      // succeeded. This is what closes the "APK reinstall wiped my nodes"
-      // hole: next reinstall, Discover-from-Tailnet + fetchCurrentBearer
-      // can rehydrate every node without SSH.
-      const bearer = (editingNode.bearer_token || "").trim();
-      if (bearer) {
-        (async () => {
-          try {
-            const [url, tok] = await Promise.all([loadUpstashUrl(), loadUpstashToken()]);
-            if (!url || !tok) return; // Cloud Sync not configured — silently skip.
-            await rotateBearer(url, tok, bearer);
-            console.log("[MCPTab] bearer mirrored to Upstash");
-          } catch (e) {
-            console.warn("[MCPTab] Upstash bearer mirror failed:", e);
-          }
-        })();
-      }
+      // Belt-and-suspenders backup: mirror bearer AND roster to Upstash.
+      // Fire-and-forget — network failure here shouldn't block the DB
+      // save that just succeeded. This is what closes the "APK reinstall
+      // wiped my nodes" hole:
+      //   • bearer → KEY_CURRENT (any node can be rehydrated with it)
+      //   • roster → KEY_ROSTER (fresh install pulls back the full list)
+      // Both happen concurrently — either succeeding alone is still a win.
+      (async () => {
+        try {
+          const [url, tok] = await Promise.all([loadUpstashUrl(), loadUpstashToken()]);
+          if (!url || !tok) return; // Cloud Sync not configured — silent no-op.
+          const bearer = (editingNode.bearer_token || "").trim();
+          const jobs: Promise<any>[] = [mirrorRosterToCloud()];
+          if (bearer) jobs.push(rotateBearer(url, tok, bearer));
+          await Promise.allSettled(jobs);
+          console.log("[MCPTab] cloud mirror complete (roster + bearer)");
+        } catch (e) {
+          console.warn("[MCPTab] cloud mirror failed:", e);
+        }
+      })();
     } catch (e: any) {
       Alert.alert("Save failed",
         (e?.message || "sqlite error") +
         (String(e?.message || "").includes("UNIQUE") ?
           "\n\nA node with this host:port already exists." : ""));
     }
-  }, [editingNode, refreshLists]);
+  }, [editingNode, refreshLists, mirrorRosterToCloud]);
 
   const handleDeleteNode = useCallback((node: MCPNode) => {
     Alert.alert(
@@ -765,16 +799,20 @@ export default function MCPTab() {
           onPress: async () => {
             await nodesLocal.delete(node.id);
             refreshLists();
+            // Mirror the shrunken roster so Redis reflects the delete.
+            mirrorRosterToCloud();
           },
         },
       ],
     );
-  }, [refreshLists]);
+  }, [refreshLists, mirrorRosterToCloud]);
 
   const handleSetPrimaryNode = useCallback(async (node: MCPNode) => {
     await nodesLocal.setPrimary(node.id);
     refreshLists();
-  }, [refreshLists]);
+    // Primary flag changes → roster shape changes → mirror.
+    mirrorRosterToCloud();
+  }, [refreshLists, mirrorRosterToCloud]);
 
   const handleResyncNodeTools = useCallback(async (node: MCPNode) => {
     if (!node.bearer_token) {
@@ -860,6 +898,40 @@ export default function MCPTab() {
         setCloudSyncTokenSaved(true);
         setCloudSyncToken("");
       }
+      // Auto-snapshot right after save. This is the whole point of the
+      // Cloud Sync — the user should be able to verify Redis is populated
+      // on the very next power cycle without having to add/edit a node
+      // first. If the DB is empty (fresh install), this is a no-op with
+      // roster=[]; still writes the update timestamp so RESTORE has
+      // something to eyeball.
+      const [finalUrl, finalTok] = await Promise.all([loadUpstashUrl(), loadUpstashToken()]);
+      if (finalUrl && finalTok) {
+        try {
+          const rows = await nodesLocal.list();
+          const roster: RosterEntry[] = rows.map((n) => ({
+            name: n.name, host: n.host, port: n.port,
+            transport: n.transport, is_primary: n.is_primary,
+            tags: n.tags, description: n.description,
+          }));
+          await pushRoster(finalUrl, finalTok, roster);
+          // Also seed the bearer if a local node has one and Redis
+          // doesn't yet — solves the chicken-and-egg where DISCOVER
+          // needs a bearer to hydrate but bearer never gets written
+          // until the user adds a node manually.
+          const localBearer = rows.find((n) => n.bearer_token)?.bearer_token;
+          if (localBearer) {
+            const existing = await fetchCurrentBearer(finalUrl, finalTok);
+            if (!existing?.token) {
+              await rotateBearer(finalUrl, finalTok, localBearer);
+            }
+          }
+          setCloudSyncStatus(`ok: creds saved + snapshot pushed (${roster.length} node${roster.length === 1 ? "" : "s"})`);
+          return;
+        } catch (e: any) {
+          setCloudSyncStatus(`ok: creds saved (snapshot failed: ${e?.message || e})`);
+          return;
+        }
+      }
       setCloudSyncStatus("ok: creds saved to keystore");
     } catch (e: any) {
       setCloudSyncStatus(`err: ${e?.message || e}`);
@@ -894,32 +966,138 @@ export default function MCPTab() {
       const url = (await loadUpstashUrl()) || cloudSyncUrl.trim();
       const tok = (await loadUpstashToken()) || cloudSyncToken.trim();
       if (!url || !tok) throw new Error("save + set creds first (URL + R/W token)");
-      const peers = await discoverEnforcerPeers(execReal);
-      if (peers.length === 0) {
-        throw new Error("no enforcer peers on tailnet (hostname must match /node|enforcer/i)");
+
+      // Pull tailnet peers AND the Redis roster in parallel. We'll merge:
+      //   • tailnet gives us live IPs + which peers are actually online now
+      //   • roster gives us names, tags, descriptions, is_primary flags
+      // If tailnet returns nothing (chroot socket down, offline), we
+      // fall back to roster-only restore (best-effort with roster IPs).
+      const [peers, roster, rec] = await Promise.all([
+        discoverEnforcerPeers(execReal),
+        fetchRoster(url, tok),
+        fetchCurrentBearer(url, tok),
+      ]);
+
+      if (peers.length === 0 && roster.length === 0) {
+        throw new Error(
+          "nothing to restore. tailnet returned 0 enforcer-node peers AND redis roster is empty. " +
+          "either name your peers <host>-enforcer-node, or add one node manually first so the roster gets populated.",
+        );
       }
-      const rec = await fetchCurrentBearer(url, tok);
       if (!rec?.token) {
-        throw new Error("no bearer in upstash yet — rotate one first, or paste manually via [+ ADD NODE]");
+        throw new Error("no bearer in upstash yet — add one node manually first so the bearer gets pushed, or paste one via [+ ADD NODE]");
       }
+
+      // Build a lookup from roster by name/host so we can enrich the
+      // tailnet-discovered entries (which only have hostname + IP).
+      const rosterByHost = new Map<string, RosterEntry>();
+      const rosterByName = new Map<string, RosterEntry>();
+      for (const r of roster) {
+        rosterByHost.set(r.host, r);
+        rosterByName.set(r.name.toLowerCase(), r);
+      }
+
       let added = 0;
+      const seenHosts = new Set<string>();
+
+      // Tailnet-first: peers that ARE reachable right now win the IP.
       for (const p of peers) {
+        seenHosts.add(p.tailIp);
+        const enriched = rosterByName.get(p.hostname.toLowerCase())
+          ?? rosterByHost.get(p.tailIp);
         try {
           await nodesLocal.upsert({
-            name: p.hostname, host: p.tailIp, port: 8765,
-            bearer_token: rec.token, transport: "http_sse",
-            enabled: true, is_primary: false, tags: [p.dnsName],
-            description: `restored from tailnet ${new Date().toISOString().slice(0, 16)}`,
+            name: enriched?.name || p.hostname,
+            host: p.tailIp,
+            port: enriched?.port ?? 8765,
+            bearer_token: rec.token,
+            transport: enriched?.transport || "http_sse",
+            enabled: true,
+            is_primary: !!enriched?.is_primary,
+            tags: enriched?.tags?.length ? enriched.tags : [p.dnsName],
+            description: enriched?.description ||
+              `restored from tailnet ${new Date().toISOString().slice(0, 16)}`,
           } as any);
           added++;
         } catch (e) { console.warn("[cloudSync] upsert failed for", p.hostname, e); }
       }
+
+      // Roster-only fallback: entries in Redis but NOT visible on tailnet
+      // right now. Still restore them — the node may be offline / user
+      // may be on a different network. They'll auto-verify when tailscale
+      // reconnects.
+      let rosterOnly = 0;
+      for (const r of roster) {
+        if (seenHosts.has(r.host)) continue; // already added via tailnet
+        try {
+          await nodesLocal.upsert({
+            name: r.name,
+            host: r.host,
+            port: r.port,
+            bearer_token: rec.token,
+            transport: r.transport || "http_sse",
+            enabled: true,
+            is_primary: !!r.is_primary,
+            tags: r.tags || [],
+            description: r.description ||
+              `restored from redis roster ${new Date().toISOString().slice(0, 16)}`,
+          } as any);
+          rosterOnly++;
+          added++;
+        } catch (e) { console.warn("[cloudSync] roster upsert failed for", r.name, e); }
+      }
       await refreshLists();
-      setCloudSyncStatus(`ok: restored ${added}/${peers.length} peer(s) with current bearer`);
+      setCloudSyncStatus(
+        `ok: restored ${added} node(s) ` +
+        `(${peers.length} live on tailnet, ${rosterOnly} from redis roster only)`,
+      );
     } catch (e: any) {
       setCloudSyncStatus(`err: ${e?.message || e}`);
     } finally { setCloudSyncBusy(false); }
   }, [cloudSyncUrl, cloudSyncToken, refreshLists]);
+
+  /**
+   * Force a full snapshot to Upstash right now. Same as handleSaveCloudSync's
+   * auto-snapshot but exposed as a discrete button so the operator can
+   * verify Redis is populated without having to re-save credentials.
+   *
+   * Pushes:
+   *   • enforcer:nodes:roster       (JSON array of node metadata)
+   *   • enforcer:nodes:roster_updated_at
+   *   • enforcer:bearer:current     (if any local node has a token AND
+   *                                  redis doesn't already have one)
+   */
+  const handleSnapshotNow = useCallback(async () => {
+    setCloudSyncBusy(true);
+    setCloudSyncStatus("");
+    try {
+      const url = (await loadUpstashUrl()) || cloudSyncUrl.trim();
+      const tok = (await loadUpstashToken()) || cloudSyncToken.trim();
+      if (!url || !tok) throw new Error("save + set creds first (URL + R/W token)");
+      const rows = await nodesLocal.list();
+      const roster: RosterEntry[] = rows.map((n) => ({
+        name: n.name, host: n.host, port: n.port,
+        transport: n.transport, is_primary: n.is_primary,
+        tags: n.tags, description: n.description,
+      }));
+      await pushRoster(url, tok, roster);
+      let bearerPushed = false;
+      const localBearer = rows.find((n) => n.bearer_token)?.bearer_token;
+      if (localBearer) {
+        const existing = await fetchCurrentBearer(url, tok);
+        if (!existing?.token) {
+          await rotateBearer(url, tok, localBearer);
+          bearerPushed = true;
+        }
+      }
+      setCloudSyncStatus(
+        `ok: pushed roster (${roster.length} node${roster.length === 1 ? "" : "s"})` +
+        (bearerPushed ? " + seeded bearer" : ""),
+      );
+    } catch (e: any) {
+      setCloudSyncStatus(`err: ${e?.message || e}`);
+    } finally { setCloudSyncBusy(false); }
+  }, [cloudSyncUrl, cloudSyncToken]);
 
   const handleReapOrphans = useCallback(async () => {
     try {
@@ -1536,7 +1714,7 @@ export default function MCPTab() {
             />
             <View style={[s.row, { marginTop: 10, gap: 6, flexWrap: "wrap" }]}>
               <TouchableOpacity style={[s.smallBtn, { borderColor: C.cyan }]} onPress={handleSaveCloudSync}>
-                <Text style={[s.smallBtnText, { color: C.cyan }]}>SAVE CREDS</Text>
+                <Text style={[s.smallBtnText, { color: C.cyan }]}>SAVE + SNAPSHOT</Text>
               </TouchableOpacity>
               <TouchableOpacity style={[s.smallBtn, { borderColor: C.yellow }]}
                 onPress={handleTestCloudSync}
@@ -1545,11 +1723,18 @@ export default function MCPTab() {
                   {cloudSyncBusy ? "…" : "TEST"}
                 </Text>
               </TouchableOpacity>
+              <TouchableOpacity style={[s.smallBtn, { borderColor: C.mcpAccent }]}
+                onPress={handleSnapshotNow}
+                disabled={cloudSyncBusy}>
+                <Text style={[s.smallBtnText, { color: C.mcpAccent }]}>
+                  SNAPSHOT NOW
+                </Text>
+              </TouchableOpacity>
               <TouchableOpacity style={[s.smallBtn, { borderColor: C.green }]}
                 onPress={handleDiscoverFromTailnet}
                 disabled={cloudSyncBusy}>
                 <Text style={[s.smallBtnText, { color: C.green }]}>
-                  DISCOVER + RESTORE
+                  RESTORE FROM CLOUD
                 </Text>
               </TouchableOpacity>
               <TouchableOpacity style={[s.smallBtn, { borderColor: C.red }]}
@@ -1563,10 +1748,10 @@ export default function MCPTab() {
               </Text>
             )}
             <Text style={[s.helperFine, { marginTop: 8, color: C.textDim }]}>
-              rotation loop off until nodes ship enforcer-mcp 0.3.0. discover+restore
-              works today: greps <Text style={{ color: C.cyan }}>tailscale status</Text>{" "}
-              for <Text style={{ color: C.cyan }}>/node|enforcer/i</Text> hostnames,
-              fetches current bearer from upstash, inserts rows.
+              <Text style={{ color: C.cyan }}>save + snapshot</Text> pushes creds AND a full node roster in one tap.{"\n"}
+              <Text style={{ color: C.mcpAccent }}>snapshot now</Text> re-pushes the current roster + seeds bearer if redis is empty.{"\n"}
+              <Text style={{ color: C.green }}>restore from cloud</Text> merges tailnet peers matching{" "}
+              <Text style={{ color: C.cyan }}>/enforcer-node/i</Text> (excluding self) with the redis roster fallback.
             </Text>
           </View>
 
