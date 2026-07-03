@@ -143,3 +143,23 @@ echo "  ssh node 'sudo apt install /tmp/$(basename "$OUT")'"
 echo
 echo "The bearer token is generated on first install and printed in the"
 echo "postinst output AND saved to /etc/enforcer-mcp/config.yaml."
+
+# ─── Auto-sync into the frontend APK asset dir ───────────────────────
+# The cockpit's [Deploy New Node] flow ships the bundled .deb over
+# Tailscale to targets. If the asset here goes stale relative to the
+# freshly-built .deb, the next EAS build will still ship the old bytes.
+# We copy the .deb + regenerate the sidecar sha256 so that pain goes
+# away — the operator only needs to remember `build-deb.sh`.
+#
+# We look for the frontend directory relative to this script; if the
+# repo isn't laid out the usual way (e.g. building from a tarball),
+# we skip silently.
+_FRONTEND_ASSETS="$(cd "$(dirname "$0")/../../frontend/assets/enforcer-node" 2>/dev/null && pwd || true)"
+if [[ -n "$_FRONTEND_ASSETS" && -d "$_FRONTEND_ASSETS" ]]; then
+    cp -f "$OUT" "$_FRONTEND_ASSETS/enforcer-mcp.deb"
+    sha256sum "$_FRONTEND_ASSETS/enforcer-mcp.deb" | awk '{print $1}' \
+        > "$_FRONTEND_ASSETS/enforcer-mcp.deb.sha256"
+    echo
+    echo "→ synced into frontend APK asset dir: $_FRONTEND_ASSETS"
+    echo "  Next EAS build will bundle $VERSION."
+fi

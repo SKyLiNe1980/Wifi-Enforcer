@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# enforcer-mcp-reconcile-tools — append tool definitions from
+# /opt/enforcer-mcp/config.yaml.example (the shipped reference config)
+# into /etc/enforcer-mcp/config.yaml (the operator's live config) for
+# any tools missing by NAME. Idempotent. Never removes; never modifies
+# existing entries.
+#
+# Why: Debian conffile etiquette means dpkg preserves the operator's
+# /etc/enforcer-mcp/config.yaml across upgrades. New tools added to
+# newer .debs land in .example but never in the live config. This
+# helper closes that gap without doing anything scary.
+#
+# Usage:
+#   sudo enforcer-mcp-reconcile-tools               # apply
+#   sudo enforcer-mcp-reconcile-tools --dry-run     # show what would be added
+#
+# Requires Python 3 (already a Depends of enforcer-mcp).
+
+set -euo pipefail
+LIVE=/etc/enforcer-mcp/config.yaml
+REF=/opt/enforcer-mcp/config.yaml.example
+DRY=0
+[[ "${1:-}" == "--dry-run" ]] && DRY=1
+
+for p in "$LIVE" "$REF"; do
+    [[ -r "$p" ]] || { echo "missing: $p" >&2; exit 2; }
+done
+
+# Take a timestamped backup before touching the live config.
+if [[ $DRY -eq 0 ]]; then
+    cp -p "$LIVE" "${LIVE}.bak.$(date -u +%Y%m%dT%H%M%SZ)"
+fi
+
+python3 - "$LIVE" "$REF" "$DRY" <<'PY'
+import sys, yaml, io
+live_path, ref_path, dry = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
+
+# Load both as YAML, dive into `tools:` list.
+with open(live_path) as f: live = yaml.safe_load(f) or {}
+with open(ref_path)  as f: ref  = yaml.safe_load(f) or {}
+
+live_tools = live.get("tools") or []
+ref_tools  = ref.get("tools")  or []
+
+have = { t.get("name") for t in live_tools if isinstance(t, dict) }
+missing = [ t for t in ref_tools
+            if isinstance(t, dict) and t.get("name") and t["name"] not in have ]
+
+if not missing:
+    print("nothing to reconcile — live config already has every tool from the reference.")
+    sys.exit(0)
+
+print(f"missing {len(missing)} tool(s):")
+for t in missing:
+    print(f"  • {t['name']}")
+if dry:
+    print("(dry-run — not writing)")
+    sys.exit(0)
+
+live.setdefault("tools", []).extend(missing)
+# Preserve YAML style-ish output; yaml.safe_dump loses comments but keeps
+# structure. Operator's own tools/settings above `tools:` are preserved
+# because we're editing the dict in place.
+with open(live_path, "w") as f:
+    yaml.safe_dump(live, f, default_flow_style=False, sort_keys=False)
+print(f"appended {len(missing)} tool(s) to {live_path}")
+print("restart the server so the new tools appear:")
+print("  sudo systemctl restart enforcer-mcp   # or bounce autospawn from cockpit")
+PY
