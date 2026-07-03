@@ -1,3 +1,15 @@
+enforcer-mcp (0.3.4) unstable; urgency=low
+
+  * New helper + MCP tool: enforcer-cloud-probe-commands /
+    cloud_probe_commands. Zero-payload capability discovery — sends
+    each candidate Redis command with no arguments and classifies the
+    response as passthrough / unknown / forbidden. Useful for UEF-style
+    recon of what a REST proxy (Upstash) actually allowlists. Default
+    probe set is Streams-focused (XACK, XACKDEL, XAUTOCLAIM, …) plus
+    adjacent CVE-adjacent primitives (DEBUG, SCRIPT, MODULE, PUBSUB).
+
+ -- enforcer-swarm <enforcer@localhost>  Fri, 03 Jul 2026 12:00:00 +0000
+
 enforcer-mcp (0.3.3) unstable; urgency=medium
 
   * Five new first-class MCP tools for cloud OTA (Hermes-callable):

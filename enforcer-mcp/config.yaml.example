@@ -360,3 +360,20 @@ tools:
       }
     wrap_mode: none
     timeout_sec: 300
+
+  - name: cloud_probe_commands
+    description: "Enumerate which Redis commands are actually reachable through the Upstash REST proxy allowlist. Zero-payload capability discovery — sends each command with no arguments and classifies the response ('passthrough', 'unknown', 'forbidden'). Safe on production because we never actually invoke the target commands. Default probe set is the Streams family + interesting adjacent primitives that tend to show up in CVE research (DEBUG, SCRIPT, MODULE, PUBSUB, …). Useful for UEF-style capability recon before designing test cases."
+    command_template: "enforcer-cloud-probe-commands --json {extra}"
+    arg_schema_json: |
+      {
+        "type": "object",
+        "properties": {
+          "extra": {
+            "type": "string",
+            "default": "",
+            "description": "Optional: space-separated list of specific commands to probe (e.g. 'XACKDEL XAUTOCLAIM XCLAIM'). Empty = probe the default Streams-focused set."
+          }
+        }
+      }
+    wrap_mode: none
+    timeout_sec: 30
