@@ -40,6 +40,17 @@ export const KEY_LAST_ROTATED = "enforcer:bearer:last_rotated_at";
 // to write wins for the rotation loop; a second cockpit sees this and
 // stays read-only. Prevents two cockpits fighting over rotations.
 export const KEY_ROTATION_OWNER = "enforcer:bearer:rotation_owner";
+// Cluster node ROSTER (JSON array). Written on every node CRUD by the
+// cockpit; read on fresh reinstall to hydrate SQLite when tailnet
+// discovery returns empty (offline / tailscaled down / peers were named
+// off-convention). Bearer is NOT included here — that lives in KEY_CURRENT.
+export const KEY_ROSTER = "enforcer:nodes:roster";
+// Wall-clock of last roster write. Handy for eyeballing whether cockpit
+// is actually mirroring on schedule.
+export const KEY_ROSTER_UPDATED = "enforcer:nodes:roster_updated_at";
+// Roster TTL — long enough to survive weeks of no updates, short enough
+// that a truly abandoned cockpit's stale roster self-evicts. 30 days.
+export const TTL_ROSTER_SEC = 30 * 24 * 60 * 60;
 
 // Suggested TTLs so orphaned rows self-evict from Upstash if the cockpit
 // stops rotating (e.g. app uninstalled while a rotation was in flight).
@@ -234,14 +245,23 @@ export type DiscoveredPeer = {
 };
 
 /**
- * Enumerate tailnet peers that match the enforcer naming convention
- * (hostname contains "node" or "enforcer", case-insensitive). Uses
- * `tailscale status --json` via root shell — one call, deterministic.
+ * Enumerate tailnet peers that match the enforcer naming convention.
  *
- * Rationale over trial-and-error probing: convention-based discovery is
- * predictable ("if you want it in the swarm, name it accordingly") and
- * only costs ONE root call regardless of tailnet size. Trial probing
- * would cost N root/curl calls and pop N Magisk prompts.
+ * Default pattern is `/enforcer-node/i` — matches the user's actual naming
+ * ("<host>-enforcer-node"). Non-matching hosts like `s10-controller`
+ * (the cockpit itself) or unrelated tailnet peers are ignored.
+ *
+ * SELF EXCLUSION: even if the cockpit's hostname accidentally matches the
+ * pattern, we skip Self so the cockpit never adds itself to its own
+ * roster. `tailscale status --json` returns a `Self` block with the
+ * device's own DNSName/HostName which we read once.
+ *
+ * SOCKET DISCOVERY: on NetHunter userspace-networking mode the default
+ * `/var/run/tailscale/tailscaled.sock` is unreachable — we mirror the
+ * probe chain used by `tailnetDetect.ts` and try the chroot socket path
+ * first. Falls through to the default socket for VPS / kernel-mode
+ * installs. Silent on every failure so callers get an empty list
+ * instead of a thrown exception.
  *
  * `execReal` is imported by caller (deployServer.ts already imports it
  * from rootShell); we accept it as a param so this module stays pure
@@ -249,30 +269,133 @@ export type DiscoveredPeer = {
  */
 export async function discoverEnforcerPeers(
   execReal: (cmd: string) => Promise<{ output: string; exit_code: number }>,
-  pattern: RegExp = /node|enforcer/i,
+  pattern: RegExp = /enforcer-node/i,
 ): Promise<DiscoveredPeer[]> {
-  const res = await execReal(`tailscale status --json 2>/dev/null || echo '{}'`);
-  if (res.exit_code !== 0) return [];
-  let parsed: any;
-  try { parsed = JSON.parse(res.output || "{}"); } catch { return []; }
+  // Probe chain: chroot socket → default socket. First one that returns
+  // valid JSON with a Peer object wins.
+  const probes = [
+    `tailscale --socket=/var/run/tailscale/tailscaled-chroot.sock status --json 2>/dev/null`,
+    `tailscale status --json 2>/dev/null`,
+  ];
+  let parsed: any = null;
+  for (const cmd of probes) {
+    try {
+      const res = await execReal(cmd);
+      if (!res.output) continue;
+      try {
+        const j = JSON.parse(res.output);
+        // A valid tailscale-status JSON always has a Self key. Reject anything else.
+        if (j && typeof j === "object" && j.Self) { parsed = j; break; }
+      } catch { /* try next probe */ }
+    } catch { /* try next probe */ }
+  }
+  if (!parsed) return [];
+
+  // Grab self's hostname/DNS so we can drop it from the peer list even
+  // if the operator named the cockpit against the convention. Also
+  // useful when tailscaled reports Self INSIDE the Peer map on some
+  // versions — belt-and-suspenders.
+  const selfHost = (parsed?.Self?.HostName || "").toLowerCase();
+  const selfDns = (parsed?.Self?.DNSName || "").toLowerCase().replace(/\.$/, "");
+
   const peers = parsed?.Peer;
   if (!peers || typeof peers !== "object") return [];
+
   const out: DiscoveredPeer[] = [];
   for (const p of Object.values<any>(peers)) {
     const hostname = p?.HostName || "";
-    const dnsName = p?.DNSName || "";
+    const dnsName = (p?.DNSName || "").replace(/\.$/, "");
     if (!hostname && !dnsName) continue;
-    // Match against short hostname AND FQDN — either can contain the
-    // convention token depending on how the operator named things.
+
+    // Explicit self-skip. Even if a bug leaks Self into Peer map, or
+    // the operator has two devices with identical hostnames, we still
+    // won't add the cockpit's own IP as a "node".
+    if (hostname.toLowerCase() === selfHost) continue;
+    if (dnsName.toLowerCase() === selfDns) continue;
+
+    // Convention match: hostname OR DNS name must contain the pattern.
     if (!pattern.test(hostname) && !pattern.test(dnsName)) continue;
+
     const tailIp = (p?.TailscaleIPs || []).find((ip: string) => /^\d+\.\d+\.\d+\.\d+$/.test(ip));
     if (!tailIp) continue;
+
     out.push({
       hostname,
-      dnsName: dnsName.replace(/\.$/, ""), // strip trailing dot from FQDN
+      dnsName,
       tailIp,
       online: !!p?.Online,
     });
   }
   return out.sort((a, b) => a.hostname.localeCompare(b.hostname));
+}
+
+// ─── Node roster snapshot (Redis) ──────────────────────────────────────
+//
+// Every node CRUD in the cockpit mirrors a JSON snapshot of the roster
+// to Upstash under KEY_ROSTER. Reinstall recovery becomes:
+//   1. paste Upstash URL + token
+//   2. hit RESTORE-FROM-CLOUD → cockpit fetches KEY_ROSTER + KEY_CURRENT
+//      → hydrates SQLite in one call
+//
+// Nothing here is required for the app to function online — it's a
+// fresh-install-only escape hatch. All writes are fire-and-forget from
+// the UI (Cloud Sync unconfigured just no-ops).
+
+/** Public shape of a roster entry — deliberately a subset of MCPNode so
+ *  we don't leak transient state (last_seen_at, health_status, etc). */
+export type RosterEntry = {
+  name: string;
+  host: string;
+  port: number;
+  transport?: "http_sse" | "stdio";
+  is_primary?: boolean;
+  tags?: string[];
+  description?: string;
+};
+
+/** Push the full roster to Upstash. Overwrites the previous snapshot. */
+export async function pushRoster(
+  restUrl: string, restToken: string,
+  roster: RosterEntry[],
+): Promise<void> {
+  const payload = JSON.stringify(roster);
+  await upstashCmd(restUrl, restToken, [
+    "SET", KEY_ROSTER, payload,
+    "EX", TTL_ROSTER_SEC,
+  ]);
+  await upstashCmd(restUrl, restToken, [
+    "SET", KEY_ROSTER_UPDATED, new Date().toISOString(),
+    "EX", TTL_ROSTER_SEC,
+  ]);
+}
+
+/** Fetch the roster snapshot from Upstash. Returns [] if the key doesn't
+ *  exist or is unparseable. Never throws — callers can treat empty as
+ *  "no cloud roster yet, prompt manual add". */
+export async function fetchRoster(
+  restUrl: string, restToken: string,
+): Promise<RosterEntry[]> {
+  try {
+    const raw = await upstashCmd(restUrl, restToken, ["GET", KEY_ROSTER]);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw as string);
+    if (!Array.isArray(parsed)) return [];
+    // Loose shape validation — just make sure we have the required keys.
+    return parsed.filter((e: any) =>
+      e && typeof e.name === "string" && typeof e.host === "string" &&
+      typeof e.port === "number");
+  } catch (e) {
+    console.warn("[tokenStash] fetchRoster failed:", e);
+    return [];
+  }
+}
+
+/** Fetch when the roster snapshot was last written. Returns null if unset. */
+export async function fetchRosterUpdatedAt(
+  restUrl: string, restToken: string,
+): Promise<string | null> {
+  try {
+    const raw = await upstashCmd(restUrl, restToken, ["GET", KEY_ROSTER_UPDATED]);
+    return typeof raw === "string" ? raw : null;
+  } catch { return null; }
 }
