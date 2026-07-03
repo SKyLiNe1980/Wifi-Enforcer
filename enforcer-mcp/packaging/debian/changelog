@@ -1,3 +1,16 @@
+enforcer-mcp (0.3.7) unstable; urgency=medium
+
+  * GTFOBins integration: ships handlers/gtfobins/ with the 478-binary
+    offline cache (~192KB) plus a --cli mode wrapper. Four new MCP
+    tools: gtfobins_functions, gtfobins_lookup, gtfobins_triage,
+    gtfobins_search. Post-shell triage is now a Hermes-callable prompt
+    away — feed it `ls /bin` output on a compromised target and get
+    ranked exploit primitives sorted by code length.
+  * build-deb.sh now recursively packages handlers/<subdir>/ so future
+    self-contained handler modules ship without touching the packager.
+
+ -- enforcer-swarm <enforcer@localhost>  Fri, 03 Jul 2026 15:00:00 +0000
+
 enforcer-mcp (0.3.6) unstable; urgency=medium
 
   * New helper: enforcer-mcp-reconcile-tools. Appends missing tool

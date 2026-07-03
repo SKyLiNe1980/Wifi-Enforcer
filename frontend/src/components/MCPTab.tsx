@@ -29,6 +29,7 @@ import { startStream, killStream, hasNativeStreaming, execReal, HAS_NATIVE_ROOT 
 import { detectTailnetIp } from "../lib/tailnetDetect";
 import {
   prepareDebPayload, detectTailscaleIp, startHttpServer, stopHttpServer,
+  installBundledDebLocally, pushBundledDebToCloud,
   buildInstallOneLiner, diagnoseDeploy, reapStaleHttpServers,
   type DeployPayload, type HttpdHandle, type DiagnosticsReport,
 } from "../lib/deployServer";
@@ -1852,6 +1853,61 @@ export default function MCPTab() {
               >
                 <MaterialCommunityIcons name="plus" size={14} color={C.mcpAccent} />
                 <Text style={[s.btnText, { color: C.mcpAccent }]}>ADD NODE</Text>
+              </TouchableOpacity>
+              {/*
+                Install-locally + Push-to-cloud: use the APK-bundled .deb
+                as the source of truth. Solves the chicken-egg where the
+                cockpit's own chroot lagged behind the APK and where
+                seeding Upstash required SSH'ing to another box.
+              */}
+              <TouchableOpacity
+                style={[s.btn, { backgroundColor: C.panel2, borderColor: C.cyan }]}
+                disabled={!HAS_NATIVE_ROOT}
+                onPress={async () => {
+                  try {
+                    const out = await installBundledDebLocally();
+                    Alert.alert("Install OK", out.slice(-800) || "(no output)");
+                    refreshLists();
+                  } catch (e: any) {
+                    Alert.alert("Install failed", e?.message || String(e));
+                  }
+                }}
+              >
+                <MaterialCommunityIcons name="download-outline" size={14}
+                  color={HAS_NATIVE_ROOT ? C.cyan : C.textDim} />
+                <Text style={[s.btnText, { color: HAS_NATIVE_ROOT ? C.cyan : C.textDim }]}>
+                  INSTALL BUNDLED .DEB LOCALLY
+                </Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[s.btn, { backgroundColor: C.panel2, borderColor: C.mcpAccent }]}
+                disabled={!HAS_NATIVE_ROOT}
+                onPress={async () => {
+                  try {
+                    // Reuse the SecureStore-backed Upstash creds already
+                    // saved via the Cloud Sync UI. If unset, the helper
+                    // throws with a clear message we surface as an Alert.
+                    const [url, tok] = await Promise.all([loadUpstashUrl(), loadUpstashToken()]);
+                    if (!url || !tok) {
+                      Alert.alert("Not configured",
+                        "Cloud Sync isn't set up yet. Paste your Upstash REST URL + token first.");
+                      return;
+                    }
+                    const out = await pushBundledDebToCloud({
+                      restUrl: url, restToken: tok,
+                      changelog: "pushed from cockpit bundled asset",
+                    });
+                    Alert.alert("Pushed to cloud", out.slice(-800) || "(no output)");
+                  } catch (e: any) {
+                    Alert.alert("Push failed", e?.message || String(e));
+                  }
+                }}
+              >
+                <MaterialCommunityIcons name="cloud-upload-outline" size={14}
+                  color={HAS_NATIVE_ROOT ? C.mcpAccent : C.textDim} />
+                <Text style={[s.btnText, { color: HAS_NATIVE_ROOT ? C.mcpAccent : C.textDim }]}>
+                  PUSH BUNDLED .DEB TO CLOUD
+                </Text>
               </TouchableOpacity>
             </View>
           </View>

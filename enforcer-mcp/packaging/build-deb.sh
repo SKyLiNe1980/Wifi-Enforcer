@@ -82,10 +82,20 @@ install -m 0644 "$PROJECT_DIR/requirements.txt"    "$STAGE/opt/enforcer-mcp/"
 install -m 0644 "$PROJECT_DIR/README.md"           "$STAGE/opt/enforcer-mcp/"
 install -m 0644 "$PROJECT_DIR/config.yaml.example" "$STAGE/opt/enforcer-mcp/"
 
-# handlers/ — Python package
+# handlers/ — Python package. Includes top-level *.py AND self-contained
+# subdirectories (e.g. handlers/gtfobins/ which ships its own cache).
 install -d -m 0755 "$STAGE/opt/enforcer-mcp/handlers"
 for f in "$PROJECT_DIR/handlers/"*.py; do
+    [[ -f "$f" ]] || continue
     install -m 0644 "$f" "$STAGE/opt/enforcer-mcp/handlers/"
+done
+# Copy subdirectories recursively so bundled databases and __main__ CLIs
+# come along for the ride. Preserves executable bits on any .py that had
+# them (e.g. gtfobins-mcp.py runs standalone via --cli).
+for d in "$PROJECT_DIR/handlers/"*/; do
+    [[ -d "$d" ]] || continue
+    dname=$(basename "$d")
+    cp -a "$d" "$STAGE/opt/enforcer-mcp/handlers/$dname"
 done
 
 # scripts/ — wpa-sec helpers. install -m 0755 because postinst symlinks

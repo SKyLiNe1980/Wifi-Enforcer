@@ -402,3 +402,56 @@ export function buildInstallOneLiner(
     `sudo grep '^bearer_token_hex' /etc/enforcer-mcp/config.yaml`
   );
 }
+
+/**
+ * One-tap self-heal: install the APK's bundled .deb into the cockpit's
+ * own chroot. Uses prepareDebPayload() to stage the bytes, then
+ * `dpkg -i` + `enforcer-mcp-reconcile-tools` so the live config picks
+ * up any newly-defined MCP tools shipped in this build.
+ *
+ * Returns the combined stdout/stderr of the install for the caller to
+ * surface in an Alert. Throws on non-zero exit so the UI can flag red.
+ */
+export async function installBundledDebLocally(): Promise<string> {
+  const payload = await prepareDebPayload();
+  // Wrap in the chroot's sudo/bash the same way the deploy pipeline does.
+  const script = [
+    `dpkg -i '${payload.debPath}'`,
+    // reconcile-tools ships in the .deb we just installed, so this path
+    // is guaranteed to exist after dpkg -i finishes.
+    `enforcer-mcp-reconcile-tools || true`,
+  ].join(" && ");
+  const res = await execReal(`busybox_nh chroot ${CHROOT_ROOT} /usr/bin/sudo -E bash -c "${script}"`);
+  if (res.exit_code !== 0) {
+    throw new Error(`install failed (exit ${res.exit_code}):\n${res.output || "(no output)"}`);
+  }
+  return res.output || "";
+}
+
+/**
+ * One-tap cloud seed: push the APK's bundled .deb to Upstash so the
+ * fleet's `enforcer-cloud-pull` can grab it. Reads Upstash creds from
+ * the same SecureStore slots the Cloud Sync UI uses; fails cleanly if
+ * they aren't configured.
+ */
+export async function pushBundledDebToCloud(opts: {
+  restUrl: string;
+  restToken: string;
+  changelog?: string;
+}): Promise<string> {
+  if (!opts.restUrl || !opts.restToken) {
+    throw new Error("Cloud Sync not configured — set Upstash URL + token first.");
+  }
+  const payload = await prepareDebPayload();
+  const cl = (opts.changelog || "pushed from cockpit bundled asset").replace(/"/g, "'");
+  // enforcer-cloud-push exits non-zero on failure and prints diagnostics.
+  const script =
+    `ENFORCER_CLOUD_URL='${opts.restUrl}' ` +
+    `ENFORCER_CLOUD_TOKEN='${opts.restToken}' ` +
+    `enforcer-cloud-push --deb '${payload.debPath}' --changelog "${cl}"`;
+  const res = await execReal(`busybox_nh chroot ${CHROOT_ROOT} /usr/bin/sudo -E bash -c "${script}"`);
+  if (res.exit_code !== 0) {
+    throw new Error(`push failed (exit ${res.exit_code}):\n${res.output || "(no output)"}`);
+  }
+  return res.output || "";
+}

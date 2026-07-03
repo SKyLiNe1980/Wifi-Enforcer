@@ -377,3 +377,67 @@ tools:
       }
     wrap_mode: none
     timeout_sec: 30
+
+  # ─── GTFOBins: living-off-the-land binary lookup ────────────────────
+  # 478-binary offline cache. Post-shell triage tools — given `ls /bin`
+  # output on a compromised target, returns ranked exploit primitives
+  # (file-read, download, reverse-shell, sudo-bypass, etc.) sorted by
+  # code length. No API calls — everything's baked into the .deb.
+  # Wrappers call the shipped handler in --cli mode so we don't have to
+  # keep a stdio subprocess alive.
+
+  - name: gtfobins_functions
+    description: "List all 12 GTFOBins function types (shell, sudo, capabilities, file-write, download, reverse-shell, non-interactive-bind-shell, etc.) with their descriptions. Zero args, always safe to call."
+    command_template: "python3 /opt/enforcer-mcp/handlers/gtfobins/gtfobins-mcp.py --cli functions"
+    arg_schema_json: |
+      {"type": "object", "properties": {}}
+    wrap_mode: none
+    timeout_sec: 10
+
+  - name: gtfobins_lookup
+    description: "Return every GTFOBins exploit function known for a specific binary, with the exact one-liner code. Use when you've spotted a candidate binary on target and want the payload."
+    command_template: "python3 /opt/enforcer-mcp/handlers/gtfobins/gtfobins-mcp.py --cli lookup --binary {binary}"
+    arg_schema_json: |
+      {
+        "type": "object",
+        "required": ["binary"],
+        "properties": {
+          "binary": {"type": "string", "description": "Binary name, e.g. 'python3', 'vim', 'find', 'awk'."}
+        }
+      }
+    wrap_mode: none
+    timeout_sec: 10
+
+  - name: gtfobins_triage
+    description: "Post-shell triage. Given a comma-separated list of binaries present on the target (feed it `ls /bin` output) and a goal, returns ranked exploit paths sorted by code length. Goal is optional; when omitted, returns EVERY exploit primitive achievable with the available binaries."
+    command_template: "python3 /opt/enforcer-mcp/handlers/gtfobins/gtfobins-mcp.py --cli triage --bins {bins} --goal {goal}"
+    arg_schema_json: |
+      {
+        "type": "object",
+        "required": ["bins"],
+        "properties": {
+          "bins": {
+            "type": "string",
+            "description": "Comma-separated list of binaries present on target, e.g. 'whois,ftp,perl,nc,lua'."
+          },
+          "goal": {
+            "type": "string",
+            "description": "Optional goal filter. Common: 'download', 'shell', 'reverse-shell', 'file-read', 'file-write', 'suid', 'sudo', 'capabilities'.",
+            "default": ""
+          }
+        }
+      }
+    wrap_mode: none
+    timeout_sec: 15
+
+  - name: gtfobins_search
+    description: "Fuzzy substring search across the 478 GTFOBins binaries. Useful when you've spotted 'something_python' on target and want to check what variants are in the DB."
+    command_template: "python3 /opt/enforcer-mcp/handlers/gtfobins/gtfobins-mcp.py --cli search --query {query}"
+    arg_schema_json: |
+      {
+        "type": "object",
+        "required": ["query"],
+        "properties": {"query": {"type": "string"}}
+      }
+    wrap_mode: none
+    timeout_sec: 10
