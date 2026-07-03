@@ -24,6 +24,19 @@ import React, { useCallback, useEffect, useMemo, useRef } from "react";
 import { Platform, StyleSheet, View } from "react-native";
 import { WebView } from "react-native-webview";
 import { sessionManager } from "../lib/sessionManager";
+// Vendored xterm.js payload — see frontend/scripts/vendor-xterm.sh.
+// Loading from a public CDN inside the WebView hangs indefinitely on
+// tailnet-routed devices (the exit node may not have a route to
+// jsDelivr, or the chroot's resolver misses the alias). Bundling the
+// JS + CSS as base64 inside a JSON asset lets Metro ship it with the
+// app bundle so the terminal loads even fully offline.
+const xtermBundle = require("../../assets/xterm/xterm-bundle.json") as {
+  xtermVersion: string;
+  fitVersion: string;
+  cssContent: string;
+  xtermJsB64: string;
+  fitAddonB64: string;
+};
 
 type Props = {
   /** The session we're rendering. May change as user starts/stops sessions. */
@@ -34,10 +47,6 @@ type Props = {
    *  user picks a different profile while a session was active). */
   resetToken?: string | number;
 };
-
-// xterm + fit-addon — pinned versions for reproducibility.
-const XTERM_VER = "5.5.0";
-const FIT_VER = "0.10.0";
 
 /**
  * Collapse runs of ≥2 consecutive empty strings down to a single empty
@@ -67,13 +76,20 @@ function collapseBlankRuns(lines: string[]): string[] {
  * with interpolated values) so the bundler doesn't have to re-encode it on
  * every render — every re-render with the same `source.html` is treated
  * as identical by react-native-webview and won't reload.
+ *
+ * All external assets are inlined from the vendored bundle: xterm.min.css
+ * as raw text inside a <style> block, xterm.min.js and addon-fit.min.js
+ * as base64 strings that a small bootstrap script decodes with atob()
+ * and evaluates. No network requests leave the WebView.
  */
 const XTERM_HTML = `<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@${XTERM_VER}/css/xterm.min.css" />
+<style>
+${xtermBundle.cssContent}
+</style>
 <style>
   html, body { margin: 0; padding: 0; height: 100%; width: 100%; background: #04070a; overflow: hidden; }
   #t { width: 100%; height: 100vh; padding: 4px; box-sizing: border-box; }
@@ -84,10 +100,37 @@ const XTERM_HTML = `<!DOCTYPE html>
 </style>
 </head>
 <body>
-<div id="boot">// loading xterm.js…</div>
+<div id="boot">// booting xterm.js…</div>
 <div id="t"></div>
-<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@${XTERM_VER}/lib/xterm.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@${FIT_VER}/lib/addon-fit.min.js"></script>
+<script>
+// Bootstrap: decode + eval the two vendored payloads (xterm core + fit
+// addon). We keep this synchronous so subsequent code that references
+// Terminal / FitAddon sees them already global. Any decode / eval
+// failure is surfaced to RN via postMessage so the fallback path can
+// swap in a scrollback view instead.
+(function bootstrap() {
+  function b64ToStr(b64) {
+    // atob returns latin-1; xterm.js source is ASCII-safe so this is fine.
+    return atob(b64);
+  }
+  function loadInline(name, b64) {
+    try {
+      // eslint-disable-next-line no-eval
+      (0, eval)(b64ToStr(b64));
+    } catch (e) {
+      if (window.ReactNativeWebView && window.ReactNativeWebView.postMessage) {
+        window.ReactNativeWebView.postMessage(JSON.stringify({
+          type: "load_error",
+          message: "eval failed for " + name + ": " + (e && e.message ? e.message : String(e))
+        }));
+      }
+      throw e;
+    }
+  }
+  loadInline("xterm.min.js",     ${JSON.stringify(xtermBundle.xtermJsB64)});
+  loadInline("addon-fit.min.js", ${JSON.stringify(xtermBundle.fitAddonB64)});
+})();
+</script>
 <script>
 (function () {
   // Helper that talks back to React Native.
@@ -99,11 +142,11 @@ const XTERM_HTML = `<!DOCTYPE html>
     } catch (e) {}
   }
 
-  // Guard against the scripts failing to load (offline, CDN down, …).
+  // Guard against the vendored payload failing to eval for any reason.
   if (typeof Terminal === "undefined") {
     document.getElementById("boot").innerText =
-      "// xterm failed to load (no network?). Tap session info to switch to scrollback mode.";
-    post({ type: "load_error", message: "xterm.min.js failed to load" });
+      "// xterm bundle failed to init. Tap session info to switch to scrollback mode.";
+    post({ type: "load_error", message: "Terminal global missing after bootstrap" });
     return;
   }
 
@@ -417,7 +460,11 @@ export default function XTermView({ sessionId, onInput, resetToken }: Props) {
   }, []);
 
   // Stable source — never recompute (would force WebView reload).
-  const source = useMemo(() => ({ html: XTERM_HTML, baseUrl: "https://cdn.jsdelivr.net" }), []);
+  // baseUrl is "about:blank" now that all assets are inlined; a real
+  // origin would only matter if we were loading external <script>/<img>
+  // resources, and the CDN loads used to hang forever on tailnet-routed
+  // devices. See vendor-xterm.sh + xterm-bundle.json.
+  const source = useMemo(() => ({ html: XTERM_HTML, baseUrl: "about:blank" }), []);
 
   return (
     <View style={s.root} onTouchStart={focusTerm}>

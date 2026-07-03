@@ -76,6 +76,21 @@ case "$1" in
             chown root:"$GROUP_NAME" "$CONFIG_FILE" || true
             chmod 0640 "$CONFIG_FILE" || true
             echo "enforcer-mcp: existing config preserved at $CONFIG_FILE"
+            # ── 3b. loopback-bind trap (pre-0.3.1 default) ──────────────
+            # Fresh installs before 0.3.1 defaulted server.host to
+            # "127.0.0.1", which made the node invisible to remote
+            # cockpits probing over tailnet. If this node is one of
+            # those, print a big loud hint. We deliberately do NOT edit
+            # the file — Debian conffile etiquette says config edits are
+            # the operator's decision.
+            if grep -Eq '^[[:space:]]+host:[[:space:]]*"?127\.0\.0\.1"?' "$CONFIG_FILE" 2>/dev/null; then
+                echo ""
+                echo "enforcer-mcp: ⚠ server.host is 127.0.0.1 — this node will NOT be reachable"
+                echo "enforcer-mcp:   from a remote cockpit over Tailscale. To fix:"
+                echo "enforcer-mcp:     sudo enforcer-mcp-set-bind 0.0.0.0"
+                echo "enforcer-mcp:   (the helper takes a timestamped backup + restarts the service)"
+                echo ""
+            fi
         fi
 
         # ── 4. virtualenv + pip deps ────────────────────────────────────

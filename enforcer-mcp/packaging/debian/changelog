@@ -1,3 +1,20 @@
+enforcer-mcp (0.3.1) unstable; urgency=high
+
+  * Fix: default server.host in config.yaml.example flipped from
+    "127.0.0.1" to "0.0.0.0". Fresh installs on remote swarm nodes were
+    only listening on loopback, so the cockpit's tailnet health probe
+    could never reach them — nodes appeared permanently offline. The
+    daemon still requires a bearer token so this widened bind is safe
+    behind Tailscale ACLs.
+  * New helper: enforcer-mcp-set-bind. In-place safe edit of
+    /etc/enforcer-mcp/config.yaml (timestamped backup + service
+    restart) so existing 0.3.0 nodes can be repaired without a config
+    rewrite. Idempotent, supports --show to print current value.
+  * Postinst upgrade path now inspects the existing config and prints
+    a loud hint if it detects the pre-0.3.1 loopback default.
+
+ -- enforcer-swarm <enforcer@localhost>  Fri, 03 Jul 2026 07:15:00 +0000
+
 enforcer-mcp (0.3.0) unstable; urgency=medium
 
   * Ship the enforcer-cloud-{push,pull,rollback,status} scripts for

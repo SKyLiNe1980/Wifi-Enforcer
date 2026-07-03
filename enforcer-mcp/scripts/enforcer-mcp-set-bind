@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# enforcer-mcp-set-bind — safely change the enforcer-mcp server bind
+# address in /etc/enforcer-mcp/config.yaml and restart the service.
+#
+# Motivation: fresh installs before 0.3.1 defaulted the `server.host`
+# field to "127.0.0.1", which meant the enforcer-mcp daemon only listened
+# on loopback. Remote cockpits probing over Tailscale would see the node
+# as offline forever. This script flips the value in-place with a
+# backup, then bounces the systemd unit so the change takes effect.
+#
+# Usage:
+#   sudo enforcer-mcp-set-bind                # default → 0.0.0.0
+#   sudo enforcer-mcp-set-bind 0.0.0.0
+#   sudo enforcer-mcp-set-bind 100.64.1.23    # bind to a specific tailnet IP
+#   sudo enforcer-mcp-set-bind --show         # just print the current bind
+#
+# Safe to re-run: no-op if already at the desired value.
+
+set -euo pipefail
+
+CFG="/etc/enforcer-mcp/config.yaml"
+NEW_HOST=""
+SHOW_ONLY=0
+
+for arg in "$@"; do
+    case "$arg" in
+        --show|-s) SHOW_ONLY=1 ;;
+        -h|--help)
+            sed -n '2,/^set -e/p' "$0" | sed 's/^# \?//' | head -n -1
+            exit 0 ;;
+        *) NEW_HOST="$arg" ;;
+    esac
+done
+[[ -z "$NEW_HOST" ]] && NEW_HOST="0.0.0.0"
+
+if [[ ! -f "$CFG" ]]; then
+    echo "config not found: $CFG (is enforcer-mcp installed?)" >&2
+    exit 2
+fi
+
+# Extract current host from the `server: → host:` block. We use a
+# minimal awk state machine rather than shelling out to a yaml parser
+# because we can't assume `yq` is on every node.
+current_host=$(awk '
+    /^server:/            { in_server=1; next }
+    in_server && /^[a-z]/ { in_server=0 }
+    in_server && /^\s+host:/ {
+        gsub(/["'"'"']/, "", $2); print $2; exit
+    }
+' "$CFG")
+
+if (( SHOW_ONLY == 1 )); then
+    echo "current server.host: ${current_host:-<not-set>}"
+    exit 0
+fi
+
+if [[ "$current_host" == "$NEW_HOST" ]]; then
+    echo "server.host is already $NEW_HOST — nothing to do."
+    exit 0
+fi
+
+# Take a timestamped backup so operator can revert with `mv`.
+STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+cp -p "$CFG" "$CFG.bak.$STAMP"
+echo "backed up $CFG → $CFG.bak.$STAMP"
+
+# In-place edit: replace only the host: line inside the server: block.
+# sed's address range `/^server:/,/^[a-z]/` keeps us from touching a
+# stray `host:` in some other section.
+sed -i.tmp -E '/^server:/,/^[^[:space:]]/{
+    s|^([[:space:]]+host:[[:space:]]*).*$|\1"'"$NEW_HOST"'"|
+}' "$CFG"
+rm -f "$CFG.tmp"
+
+echo "updated server.host: ${current_host:-<not-set>} → $NEW_HOST"
+
+# Restart the service so the new bind takes effect. `try-restart` is a
+# no-op if the unit isn't running (which is the desired behavior for a
+# freshly-provisioned box that hasn't started enforcer-mcp yet).
+if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files 2>/dev/null | grep -q '^enforcer-mcp\.service'; then
+    echo "restarting enforcer-mcp.service …"
+    systemctl restart enforcer-mcp.service
+    sleep 1
+    if systemctl is-active --quiet enforcer-mcp.service; then
+        echo "✓ enforcer-mcp running on ${NEW_HOST}:8765"
+    else
+        echo "! service failed to come up — check: journalctl -u enforcer-mcp -n 40" >&2
+        exit 3
+    fi
+fi

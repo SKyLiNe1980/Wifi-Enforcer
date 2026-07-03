@@ -4,12 +4,14 @@
 # (// status → REGENERATE generates it; COPY copies it to clipboard).
 # Until 1B.2 wires automatic sync, you paste it in manually.
 #
-# bind: 127.0.0.1 = loopback only (same device).
-# bind: 0.0.0.0   = exposed to all interfaces (Tailscale-ready). Combine
-# with strong bearer_token + Tailscale ACLs for the swarm phase.
+# bind: 127.0.0.1 = loopback only (same device — e.g. cockpit's own chroot).
+# bind: 0.0.0.0   = exposed to all interfaces including Tailscale. This is
+# what you want on a REMOTE swarm node so the cockpit's health probe over
+# tailnet can reach the /health endpoint. Combine with strong
+# bearer_token + Tailscale ACLs.
 
 server:
-  host: "127.0.0.1"
+  host: "0.0.0.0"
   port: 8765
   mcp_path: "/mcp"
   bearer_token_hex: "REPLACE_WITH_64_HEX_CHARS_FROM_COCKPIT_MCP_TAB"
