@@ -2015,86 +2015,88 @@ export default function MCPTab() {
       {/* NODES PANE */}
       {subTab === "nodes" && (
         <ScrollView contentContainerStyle={{ padding: 14, paddingBottom: 90 }}>
-          <View style={[s.row, { justifyContent: "space-between", marginBottom: 12 }]}>
-            <Text style={s.sectionTitle}>{"// swarm nodes"}</Text>
-            <View style={[s.row, { gap: 6 }]}>
-              <TouchableOpacity
-                style={[s.btn, { backgroundColor: C.panel2, borderColor: C.green }]}
-                onPress={handleOpenDeploy}
-                disabled={!HAS_NATIVE_ROOT}
-              >
-                <MaterialCommunityIcons name="rocket-launch-outline" size={14}
-                  color={HAS_NATIVE_ROOT ? C.green : C.textDim} />
-                <Text style={[s.btnText, { color: HAS_NATIVE_ROOT ? C.green : C.textDim }]}>
-                  DEPLOY NEW NODE
-                </Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={[s.btn, { backgroundColor: C.panel2, borderColor: C.mcpAccent }]}
-                onPress={() => setEditingNode({
-                  name: "", host: "", port: 8765, bearer_token: "",
-                  tags: [], description: "", enabled: true,
-                })}
-              >
-                <MaterialCommunityIcons name="plus" size={14} color={C.mcpAccent} />
-                <Text style={[s.btnText, { color: C.mcpAccent }]}>ADD NODE</Text>
-              </TouchableOpacity>
-              {/*
-                Install-locally + Push-to-cloud: use the APK-bundled .deb
-                as the source of truth. Solves the chicken-egg where the
-                cockpit's own chroot lagged behind the APK and where
-                seeding Upstash required SSH'ing to another box.
-              */}
-              <TouchableOpacity
-                style={[s.btn, { backgroundColor: C.panel2, borderColor: C.cyan }]}
-                disabled={!HAS_NATIVE_ROOT}
-                onPress={async () => {
-                  try {
-                    const out = await installBundledDebLocally();
-                    Alert.alert("Install OK", out.slice(-800) || "(no output)");
-                    refreshLists();
-                  } catch (e: any) {
-                    Alert.alert("Install failed", e?.message || String(e));
+          {/* Title gets its own row so the action bar can breathe and
+              wrap without stealing horizontal space from the header. */}
+          <Text style={[s.sectionTitle, { marginBottom: 10 }]}>{"// swarm nodes"}</Text>
+          <View style={[s.row, {
+            gap: 6, flexWrap: "wrap", marginBottom: 12,
+          }]}>
+            <TouchableOpacity
+              style={[s.btn, { backgroundColor: C.panel2, borderColor: C.green }]}
+              onPress={handleOpenDeploy}
+              disabled={!HAS_NATIVE_ROOT}
+            >
+              <MaterialCommunityIcons name="rocket-launch-outline" size={14}
+                color={HAS_NATIVE_ROOT ? C.green : C.textDim} />
+              <Text style={[s.btnText, { color: HAS_NATIVE_ROOT ? C.green : C.textDim }]}>
+                DEPLOY NEW NODE
+              </Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[s.btn, { backgroundColor: C.panel2, borderColor: C.mcpAccent }]}
+              onPress={() => setEditingNode({
+                name: "", host: "", port: 8765, bearer_token: "",
+                tags: [], description: "", enabled: true,
+              })}
+            >
+              <MaterialCommunityIcons name="plus" size={14} color={C.mcpAccent} />
+              <Text style={[s.btnText, { color: C.mcpAccent }]}>ADD NODE</Text>
+            </TouchableOpacity>
+            {/*
+              Install-locally + Push-to-cloud: use the APK-bundled .deb
+              as the source of truth. Solves the chicken-egg where the
+              cockpit's own chroot lagged behind the APK and where
+              seeding Upstash required SSH'ing to another box.
+            */}
+            <TouchableOpacity
+              style={[s.btn, { backgroundColor: C.panel2, borderColor: C.cyan }]}
+              disabled={!HAS_NATIVE_ROOT}
+              onPress={async () => {
+                try {
+                  const out = await installBundledDebLocally();
+                  Alert.alert("Install OK", out.slice(-800) || "(no output)");
+                  refreshLists();
+                } catch (e: any) {
+                  Alert.alert("Install failed", e?.message || String(e));
+                }
+              }}
+            >
+              <MaterialCommunityIcons name="download-outline" size={14}
+                color={HAS_NATIVE_ROOT ? C.cyan : C.textDim} />
+              <Text style={[s.btnText, { color: HAS_NATIVE_ROOT ? C.cyan : C.textDim }]}>
+                INSTALL .DEB LOCAL
+              </Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[s.btn, { backgroundColor: C.panel2, borderColor: C.mcpAccent }]}
+              disabled={!HAS_NATIVE_ROOT}
+              onPress={async () => {
+                try {
+                  // Reuse the SecureStore-backed Upstash creds already
+                  // saved via the Cloud Sync UI. If unset, the helper
+                  // throws with a clear message we surface as an Alert.
+                  const [url, tok] = await Promise.all([loadUpstashUrl(), loadUpstashToken()]);
+                  if (!url || !tok) {
+                    Alert.alert("Not configured",
+                      "Cloud Sync isn't set up yet. Paste your Upstash REST URL + token first.");
+                    return;
                   }
-                }}
-              >
-                <MaterialCommunityIcons name="download-outline" size={14}
-                  color={HAS_NATIVE_ROOT ? C.cyan : C.textDim} />
-                <Text style={[s.btnText, { color: HAS_NATIVE_ROOT ? C.cyan : C.textDim }]}>
-                  INSTALL BUNDLED .DEB LOCALLY
-                </Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={[s.btn, { backgroundColor: C.panel2, borderColor: C.mcpAccent }]}
-                disabled={!HAS_NATIVE_ROOT}
-                onPress={async () => {
-                  try {
-                    // Reuse the SecureStore-backed Upstash creds already
-                    // saved via the Cloud Sync UI. If unset, the helper
-                    // throws with a clear message we surface as an Alert.
-                    const [url, tok] = await Promise.all([loadUpstashUrl(), loadUpstashToken()]);
-                    if (!url || !tok) {
-                      Alert.alert("Not configured",
-                        "Cloud Sync isn't set up yet. Paste your Upstash REST URL + token first.");
-                      return;
-                    }
-                    const out = await pushBundledDebToCloud({
-                      restUrl: url, restToken: tok,
-                      changelog: "pushed from cockpit bundled asset",
-                    });
-                    Alert.alert("Pushed to cloud", out.slice(-800) || "(no output)");
-                  } catch (e: any) {
-                    Alert.alert("Push failed", e?.message || String(e));
-                  }
-                }}
-              >
-                <MaterialCommunityIcons name="cloud-upload-outline" size={14}
-                  color={HAS_NATIVE_ROOT ? C.mcpAccent : C.textDim} />
-                <Text style={[s.btnText, { color: HAS_NATIVE_ROOT ? C.mcpAccent : C.textDim }]}>
-                  PUSH BUNDLED .DEB TO CLOUD
-                </Text>
-              </TouchableOpacity>
-            </View>
+                  const out = await pushBundledDebToCloud({
+                    restUrl: url, restToken: tok,
+                    changelog: "pushed from cockpit bundled asset",
+                  });
+                  Alert.alert("Pushed to cloud", out.slice(-800) || "(no output)");
+                } catch (e: any) {
+                  Alert.alert("Push failed", e?.message || String(e));
+                }
+              }}
+            >
+              <MaterialCommunityIcons name="cloud-upload-outline" size={14}
+                color={HAS_NATIVE_ROOT ? C.mcpAccent : C.textDim} />
+              <Text style={[s.btnText, { color: HAS_NATIVE_ROOT ? C.mcpAccent : C.textDim }]}>
+                PUSH .DEB TO CLOUD
+              </Text>
+            </TouchableOpacity>
           </View>
 
           {nodes.length === 0 ? (
