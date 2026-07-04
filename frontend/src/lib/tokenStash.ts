@@ -277,34 +277,29 @@ export type DiscoverResult = {
  */
 export async function discoverEnforcerPeers(
   execReal: (cmd: string) => Promise<{ output: string; exit_code: number }>,
+  wrapChrootCmd: (innerCmd: string) => Promise<string>,
   pattern: RegExp = /enforcer-node/i,
 ): Promise<DiscoverResult> {
-  // Probe matrix — ordered by "most likely to work in NetHunter chroot"
-  // first, most-portable last. Every command redirects stderr to stdout
-  // so we can differentiate "binary not found" from "socket refused"
-  // without a second exec roundtrip.
+  // The cockpit's own Magisk root shell CANNOT see the kalifs mount
+  // namespace — there's no `tailscale` binary on the Android side (only
+  // the Tailscale UI apk which has no CLI). Every probe must go through
+  // wrapChrootCmd() → busybox_nh chroot /data/local/nhsystem/kalifs …
+  //
+  // Socket flag is still worthwhile: userspace-networking mode uses
+  // /var/run/tailscale/tailscaled-chroot.sock (the alias in .zshrc).
+  // We try WITH the explicit flag first (matches operator's alias),
+  // then let tailscale-cli's default socket handling kick in.
   const socket = "/var/run/tailscale/tailscaled-chroot.sock";
-  const probes: string[] = [
-    // 1) explicit absolute path + chroot socket. Preferred: no PATH lookup.
-    `/usr/bin/tailscale --socket=${socket} status --json 2>&1`,
-    // 2) same but /usr/local/bin (some kali installs).
-    `/usr/local/bin/tailscale --socket=${socket} status --json 2>&1`,
-    // 3) PATH-based lookup with chroot socket.
+  const innerProbes: string[] = [
     `tailscale --socket=${socket} status --json 2>&1`,
-    // 4) login zsh — sources .zshrc so the operator's alias kicks in.
-    //    We can't just `.` the file because interactive vs login mode
-    //    differences; `-lc` is the deterministic way.
-    `zsh -lc 'tailscale status --json' 2>&1`,
-    // 5) same for bash-flavoured environments.
-    `bash -lc 'tailscale status --json' 2>&1`,
-    // 6) default socket (VPS / kernel-mode installs).
     `tailscale status --json 2>&1`,
   ];
 
   const tried: DiscoverResult["tried"] = [];
   let parsed: any = null;
   let usedCmd: string | undefined;
-  for (const cmd of probes) {
+  for (const inner of innerProbes) {
+    const cmd = await wrapChrootCmd(inner);
     let exit = -1;
     let note = "";
     try {
@@ -314,11 +309,9 @@ export async function discoverEnforcerPeers(
       if (!out.trim()) {
         note = "empty output";
       } else if (/not found|no such|command not found/i.test(out)) {
-        note = "binary not found";
+        note = "binary not found in chroot";
       } else if (/dial|connection refused|no such file/i.test(out) && !/"/.test(out)) {
-        // Only tag socket-refused if it doesn't look like JSON (which
-        // could legitimately contain those substrings in error fields).
-        note = "socket unreachable";
+        note = "socket unreachable inside chroot";
       } else {
         try {
           const j = JSON.parse(out);
@@ -326,18 +319,18 @@ export async function discoverEnforcerPeers(
             parsed = j;
             usedCmd = cmd;
             note = "ok";
-            tried.push({ cmd, exit, note });
+            tried.push({ cmd: inner, exit, note });
             break;
           }
           note = "json missing Self";
-        } catch (e: any) {
-          note = "unparseable: " + (out.slice(0, 60).replace(/\s+/g, " "));
+        } catch {
+          note = "unparseable: " + out.slice(0, 60).replace(/\s+/g, " ");
         }
       }
     } catch (e: any) {
       note = "exec threw: " + (e?.message || String(e)).slice(0, 60);
     }
-    tried.push({ cmd, exit, note });
+    tried.push({ cmd: inner, exit, note });
   }
 
   if (!parsed) return { peers: [], tried };

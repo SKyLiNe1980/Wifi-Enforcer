@@ -972,16 +972,20 @@ export default function MCPTab() {
       //   • roster gives us names, tags, descriptions, is_primary flags
       // If tailnet returns nothing (chroot socket down, offline), we
       // fall back to roster-only restore (best-effort with roster IPs).
-      const [peers, roster, rec] = await Promise.all([
-        discoverEnforcerPeers(execReal),
+      const [discovered, roster, rec] = await Promise.all([
+        discoverEnforcerPeers(execReal, wrapChrootCmd),
         fetchRoster(url, tok),
         fetchCurrentBearer(url, tok),
       ]);
+      const peers = discovered.peers;
 
       if (peers.length === 0 && roster.length === 0) {
+        // Surface the first failed probe's diagnostic — huge time-saver
+        // vs opening logcat. Ex: "socket unreachable inside chroot".
+        const diag = discovered.tried[0]?.note || "unknown";
         throw new Error(
-          "nothing to restore. tailnet returned 0 enforcer-node peers AND redis roster is empty. " +
-          "either name your peers <host>-enforcer-node, or add one node manually first so the roster gets populated.",
+          `nothing to restore. tailnet=0 peers (${diag}) AND redis roster is empty. ` +
+          `either fix chroot tailscale visibility, or add one node manually first.`,
         );
       }
       if (!rec?.token) {
@@ -1054,7 +1058,7 @@ export default function MCPTab() {
     } catch (e: any) {
       setCloudSyncStatus(`err: ${e?.message || e}`);
     } finally { setCloudSyncBusy(false); }
-  }, [cloudSyncUrl, cloudSyncToken, refreshLists]);
+  }, [cloudSyncUrl, cloudSyncToken, refreshLists, wrapChrootCmd]);
 
   /**
    * Force a full snapshot to Upstash right now. Same as handleSaveCloudSync's
