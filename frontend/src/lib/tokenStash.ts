@@ -245,6 +245,18 @@ export type DiscoveredPeer = {
 };
 
 /**
+ * Diagnostic result of a peer discovery attempt. Even when we return
+ * zero peers, callers can inspect `.tried` to figure out WHY — was the
+ * binary missing, was every socket unreachable, did we get JSON that
+ * lacked a Self block, etc. Stops us re-guessing the tailnet forever.
+ */
+export type DiscoverResult = {
+  peers: DiscoveredPeer[];
+  tried: Array<{ cmd: string; exit: number; note: string }>;
+  usedCmd?: string;                // the probe that finally worked
+};
+
+/**
  * Enumerate tailnet peers that match the enforcer naming convention.
  *
  * Default pattern is `/enforcer-node/i` — matches the user's actual naming
@@ -253,80 +265,107 @@ export type DiscoveredPeer = {
  *
  * SELF EXCLUSION: even if the cockpit's hostname accidentally matches the
  * pattern, we skip Self so the cockpit never adds itself to its own
- * roster. `tailscale status --json` returns a `Self` block with the
- * device's own DNSName/HostName which we read once.
+ * roster.
  *
- * SOCKET DISCOVERY: on NetHunter userspace-networking mode the default
- * `/var/run/tailscale/tailscaled.sock` is unreachable — we mirror the
- * probe chain used by `tailnetDetect.ts` and try the chroot socket path
- * first. Falls through to the default socket for VPS / kernel-mode
- * installs. Silent on every failure so callers get an empty list
- * instead of a thrown exception.
- *
- * `execReal` is imported by caller (deployServer.ts already imports it
- * from rootShell); we accept it as a param so this module stays pure
- * TypeScript with no root-shell coupling — makes it unit-testable.
+ * SOCKET / PATH DISCOVERY: NetHunter chroot commonly has the tailscale
+ * binary at `/usr/bin/tailscale` but the daemon socket in `.zshrc`
+ * alias form (`--socket=/var/run/tailscale/tailscaled-chroot.sock`).
+ * Root shells (exec) don't source `.zshrc` so the alias is invisible.
+ * We compensate with an explicit probe matrix: absolute paths × socket
+ * flags × login-shell fallback. First combination that returns valid
+ * JSON with a Self block wins.
  */
 export async function discoverEnforcerPeers(
   execReal: (cmd: string) => Promise<{ output: string; exit_code: number }>,
   pattern: RegExp = /enforcer-node/i,
-): Promise<DiscoveredPeer[]> {
-  // Probe chain: chroot socket → default socket. First one that returns
-  // valid JSON with a Peer object wins.
-  const probes = [
-    `tailscale --socket=/var/run/tailscale/tailscaled-chroot.sock status --json 2>/dev/null`,
-    `tailscale status --json 2>/dev/null`,
+): Promise<DiscoverResult> {
+  // Probe matrix — ordered by "most likely to work in NetHunter chroot"
+  // first, most-portable last. Every command redirects stderr to stdout
+  // so we can differentiate "binary not found" from "socket refused"
+  // without a second exec roundtrip.
+  const socket = "/var/run/tailscale/tailscaled-chroot.sock";
+  const probes: string[] = [
+    // 1) explicit absolute path + chroot socket. Preferred: no PATH lookup.
+    `/usr/bin/tailscale --socket=${socket} status --json 2>&1`,
+    // 2) same but /usr/local/bin (some kali installs).
+    `/usr/local/bin/tailscale --socket=${socket} status --json 2>&1`,
+    // 3) PATH-based lookup with chroot socket.
+    `tailscale --socket=${socket} status --json 2>&1`,
+    // 4) login zsh — sources .zshrc so the operator's alias kicks in.
+    //    We can't just `.` the file because interactive vs login mode
+    //    differences; `-lc` is the deterministic way.
+    `zsh -lc 'tailscale status --json' 2>&1`,
+    // 5) same for bash-flavoured environments.
+    `bash -lc 'tailscale status --json' 2>&1`,
+    // 6) default socket (VPS / kernel-mode installs).
+    `tailscale status --json 2>&1`,
   ];
+
+  const tried: DiscoverResult["tried"] = [];
   let parsed: any = null;
+  let usedCmd: string | undefined;
   for (const cmd of probes) {
+    let exit = -1;
+    let note = "";
     try {
       const res = await execReal(cmd);
-      if (!res.output) continue;
-      try {
-        const j = JSON.parse(res.output);
-        // A valid tailscale-status JSON always has a Self key. Reject anything else.
-        if (j && typeof j === "object" && j.Self) { parsed = j; break; }
-      } catch { /* try next probe */ }
-    } catch { /* try next probe */ }
+      exit = res.exit_code;
+      const out = res.output || "";
+      if (!out.trim()) {
+        note = "empty output";
+      } else if (/not found|no such|command not found/i.test(out)) {
+        note = "binary not found";
+      } else if (/dial|connection refused|no such file/i.test(out) && !/"/.test(out)) {
+        // Only tag socket-refused if it doesn't look like JSON (which
+        // could legitimately contain those substrings in error fields).
+        note = "socket unreachable";
+      } else {
+        try {
+          const j = JSON.parse(out);
+          if (j && typeof j === "object" && j.Self) {
+            parsed = j;
+            usedCmd = cmd;
+            note = "ok";
+            tried.push({ cmd, exit, note });
+            break;
+          }
+          note = "json missing Self";
+        } catch (e: any) {
+          note = "unparseable: " + (out.slice(0, 60).replace(/\s+/g, " "));
+        }
+      }
+    } catch (e: any) {
+      note = "exec threw: " + (e?.message || String(e)).slice(0, 60);
+    }
+    tried.push({ cmd, exit, note });
   }
-  if (!parsed) return [];
 
-  // Grab self's hostname/DNS so we can drop it from the peer list even
-  // if the operator named the cockpit against the convention. Also
-  // useful when tailscaled reports Self INSIDE the Peer map on some
-  // versions — belt-and-suspenders.
+  if (!parsed) return { peers: [], tried };
+
   const selfHost = (parsed?.Self?.HostName || "").toLowerCase();
   const selfDns = (parsed?.Self?.DNSName || "").toLowerCase().replace(/\.$/, "");
-
-  const peers = parsed?.Peer;
-  if (!peers || typeof peers !== "object") return [];
+  const peerMap = parsed?.Peer;
+  if (!peerMap || typeof peerMap !== "object") {
+    return { peers: [], tried, usedCmd };
+  }
 
   const out: DiscoveredPeer[] = [];
-  for (const p of Object.values<any>(peers)) {
+  for (const p of Object.values<any>(peerMap)) {
     const hostname = p?.HostName || "";
     const dnsName = (p?.DNSName || "").replace(/\.$/, "");
     if (!hostname && !dnsName) continue;
-
-    // Explicit self-skip. Even if a bug leaks Self into Peer map, or
-    // the operator has two devices with identical hostnames, we still
-    // won't add the cockpit's own IP as a "node".
     if (hostname.toLowerCase() === selfHost) continue;
     if (dnsName.toLowerCase() === selfDns) continue;
-
-    // Convention match: hostname OR DNS name must contain the pattern.
     if (!pattern.test(hostname) && !pattern.test(dnsName)) continue;
-
     const tailIp = (p?.TailscaleIPs || []).find((ip: string) => /^\d+\.\d+\.\d+\.\d+$/.test(ip));
     if (!tailIp) continue;
-
-    out.push({
-      hostname,
-      dnsName,
-      tailIp,
-      online: !!p?.Online,
-    });
+    out.push({ hostname, dnsName, tailIp, online: !!p?.Online });
   }
-  return out.sort((a, b) => a.hostname.localeCompare(b.hostname));
+  return {
+    peers: out.sort((a, b) => a.hostname.localeCompare(b.hostname)),
+    tried,
+    usedCmd,
+  };
 }
 
 // ─── Node roster snapshot (Redis) ──────────────────────────────────────
