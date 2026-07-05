@@ -42,6 +42,7 @@ import {
   pushRoster, fetchRoster,
   type RosterEntry,
 } from "../lib/tokenStash";
+import NodesMap from "./NodesMap";
 
 // Keep palette identical to the rest of the cockpit so the tab feels native.
 const C = {
@@ -85,6 +86,9 @@ export default function MCPTab() {
   const [nodeHealth, setNodeHealth] = useState<Record<string, string>>({});
   const [nodeToolCount, setNodeToolCount] = useState<Record<string, number>>({});
   const [editingNode, setEditingNode] = useState<Partial<MCPNode> | null>(null);
+  // Node-map tap sheets (// status pane radial map)
+  const [mapSheetNode, setMapSheetNode] = useState<MCPNode | null>(null);
+  const [showLocalSheet, setShowLocalSheet] = useState(false);
   const [busy, setBusy] = useState(false);
   const [tokenVisible, setTokenVisible] = useState(false);
 
@@ -972,16 +976,20 @@ export default function MCPTab() {
       //   • roster gives us names, tags, descriptions, is_primary flags
       // If tailnet returns nothing (chroot socket down, offline), we
       // fall back to roster-only restore (best-effort with roster IPs).
-      const [peers, roster, rec] = await Promise.all([
-        discoverEnforcerPeers(execReal),
+      const [discovered, roster, rec] = await Promise.all([
+        discoverEnforcerPeers(execReal, wrapChrootCmd),
         fetchRoster(url, tok),
         fetchCurrentBearer(url, tok),
       ]);
+      const peers = discovered.peers;
 
       if (peers.length === 0 && roster.length === 0) {
+        // Surface the first failed probe's diagnostic — huge time-saver
+        // vs opening logcat. Ex: "socket unreachable inside chroot".
+        const diag = discovered.tried[0]?.note || "unknown";
         throw new Error(
-          "nothing to restore. tailnet returned 0 enforcer-node peers AND redis roster is empty. " +
-          "either name your peers <host>-enforcer-node, or add one node manually first so the roster gets populated.",
+          `nothing to restore. tailnet=0 peers (${diag}) AND redis roster is empty. ` +
+          `either fix chroot tailscale visibility, or add one node manually first.`,
         );
       }
       if (!rec?.token) {
@@ -1054,7 +1062,7 @@ export default function MCPTab() {
     } catch (e: any) {
       setCloudSyncStatus(`err: ${e?.message || e}`);
     } finally { setCloudSyncBusy(false); }
-  }, [cloudSyncUrl, cloudSyncToken, refreshLists]);
+  }, [cloudSyncUrl, cloudSyncToken, refreshLists, wrapChrootCmd]);
 
   /**
    * Force a full snapshot to Upstash right now. Same as handleSaveCloudSync's
@@ -1476,6 +1484,17 @@ export default function MCPTab() {
               />
             </View>
           </View>
+
+          <Text style={[s.sectionTitle, { marginTop: 20 }]}>{"// nodes map"}</Text>
+          <NodesMap
+            localHealth={serverHealth}
+            localEnabled={config.server_enabled}
+            localLabel={config.bind_host}
+            nodes={nodes}
+            nodeHealth={nodeHealth}
+            onPressLocal={() => setShowLocalSheet(true)}
+            onPressNode={(n) => setMapSheetNode(n)}
+          />
 
           <Text style={[s.sectionTitle, { marginTop: 20 }]}>{"// network"}</Text>
           <View style={s.card}>
@@ -2015,86 +2034,88 @@ export default function MCPTab() {
       {/* NODES PANE */}
       {subTab === "nodes" && (
         <ScrollView contentContainerStyle={{ padding: 14, paddingBottom: 90 }}>
-          <View style={[s.row, { justifyContent: "space-between", marginBottom: 12 }]}>
-            <Text style={s.sectionTitle}>{"// swarm nodes"}</Text>
-            <View style={[s.row, { gap: 6 }]}>
-              <TouchableOpacity
-                style={[s.btn, { backgroundColor: C.panel2, borderColor: C.green }]}
-                onPress={handleOpenDeploy}
-                disabled={!HAS_NATIVE_ROOT}
-              >
-                <MaterialCommunityIcons name="rocket-launch-outline" size={14}
-                  color={HAS_NATIVE_ROOT ? C.green : C.textDim} />
-                <Text style={[s.btnText, { color: HAS_NATIVE_ROOT ? C.green : C.textDim }]}>
-                  DEPLOY NEW NODE
-                </Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={[s.btn, { backgroundColor: C.panel2, borderColor: C.mcpAccent }]}
-                onPress={() => setEditingNode({
-                  name: "", host: "", port: 8765, bearer_token: "",
-                  tags: [], description: "", enabled: true,
-                })}
-              >
-                <MaterialCommunityIcons name="plus" size={14} color={C.mcpAccent} />
-                <Text style={[s.btnText, { color: C.mcpAccent }]}>ADD NODE</Text>
-              </TouchableOpacity>
-              {/*
-                Install-locally + Push-to-cloud: use the APK-bundled .deb
-                as the source of truth. Solves the chicken-egg where the
-                cockpit's own chroot lagged behind the APK and where
-                seeding Upstash required SSH'ing to another box.
-              */}
-              <TouchableOpacity
-                style={[s.btn, { backgroundColor: C.panel2, borderColor: C.cyan }]}
-                disabled={!HAS_NATIVE_ROOT}
-                onPress={async () => {
-                  try {
-                    const out = await installBundledDebLocally();
-                    Alert.alert("Install OK", out.slice(-800) || "(no output)");
-                    refreshLists();
-                  } catch (e: any) {
-                    Alert.alert("Install failed", e?.message || String(e));
+          {/* Title gets its own row so the action bar can breathe and
+              wrap without stealing horizontal space from the header. */}
+          <Text style={[s.sectionTitle, { marginBottom: 10 }]}>{"// swarm nodes"}</Text>
+          <View style={[s.row, {
+            gap: 6, flexWrap: "wrap", marginBottom: 12,
+          }]}>
+            <TouchableOpacity
+              style={[s.btn, { flexGrow: 1, flexBasis: "47%", backgroundColor: C.panel2, borderColor: C.green }]}
+              onPress={handleOpenDeploy}
+              disabled={!HAS_NATIVE_ROOT}
+            >
+              <MaterialCommunityIcons name="rocket-launch-outline" size={14}
+                color={HAS_NATIVE_ROOT ? C.green : C.textDim} />
+              <Text style={[s.btnText, { color: HAS_NATIVE_ROOT ? C.green : C.textDim }]}>
+                DEPLOY NEW NODE
+              </Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[s.btn, { flexGrow: 1, flexBasis: "47%", backgroundColor: C.panel2, borderColor: C.mcpAccent }]}
+              onPress={() => setEditingNode({
+                name: "", host: "", port: 8765, bearer_token: "",
+                tags: [], description: "", enabled: true,
+              })}
+            >
+              <MaterialCommunityIcons name="plus" size={14} color={C.mcpAccent} />
+              <Text style={[s.btnText, { color: C.mcpAccent }]}>ADD NODE</Text>
+            </TouchableOpacity>
+            {/*
+              Install-locally + Push-to-cloud: use the APK-bundled .deb
+              as the source of truth. Solves the chicken-egg where the
+              cockpit's own chroot lagged behind the APK and where
+              seeding Upstash required SSH'ing to another box.
+            */}
+            <TouchableOpacity
+              style={[s.btn, { flexGrow: 1, flexBasis: "47%", backgroundColor: C.panel2, borderColor: C.cyan }]}
+              disabled={!HAS_NATIVE_ROOT}
+              onPress={async () => {
+                try {
+                  const out = await installBundledDebLocally();
+                  Alert.alert("Install OK", out.slice(-800) || "(no output)");
+                  refreshLists();
+                } catch (e: any) {
+                  Alert.alert("Install failed", e?.message || String(e));
+                }
+              }}
+            >
+              <MaterialCommunityIcons name="download-outline" size={14}
+                color={HAS_NATIVE_ROOT ? C.cyan : C.textDim} />
+              <Text style={[s.btnText, { color: HAS_NATIVE_ROOT ? C.cyan : C.textDim }]}>
+                INSTALL .DEB LOCAL
+              </Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[s.btn, { flexGrow: 1, flexBasis: "47%", backgroundColor: C.panel2, borderColor: C.mcpAccent }]}
+              disabled={!HAS_NATIVE_ROOT}
+              onPress={async () => {
+                try {
+                  // Reuse the SecureStore-backed Upstash creds already
+                  // saved via the Cloud Sync UI. If unset, the helper
+                  // throws with a clear message we surface as an Alert.
+                  const [url, tok] = await Promise.all([loadUpstashUrl(), loadUpstashToken()]);
+                  if (!url || !tok) {
+                    Alert.alert("Not configured",
+                      "Cloud Sync isn't set up yet. Paste your Upstash REST URL + token first.");
+                    return;
                   }
-                }}
-              >
-                <MaterialCommunityIcons name="download-outline" size={14}
-                  color={HAS_NATIVE_ROOT ? C.cyan : C.textDim} />
-                <Text style={[s.btnText, { color: HAS_NATIVE_ROOT ? C.cyan : C.textDim }]}>
-                  INSTALL BUNDLED .DEB LOCALLY
-                </Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={[s.btn, { backgroundColor: C.panel2, borderColor: C.mcpAccent }]}
-                disabled={!HAS_NATIVE_ROOT}
-                onPress={async () => {
-                  try {
-                    // Reuse the SecureStore-backed Upstash creds already
-                    // saved via the Cloud Sync UI. If unset, the helper
-                    // throws with a clear message we surface as an Alert.
-                    const [url, tok] = await Promise.all([loadUpstashUrl(), loadUpstashToken()]);
-                    if (!url || !tok) {
-                      Alert.alert("Not configured",
-                        "Cloud Sync isn't set up yet. Paste your Upstash REST URL + token first.");
-                      return;
-                    }
-                    const out = await pushBundledDebToCloud({
-                      restUrl: url, restToken: tok,
-                      changelog: "pushed from cockpit bundled asset",
-                    });
-                    Alert.alert("Pushed to cloud", out.slice(-800) || "(no output)");
-                  } catch (e: any) {
-                    Alert.alert("Push failed", e?.message || String(e));
-                  }
-                }}
-              >
-                <MaterialCommunityIcons name="cloud-upload-outline" size={14}
-                  color={HAS_NATIVE_ROOT ? C.mcpAccent : C.textDim} />
-                <Text style={[s.btnText, { color: HAS_NATIVE_ROOT ? C.mcpAccent : C.textDim }]}>
-                  PUSH BUNDLED .DEB TO CLOUD
-                </Text>
-              </TouchableOpacity>
-            </View>
+                  const out = await pushBundledDebToCloud({
+                    restUrl: url, restToken: tok,
+                    changelog: "pushed from cockpit bundled asset",
+                  });
+                  Alert.alert("Pushed to cloud", out.slice(-800) || "(no output)");
+                } catch (e: any) {
+                  Alert.alert("Push failed", e?.message || String(e));
+                }
+              }}
+            >
+              <MaterialCommunityIcons name="cloud-upload-outline" size={14}
+                color={HAS_NATIVE_ROOT ? C.mcpAccent : C.textDim} />
+              <Text style={[s.btnText, { color: HAS_NATIVE_ROOT ? C.mcpAccent : C.textDim }]}>
+                PUSH .DEB TO CLOUD
+              </Text>
+            </TouchableOpacity>
           </View>
 
           {nodes.length === 0 ? (
@@ -2128,11 +2149,14 @@ export default function MCPTab() {
                         width: 8, height: 8, borderRadius: 4,
                         backgroundColor: dotColor, marginRight: 8,
                       }} />
-                      <Text style={[s.toolName, { color: n.enabled ? C.mcpAccent : C.textDim }]}>
+                      <Text
+                        numberOfLines={1}
+                        style={[s.toolName, { flexShrink: 1, color: n.enabled ? C.mcpAccent : C.textDim }]}
+                      >
                         {n.name}
                       </Text>
                       {n.is_primary && (
-                        <View style={[s.tag, { borderColor: C.yellow, marginLeft: 6 }]}>
+                        <View style={[s.tag, { borderColor: C.yellow, marginLeft: 6, flexShrink: 0 }]}>
                           <Text style={[s.tagText, { color: C.yellow }]}>PRIMARY</Text>
                         </View>
                       )}
@@ -2390,6 +2414,136 @@ export default function MCPTab() {
       )}
 
       {/* NODE EDIT MODAL */}
+      {/* NODE-MAP: local hub sheet ─────────────────────────────────── */}
+      {showLocalSheet && (
+        <View style={s.overlay} pointerEvents="auto">
+          <View style={s.sheet}>
+            <View style={s.sheetHeader}>
+              <Text style={s.sheetTitle}>{"// local mcp"}</Text>
+              <TouchableOpacity onPress={() => setShowLocalSheet(false)}>
+                <MaterialCommunityIcons name="close" size={22} color={C.green} />
+              </TouchableOpacity>
+            </View>
+            <Text style={s.helperFine}>
+              this cockpit&apos;s chroot MCP server (the swarm hub).
+            </Text>
+            <Text style={[s.helperFine, { marginTop: 8 }]}>
+              endpoint:{" "}
+              <Text style={{ color: C.cyan }}>http://{config.bind_host}:{config.port}/mcp</Text>
+            </Text>
+            <Text style={[s.helperFine, { marginTop: 4 }]}>
+              health:{" "}
+              <Text style={{ color: statusInfo.color }}>{statusInfo.label}</Text>
+            </Text>
+            <View style={[s.row, { marginTop: 12, justifyContent: "space-between" }]}>
+              <Text style={s.kvLabel}>enable server</Text>
+              <Switch
+                value={config.server_enabled}
+                onValueChange={handleToggleServer}
+                trackColor={{ false: C.border, true: C.greenDim }}
+                thumbColor={config.server_enabled ? C.green : C.textDim}
+                disabled={busy}
+              />
+            </View>
+            <Text style={[s.helperFine, { marginTop: 10, color: C.textDim }]}>
+              bind host / probe host / port are editable below in{" "}
+              <Text style={{ color: C.green }}>{"// network"}</Text>.
+            </Text>
+          </View>
+        </View>
+      )}
+
+      {/* NODE-MAP: remote node sheet ────────────────────────────────── */}
+      {mapSheetNode && (() => {
+        const n = mapSheetNode;
+        const health = nodeHealth[n.id] || n.last_health_status || "unknown";
+        const toolCount = nodeToolCount[n.id] ?? n.last_tool_count;
+        const dotColor =
+          health === "running" ? C.green :
+          health === "probing" ? C.yellow :
+          health === "unreachable" ? C.textDim : C.red;
+        return (
+          <View style={s.overlay} pointerEvents="auto">
+            <View style={s.sheet}>
+              <View style={s.sheetHeader}>
+                <Text style={s.sheetTitle} numberOfLines={1}>{`// ${n.name}`}</Text>
+                <TouchableOpacity onPress={() => setMapSheetNode(null)}>
+                  <MaterialCommunityIcons name="close" size={22} color={C.green} />
+                </TouchableOpacity>
+              </View>
+              <Text style={s.helperFine}>
+                <Text style={{ color: C.cyan }}>http://{n.host}:{n.port}</Text>
+                {"  ·  "}<Text style={{ color: dotColor }}>{health.toUpperCase()}</Text>
+                {toolCount !== null && toolCount !== undefined ? (
+                  <Text style={{ color: C.textDim }}>{`  ·  ${toolCount} tools`}</Text>
+                ) : null}
+                {n.is_primary ? <Text style={{ color: C.yellow }}>{"  ·  PRIMARY"}</Text> : null}
+              </Text>
+              {n.description ? (
+                <Text style={[s.helperFine, { marginTop: 6, color: C.textDim }]}>{n.description}</Text>
+              ) : null}
+
+              <View style={[s.row, { marginTop: 12, justifyContent: "space-between" }]}>
+                <Text style={s.kvLabel}>enabled</Text>
+                <Switch
+                  value={n.enabled}
+                  onValueChange={async (v) => {
+                    await nodesLocal.update(n.id, { enabled: v });
+                    setMapSheetNode({ ...n, enabled: v });
+                    refreshLists();
+                  }}
+                  trackColor={{ false: C.border, true: C.greenDim }}
+                  thumbColor={n.enabled ? C.green : C.textDim}
+                />
+              </View>
+
+              <View style={[s.row, { marginTop: 14, gap: 6, flexWrap: "wrap" }]}>
+                <TouchableOpacity
+                  style={[s.smallBtn, { borderColor: health === "probing" ? C.yellow : C.green }]}
+                  onPress={() => probeNode(n)}
+                  disabled={!n.enabled || health === "probing"}
+                >
+                  <Text style={[s.smallBtnText, {
+                    color: !n.enabled ? C.textDim : health === "probing" ? C.yellow : C.green,
+                  }]}>
+                    {health === "probing" ? "PROBING…" : "RETRY PROBE"}
+                  </Text>
+                </TouchableOpacity>
+                {!n.is_primary && (
+                  <TouchableOpacity
+                    style={[s.smallBtn, { borderColor: C.yellow }]}
+                    onPress={() => { handleSetPrimaryNode(n); setMapSheetNode(null); }}
+                  >
+                    <Text style={[s.smallBtnText, { color: C.yellow }]}>SET PRIMARY</Text>
+                  </TouchableOpacity>
+                )}
+                <TouchableOpacity
+                  style={[s.smallBtn, { borderColor: C.cyan }]}
+                  onPress={() => handleResyncNodeTools(n)}
+                  disabled={!n.bearer_token || health !== "running"}
+                >
+                  <Text style={[s.smallBtnText, {
+                    color: (!n.bearer_token || health !== "running") ? C.textDim : C.cyan,
+                  }]}>SYNC TOOLS</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[s.smallBtn, { borderColor: C.mcpAccent }]}
+                  onPress={() => { setMapSheetNode(null); setEditingNode({ ...n }); }}
+                >
+                  <Text style={[s.smallBtnText, { color: C.mcpAccent }]}>EDIT</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[s.smallBtn, { borderColor: C.red }]}
+                  onPress={() => { setMapSheetNode(null); handleDeleteNode(n); }}
+                >
+                  <Text style={[s.smallBtnText, { color: C.red }]}>DELETE</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+          </View>
+        );
+      })()}
+
       {editingNode && (
         <View style={s.overlay} pointerEvents="auto">
           <View style={s.sheet}>
