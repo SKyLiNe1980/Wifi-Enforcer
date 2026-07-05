@@ -75,6 +75,18 @@ function collapseBlankRuns(lines: string[]): string[] {
 }
 
 /**
+ * Strip ANSI/VT escape sequences (SGR colors, cursor moves, OSC titles,
+ * bracketed-paste, charset selects, and lone control bytes) so the flat
+ * scrollback fallback shows clean readable text instead of raw `[0m[01;34m`
+ * noise. Only used by the fallback view — the real xterm path keeps the
+ * raw bytes so it can render true color/TUI.
+ */
+const ANSI_RE = /\x1b\[[0-9;?]*[ -\/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][A-Za-z0-9]|\x1b[=>]|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g;
+function stripAnsi(s: string): string {
+  return s.replace(ANSI_RE, "");
+}
+
+/**
  * Inline HTML loaded into the WebView. Kept as a `const` (not a template
  * with interpolated values) so the bundler doesn't have to re-encode it on
  * every render — every re-render with the same `source.html` is treated
@@ -130,11 +142,26 @@ ${xtermBundle.cssContent}
     } catch (e) {}
   }
 
+  // ── DIAGNOSTIC ──────────────────────────────────────────────────────
+  // Report that the inline bootstrap actually executed, plus whether the
+  // sibling xterm/fit scripts defined their globals. This tells RN exactly
+  // where the boot fails: no probe at all → inline scripts don't run;
+  // probe with term=false → the file:// <script src> didn't load.
+  window.onerror = function (m, src, line, col, err) {
+    post({ type: "diag", stage: "window.onerror", detail: String(m) + " @" + line + ":" + col });
+    return false;
+  };
+  post({
+    type: "diag",
+    stage: "bootstrap-ran",
+    detail: "Terminal=" + (typeof Terminal) + " FitAddon=" + (typeof FitAddon),
+  });
+
   // Guard against the vendored payload failing to eval for any reason.
   if (typeof Terminal === "undefined") {
     document.getElementById("boot").innerText =
-      "// xterm bundle failed to init. Tap session info to switch to scrollback mode.";
-    post({ type: "load_error", message: "Terminal global missing after bootstrap" });
+      "// xterm scripts didn't load (Terminal undefined). Falling back to scrollback.";
+    post({ type: "load_error", message: "Terminal global missing (file:// script did not load)" });
     return;
   }
 
@@ -374,6 +401,8 @@ export default function XTermView({ sessionId, onInput, resetToken }: Props) {
   const [fbLines, setFbLines] = useState<string>("");
   const [fbInput, setFbInput] = useState<string>("");
   const fbScrollRef = useRef<ScrollView>(null);
+  // Diagnostic line surfaced from the WebView (why xterm did/didn't boot).
+  const [diag, setDiag] = useState<string>("");
   // Buffer writes that arrive before the WebView has finished loading
   // xterm.js — flushed once we get the `ready` message.
   const pendingRef = useRef<string[]>([]);
@@ -413,7 +442,7 @@ export default function XTermView({ sessionId, onInput, resetToken }: Props) {
     // screen. Cleared the moment `ready` arrives (see onMessage).
     const t = setTimeout(() => {
       if (alive && !readyRef.current) setFallback(true);
-    }, 6000);
+    }, 9000);
     return () => { alive = false; clearTimeout(t); };
   }, []);
 
@@ -468,6 +497,7 @@ export default function XTermView({ sessionId, onInput, resetToken }: Props) {
     if (!msg || typeof msg !== "object") return;
     if (msg.type === "ready") {
       readyRef.current = true;
+      setDiag(`xterm ready · ${msg.cols}x${msg.rows}`);
       // Flush anything that arrived before the WebView booted xterm.
       if (pendingRef.current.length && webRef.current) {
         const buf = pendingRef.current.join("");
@@ -479,9 +509,10 @@ export default function XTermView({ sessionId, onInput, resetToken }: Props) {
       // Raw keystroke (already a properly-encoded escape sequence for
       // arrows / function keys / ctrl-chars).
       onInput(msg.data);
+    } else if (msg.type === "diag") {
+      setDiag(`${msg.stage}: ${msg.detail || ""}`);
     } else if (msg.type === "load_error") {
-      // CDN failed — leave a note in the buffer so the user knows.
-      // (Surfaced as a JS console log; future enhancement: hoist to RN UI.)
+      setDiag(`load_error: ${msg.message}`);
       console.warn("[XTermView] xterm.js failed to load in WebView:", msg.message);
     }
   }, [onInput]);
@@ -507,13 +538,18 @@ export default function XTermView({ sessionId, onInput, resetToken }: Props) {
   if (fallback) {
     return (
       <View style={s.root}>
+        {diag ? (
+          <View style={s.diagBar}>
+            <Text style={s.diagText} numberOfLines={2}>{`⚠ xterm didn't boot · ${diag}`}</Text>
+          </View>
+        ) : null}
         <ScrollView
           ref={fbScrollRef}
           style={s.fbScroll}
           contentContainerStyle={s.fbContent}
           onContentSizeChange={() => fbScrollRef.current?.scrollToEnd({ animated: false })}
         >
-          <Text style={s.fbText} selectable>{fbLines || "// terminal ready — type a command below"}</Text>
+          <Text style={s.fbText} selectable>{stripAnsi(fbLines) || "// terminal ready — type a command below"}</Text>
         </ScrollView>
         <View style={s.fbInputRow}>
           <Text style={s.fbPrompt}>$</Text>
@@ -552,8 +588,10 @@ export default function XTermView({ sessionId, onInput, resetToken }: Props) {
         originWhitelist={["*"]}
         source={source}
         onMessage={onMessage}
-        onError={() => setFallback(true)}
-        onRenderProcessGone={() => setFallback(true)}
+        onError={(e) => { setDiag(`webview onError: ${e?.nativeEvent?.description || ""}`); setFallback(true); }}
+        onHttpError={(e) => setDiag(`http ${e?.nativeEvent?.statusCode || "?"}`)}
+        onLoadEnd={() => setDiag((d) => d || "html loaded, waiting for xterm…")}
+        onRenderProcessGone={() => { setDiag("webview process gone"); setFallback(true); }}
         javaScriptEnabled
         domStorageEnabled
         allowFileAccess
@@ -587,6 +625,8 @@ const s = StyleSheet.create({
   },
   fbScroll: { flex: 1, backgroundColor: "#04070a" },
   fbContent: { padding: 8 },
+  diagBar: { backgroundColor: "#2a0e0e", borderBottomWidth: 1, borderBottomColor: "#ff3860", paddingHorizontal: 8, paddingVertical: 5 },
+  diagText: { fontFamily: MONO, fontSize: 10, color: "#ff8090" },
   fbText: { fontFamily: MONO, fontSize: 12, color: "#cfeadb", lineHeight: 17 },
   fbInputRow: {
     flexDirection: "row",
