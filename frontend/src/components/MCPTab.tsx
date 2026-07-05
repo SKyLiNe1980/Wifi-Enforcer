@@ -2026,7 +2026,7 @@ export default function MCPTab() {
             gap: 6, flexWrap: "wrap", marginBottom: 12,
           }]}>
             <TouchableOpacity
-              style={[s.btn, { backgroundColor: C.panel2, borderColor: C.green }]}
+              style={[s.btn, { flexGrow: 1, flexBasis: "47%", backgroundColor: C.panel2, borderColor: C.green }]}
               onPress={handleOpenDeploy}
               disabled={!HAS_NATIVE_ROOT}
             >
@@ -2037,7 +2037,7 @@ export default function MCPTab() {
               </Text>
             </TouchableOpacity>
             <TouchableOpacity
-              style={[s.btn, { backgroundColor: C.panel2, borderColor: C.mcpAccent }]}
+              style={[s.btn, { flexGrow: 1, flexBasis: "47%", backgroundColor: C.panel2, borderColor: C.mcpAccent }]}
               onPress={() => setEditingNode({
                 name: "", host: "", port: 8765, bearer_token: "",
                 tags: [], description: "", enabled: true,
@@ -2053,7 +2053,7 @@ export default function MCPTab() {
               seeding Upstash required SSH'ing to another box.
             */}
             <TouchableOpacity
-              style={[s.btn, { backgroundColor: C.panel2, borderColor: C.cyan }]}
+              style={[s.btn, { flexGrow: 1, flexBasis: "47%", backgroundColor: C.panel2, borderColor: C.cyan }]}
               disabled={!HAS_NATIVE_ROOT}
               onPress={async () => {
                 try {
@@ -2072,7 +2072,7 @@ export default function MCPTab() {
               </Text>
             </TouchableOpacity>
             <TouchableOpacity
-              style={[s.btn, { backgroundColor: C.panel2, borderColor: C.mcpAccent }]}
+              style={[s.btn, { flexGrow: 1, flexBasis: "47%", backgroundColor: C.panel2, borderColor: C.mcpAccent }]}
               disabled={!HAS_NATIVE_ROOT}
               onPress={async () => {
                 try {
