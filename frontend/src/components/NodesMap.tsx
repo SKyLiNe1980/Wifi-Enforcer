@@ -23,6 +23,7 @@ const MONO = Platform.select({ ios: "Menlo", android: "monospace", default: "mon
 
 const H = 300;          // canvas height
 const NODE = 60;        // node touch box size
+const GRID_THRESHOLD = 8; // above this many nodes, radial → grid
 
 function healthColor(h: string): string {
   switch (h) {
@@ -87,6 +88,49 @@ export default function NodesMap({
   const R = Math.max(70, Math.min(w, H) / 2 - NODE / 2 - 20);
 
   const localColor = !localEnabled ? C.textDim : healthColor(localHealth);
+
+  // Past ~8 nodes a single radial ring overlaps/labels-collide and can't
+  // fit a phone's width — switch to a compact grid so the pane never
+  // mangles regardless of fleet size. Map = glance (small fleets),
+  // grid = scale.
+  if (count > GRID_THRESHOLD) {
+    return (
+      <View style={styles.gridWrap}>
+        <View style={styles.gridHeader}>
+          <View style={[styles.gridHubDot, { backgroundColor: localColor }]} />
+          <TouchableOpacity onPress={onPressLocal} activeOpacity={0.7}>
+            <Text style={styles.gridHubText}>
+              local mcp hub · <Text style={{ color: C.textDim }}>{count} remote nodes</Text>
+            </Text>
+          </TouchableOpacity>
+        </View>
+        <View style={styles.grid}>
+          {nodes.map((n) => {
+            const h = nodeHealth[n.id] || n.last_health_status || "unknown";
+            const col = !n.enabled ? C.textDim : healthColor(h);
+            return (
+              <TouchableOpacity
+                key={n.id}
+                activeOpacity={0.7}
+                onPress={() => onPressNode(n)}
+                style={styles.gridCell}
+              >
+                <View style={[styles.gridDot, { backgroundColor: col }]} />
+                <MaterialCommunityIcons
+                  name={n.is_primary ? "star-circle-outline" : "server-network"}
+                  size={16}
+                  color={col}
+                />
+                <Text numberOfLines={1} style={[styles.gridLabel, { color: n.enabled ? C.text : C.textDim }]}>
+                  {n.name || n.host}
+                </Text>
+              </TouchableOpacity>
+            );
+          })}
+        </View>
+      </View>
+    );
+  }
 
   const positioned = nodes.map((n, i) => {
     const ang = -Math.PI / 2 + i * ((2 * Math.PI) / Math.max(1, count));
@@ -212,4 +256,31 @@ const styles = StyleSheet.create({
     textAlign: "center",
     lineHeight: 15,
   },
+  // ── grid fallback (>8 nodes) ──
+  gridWrap: {
+    backgroundColor: C.panel,
+    borderWidth: 1,
+    borderColor: C.border,
+    borderRadius: 6,
+    padding: 10,
+  },
+  gridHeader: { flexDirection: "row", alignItems: "center", marginBottom: 10 },
+  gridHubDot: { width: 8, height: 8, borderRadius: 4, marginRight: 8 },
+  gridHubText: { fontFamily: MONO, fontSize: 12, color: C.mcpAccent },
+  grid: { flexDirection: "row", flexWrap: "wrap", gap: 6 },
+  gridCell: {
+    flexBasis: "31%",
+    flexGrow: 1,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    borderWidth: 1,
+    borderColor: C.border,
+    borderRadius: 4,
+    backgroundColor: C.panel2,
+    paddingVertical: 8,
+    paddingHorizontal: 8,
+  },
+  gridDot: { width: 8, height: 8, borderRadius: 4 },
+  gridLabel: { fontFamily: MONO, fontSize: 10, flexShrink: 1 },
 });

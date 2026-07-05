@@ -1445,7 +1445,13 @@ export default function MCPTab() {
             style={[s.subTabBtn, subTab === st && s.subTabBtnActive]}
             activeOpacity={0.7}
           >
-            <Text style={[s.subTabText, subTab === st && { color: C.mcpAccent }]}>
+            <Text
+              style={[s.subTabText, subTab === st && { color: C.mcpAccent }]}
+              numberOfLines={1}
+              adjustsFontSizeToFit
+              minimumFontScale={0.7}
+              allowFontScaling={false}
+            >
               {st === "status" ? "// status"
                 : st === "tools" ? `// tools (${tools.length})`
                 : st === "nodes" ? `// nodes (${nodes.length})`
@@ -1484,17 +1490,6 @@ export default function MCPTab() {
               />
             </View>
           </View>
-
-          <Text style={[s.sectionTitle, { marginTop: 20 }]}>{"// nodes map"}</Text>
-          <NodesMap
-            localHealth={serverHealth}
-            localEnabled={config.server_enabled}
-            localLabel={config.bind_host}
-            nodes={nodes}
-            nodeHealth={nodeHealth}
-            onPressLocal={() => setShowLocalSheet(true)}
-            onPressNode={(n) => setMapSheetNode(n)}
-          />
 
           <Text style={[s.sectionTitle, { marginTop: 20 }]}>{"// network"}</Text>
           <View style={s.card}>
@@ -2118,6 +2113,18 @@ export default function MCPTab() {
             </TouchableOpacity>
           </View>
 
+          <Text style={[s.sectionTitle, { marginBottom: 10 }]}>{"// nodes map"}</Text>
+          <NodesMap
+            localHealth={serverHealth}
+            localEnabled={config.server_enabled}
+            localLabel={config.bind_host}
+            nodes={nodes}
+            nodeHealth={nodeHealth}
+            onPressLocal={() => setShowLocalSheet(true)}
+            onPressNode={(n) => setMapSheetNode(n)}
+          />
+
+          <Text style={[s.sectionTitle, { marginVertical: 10 }]}>{"// node list"}</Text>
           {nodes.length === 0 ? (
             <View style={s.card}>
               <Text style={s.helper}>
@@ -2968,7 +2975,7 @@ const s = StyleSheet.create({
   },
   subTabBtn: { flex: 1, paddingVertical: 12, alignItems: "center" },
   subTabBtnActive: { borderBottomWidth: 2, borderColor: C.mcpAccent },
-  subTabText: { fontFamily: MONO, color: C.textDim, fontSize: 12, letterSpacing: 0.5 },
+  subTabText: { fontFamily: MONO, color: C.textDim, fontSize: 12, letterSpacing: 0.5, width: "100%", textAlign: "center" },
   sectionTitle: { fontFamily: MONO, color: C.textDim, fontSize: 12, letterSpacing: 0.5, marginBottom: 6 },
   card: {
     backgroundColor: C.panel, borderWidth: 1, borderColor: C.border,
