@@ -50,7 +50,7 @@ export const KEY_ROSTER = "enforcer:nodes:roster";
 export const KEY_ROSTER_UPDATED = "enforcer:nodes:roster_updated_at";
 // Roster TTL — long enough to survive weeks of no updates, short enough
 // that a truly abandoned cockpit's stale roster self-evicts. 30 days.
-export const TTL_ROSTER_SEC = 30 * 24 * 60 * 60;
+export const TTL_ROSTER_SEC = 90 * 24 * 60 * 60;
 
 // Suggested TTLs so orphaned rows self-evict from Upstash if the cockpit
 // stops rotating (e.g. app uninstalled while a rotation was in flight).

@@ -62,14 +62,17 @@ export async function detectTailnetIp(): Promise<string | null> {
     },
     {
       name: "ip-addr",
-      // Parse `ip -4 addr show` for anything inside the 100.64/10 range.
-      // The regex-first `grep -oE` gives us the bare IP with no CIDR.
-      cmd: "ip -4 addr show 2>/dev/null | grep -oE 'inet 100\\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\\.[0-9]+\\.[0-9]+' | head -1 | awk '{print $2}'",
+      // Scope STRICTLY to the tailscale interface(s). Carrier CGNAT on
+      // rmnet0/wwan0 also lives in 100.64/10 (RFC 6598), so an unscoped
+      // `ip addr | grep 100.64/10` can grab the mobile-data IP by
+      // mistake (observed: probe host auto-set to rmnet0's 100.100.x).
+      // Only tailscale0/tun0 count as tailnet ifaces in kernel mode.
+      cmd: "for i in tailscale0 tun0; do ip -4 addr show $i 2>/dev/null; done | grep -oE 'inet 100\\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\\.[0-9]+\\.[0-9]+' | head -1 | awk '{print $2}'",
     },
     {
       name: "ifconfig",
-      // Same idea, but via ifconfig (busybox / older Debian).
-      cmd: "ifconfig 2>/dev/null | grep -oE 'inet (addr:)?100\\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\\.[0-9]+\\.[0-9]+' | head -1 | awk '{print $NF}' | tr -d 'addr:'",
+      // Same idea, iface-scoped, via ifconfig (busybox / older Debian).
+      cmd: "for i in tailscale0 tun0; do ifconfig $i 2>/dev/null; done | grep -oE 'inet (addr:)?100\\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\\.[0-9]+\\.[0-9]+' | head -1 | awk '{print $NF}' | tr -d 'addr:'",
     },
   ];
 
