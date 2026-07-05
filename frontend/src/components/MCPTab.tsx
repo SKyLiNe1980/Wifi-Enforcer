@@ -42,6 +42,7 @@ import {
   pushRoster, fetchRoster,
   type RosterEntry,
 } from "../lib/tokenStash";
+import NodesMap from "./NodesMap";
 
 // Keep palette identical to the rest of the cockpit so the tab feels native.
 const C = {
@@ -85,6 +86,9 @@ export default function MCPTab() {
   const [nodeHealth, setNodeHealth] = useState<Record<string, string>>({});
   const [nodeToolCount, setNodeToolCount] = useState<Record<string, number>>({});
   const [editingNode, setEditingNode] = useState<Partial<MCPNode> | null>(null);
+  // Node-map tap sheets (// status pane radial map)
+  const [mapSheetNode, setMapSheetNode] = useState<MCPNode | null>(null);
+  const [showLocalSheet, setShowLocalSheet] = useState(false);
   const [busy, setBusy] = useState(false);
   const [tokenVisible, setTokenVisible] = useState(false);
 
@@ -1481,6 +1485,17 @@ export default function MCPTab() {
             </View>
           </View>
 
+          <Text style={[s.sectionTitle, { marginTop: 20 }]}>{"// nodes map"}</Text>
+          <NodesMap
+            localHealth={serverHealth}
+            localEnabled={config.server_enabled}
+            localLabel={config.bind_host}
+            nodes={nodes}
+            nodeHealth={nodeHealth}
+            onPressLocal={() => setShowLocalSheet(true)}
+            onPressNode={(n) => setMapSheetNode(n)}
+          />
+
           <Text style={[s.sectionTitle, { marginTop: 20 }]}>{"// network"}</Text>
           <View style={s.card}>
             <Text style={s.kvLabel}>server bind host</Text>
@@ -2399,6 +2414,136 @@ export default function MCPTab() {
       )}
 
       {/* NODE EDIT MODAL */}
+      {/* NODE-MAP: local hub sheet ─────────────────────────────────── */}
+      {showLocalSheet && (
+        <View style={s.overlay} pointerEvents="auto">
+          <View style={s.sheet}>
+            <View style={s.sheetHeader}>
+              <Text style={s.sheetTitle}>{"// local mcp"}</Text>
+              <TouchableOpacity onPress={() => setShowLocalSheet(false)}>
+                <MaterialCommunityIcons name="close" size={22} color={C.green} />
+              </TouchableOpacity>
+            </View>
+            <Text style={s.helperFine}>
+              this cockpit&apos;s chroot MCP server (the swarm hub).
+            </Text>
+            <Text style={[s.helperFine, { marginTop: 8 }]}>
+              endpoint:{" "}
+              <Text style={{ color: C.cyan }}>http://{config.bind_host}:{config.port}/mcp</Text>
+            </Text>
+            <Text style={[s.helperFine, { marginTop: 4 }]}>
+              health:{" "}
+              <Text style={{ color: statusInfo.color }}>{statusInfo.label}</Text>
+            </Text>
+            <View style={[s.row, { marginTop: 12, justifyContent: "space-between" }]}>
+              <Text style={s.kvLabel}>enable server</Text>
+              <Switch
+                value={config.server_enabled}
+                onValueChange={handleToggleServer}
+                trackColor={{ false: C.border, true: C.greenDim }}
+                thumbColor={config.server_enabled ? C.green : C.textDim}
+                disabled={busy}
+              />
+            </View>
+            <Text style={[s.helperFine, { marginTop: 10, color: C.textDim }]}>
+              bind host / probe host / port are editable below in{" "}
+              <Text style={{ color: C.green }}>{"// network"}</Text>.
+            </Text>
+          </View>
+        </View>
+      )}
+
+      {/* NODE-MAP: remote node sheet ────────────────────────────────── */}
+      {mapSheetNode && (() => {
+        const n = mapSheetNode;
+        const health = nodeHealth[n.id] || n.last_health_status || "unknown";
+        const toolCount = nodeToolCount[n.id] ?? n.last_tool_count;
+        const dotColor =
+          health === "running" ? C.green :
+          health === "probing" ? C.yellow :
+          health === "unreachable" ? C.textDim : C.red;
+        return (
+          <View style={s.overlay} pointerEvents="auto">
+            <View style={s.sheet}>
+              <View style={s.sheetHeader}>
+                <Text style={s.sheetTitle} numberOfLines={1}>{`// ${n.name}`}</Text>
+                <TouchableOpacity onPress={() => setMapSheetNode(null)}>
+                  <MaterialCommunityIcons name="close" size={22} color={C.green} />
+                </TouchableOpacity>
+              </View>
+              <Text style={s.helperFine}>
+                <Text style={{ color: C.cyan }}>http://{n.host}:{n.port}</Text>
+                {"  ·  "}<Text style={{ color: dotColor }}>{health.toUpperCase()}</Text>
+                {toolCount !== null && toolCount !== undefined ? (
+                  <Text style={{ color: C.textDim }}>{`  ·  ${toolCount} tools`}</Text>
+                ) : null}
+                {n.is_primary ? <Text style={{ color: C.yellow }}>{"  ·  PRIMARY"}</Text> : null}
+              </Text>
+              {n.description ? (
+                <Text style={[s.helperFine, { marginTop: 6, color: C.textDim }]}>{n.description}</Text>
+              ) : null}
+
+              <View style={[s.row, { marginTop: 12, justifyContent: "space-between" }]}>
+                <Text style={s.kvLabel}>enabled</Text>
+                <Switch
+                  value={n.enabled}
+                  onValueChange={async (v) => {
+                    await nodesLocal.update(n.id, { enabled: v });
+                    setMapSheetNode({ ...n, enabled: v });
+                    refreshLists();
+                  }}
+                  trackColor={{ false: C.border, true: C.greenDim }}
+                  thumbColor={n.enabled ? C.green : C.textDim}
+                />
+              </View>
+
+              <View style={[s.row, { marginTop: 14, gap: 6, flexWrap: "wrap" }]}>
+                <TouchableOpacity
+                  style={[s.smallBtn, { borderColor: health === "probing" ? C.yellow : C.green }]}
+                  onPress={() => probeNode(n)}
+                  disabled={!n.enabled || health === "probing"}
+                >
+                  <Text style={[s.smallBtnText, {
+                    color: !n.enabled ? C.textDim : health === "probing" ? C.yellow : C.green,
+                  }]}>
+                    {health === "probing" ? "PROBING…" : "RETRY PROBE"}
+                  </Text>
+                </TouchableOpacity>
+                {!n.is_primary && (
+                  <TouchableOpacity
+                    style={[s.smallBtn, { borderColor: C.yellow }]}
+                    onPress={() => { handleSetPrimaryNode(n); setMapSheetNode(null); }}
+                  >
+                    <Text style={[s.smallBtnText, { color: C.yellow }]}>SET PRIMARY</Text>
+                  </TouchableOpacity>
+                )}
+                <TouchableOpacity
+                  style={[s.smallBtn, { borderColor: C.cyan }]}
+                  onPress={() => handleResyncNodeTools(n)}
+                  disabled={!n.bearer_token || health !== "running"}
+                >
+                  <Text style={[s.smallBtnText, {
+                    color: (!n.bearer_token || health !== "running") ? C.textDim : C.cyan,
+                  }]}>SYNC TOOLS</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[s.smallBtn, { borderColor: C.mcpAccent }]}
+                  onPress={() => { setMapSheetNode(null); setEditingNode({ ...n }); }}
+                >
+                  <Text style={[s.smallBtnText, { color: C.mcpAccent }]}>EDIT</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[s.smallBtn, { borderColor: C.red }]}
+                  onPress={() => { setMapSheetNode(null); handleDeleteNode(n); }}
+                >
+                  <Text style={[s.smallBtnText, { color: C.red }]}>DELETE</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+          </View>
+        );
+      })()}
+
       {editingNode && (
         <View style={s.overlay} pointerEvents="auto">
           <View style={s.sheet}>
