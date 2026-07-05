@@ -129,3 +129,6 @@ credentials.json
 *.pem
 *.key
 .credentials
+
+# Emergent session file (rewritten every session, causes timestamp conflicts)
+.emergent/emergent.yml
