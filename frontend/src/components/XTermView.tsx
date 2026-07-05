@@ -20,10 +20,13 @@
  * Theme intentionally matches the rest of the Enforcer UI (green-on-black
  * Kali palette) so the AI tab feels of a piece with Live / Terminal.
  */
-import React, { useCallback, useEffect, useMemo, useRef } from "react";
-import { Platform, StyleSheet, View } from "react-native";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Platform, StyleSheet, View, ScrollView, Text, TextInput } from "react-native";
 import { WebView } from "react-native-webview";
+import * as FileSystem from "expo-file-system/legacy";
 import { sessionManager } from "../lib/sessionManager";
+
+const MONO = Platform.select({ ios: "Menlo", android: "monospace", default: "monospace" });
 // Vendored xterm.js payload — see frontend/scripts/vendor-xterm.sh.
 // Loading from a public CDN inside the WebView hangs indefinitely on
 // tailnet-routed devices (the exit node may not have a route to
@@ -103,40 +106,19 @@ ${xtermBundle.cssContent}
 <div id="boot">// booting xterm.js…</div>
 <div id="t"></div>
 <!--
-  Load xterm.js + fit addon by decoding the vendored base64 in the script
-  BODY (not a src= attribute) and injecting each as a real <script> element.
+  xterm.js + fit addon are loaded from SIBLING file:// scripts written to
+  the app cache at runtime (see ensureXtermFiles()).
 
-  Why not <script src="data:...base64,...">: that stuffs a ~386 KB payload
-  into an HTML attribute. Android WebView chokes on the oversized attribute
-  value — parsing breaks on that tag and SWALLOWS the following inline
-  bootstrap <script>, which is exactly why the boot screen froze on
-  "booting xterm.js…" with no success and no guard message.
-
-  Base64 lives safely inside a JS string literal (alphabet is [A-Za-z0-9+/=],
-  no quotes/backslashes/'</script>'), so there's nothing to escape. atob()
-  is available in every Android WebView. s.text + appendChild executes the
-  decoded UMD in global scope, defining window.Terminal / FitAddon.
+  Why not inline the JS (data: URL or script body): the combined payload is
+  ~400 KB. Android WebView's loadDataWithBaseURL (used for source={{html}})
+  TRUNCATES very large documents — the early #boot div renders but the big
+  script downstream gets cut off and never executes, freezing the terminal
+  on "booting xterm.js…". Loading the HTML from a file:// URI (source={{uri}})
+  has no size ceiling, and sibling <script src> files load fine with
+  allowFileAccessFromFileURLs enabled.
 -->
-<script>
-(function () {
-  function post(m) {
-    try { window.ReactNativeWebView && window.ReactNativeWebView.postMessage(JSON.stringify(m)); } catch (e) {}
-  }
-  function inject(b64, name) {
-    try {
-      var s = document.createElement("script");
-      s.text = atob(b64);
-      document.head.appendChild(s);
-    } catch (e) {
-      var b = document.getElementById("boot");
-      if (b) b.innerText = "// xterm bundle failed (" + name + "): " + (e && e.message || e);
-      post({ type: "load_error", message: name + ": " + (e && e.message || e) });
-    }
-  }
-  inject("${xtermBundle.xtermJsB64}", "xterm.js");
-  inject("${xtermBundle.fitAddonB64}", "addon-fit");
-})();
-</script>
+<script src="./xterm.js"></script>
+<script src="./fit.js"></script>
 <script>
 (function () {
   // Helper that talks back to React Native.
@@ -351,9 +333,47 @@ ${xtermBundle.cssContent}
 </body>
 </html>`;
 
+// ── file:// asset staging ───────────────────────────────────────────────
+// Write the HTML + xterm/fit JS to the app cache ONCE (per version), then
+// load the terminal via source={{ uri }}. This dodges the Android
+// loadDataWithBaseURL size ceiling that truncated the ~400 KB inline HTML.
+const XTERM_DIR = `${FileSystem.cacheDirectory}xterm-${xtermBundle.xtermVersion}-${xtermBundle.fitVersion}/`;
+const HTML_URI = `${XTERM_DIR}term.html`;
+
+let ensurePromise: Promise<string> | null = null;
+async function ensureXtermFiles(): Promise<string> {
+  if (ensurePromise) return ensurePromise;
+  ensurePromise = (async () => {
+    const info = await FileSystem.getInfoAsync(HTML_URI);
+    if (!info.exists) {
+      await FileSystem.makeDirectoryAsync(XTERM_DIR, { intermediates: true }).catch(() => {});
+      // base64 encoding writes the DECODED bytes → real .js files.
+      await FileSystem.writeAsStringAsync(`${XTERM_DIR}xterm.js`, xtermBundle.xtermJsB64, {
+        encoding: FileSystem.EncodingType.Base64,
+      });
+      await FileSystem.writeAsStringAsync(`${XTERM_DIR}fit.js`, xtermBundle.fitAddonB64, {
+        encoding: FileSystem.EncodingType.Base64,
+      });
+      await FileSystem.writeAsStringAsync(HTML_URI, XTERM_HTML, {
+        encoding: FileSystem.EncodingType.UTF8,
+      });
+    }
+    return HTML_URI;
+  })();
+  return ensurePromise;
+}
+
 export default function XTermView({ sessionId, onInput, resetToken }: Props) {
   const webRef = useRef<WebView>(null);
   const readyRef = useRef(false);
+  // file:// HTML uri (staged on mount). null until written.
+  const [htmlUri, setHtmlUri] = useState<string | null>(null);
+  // If xterm never signals ready, drop to a flat scrollback so the
+  // terminal is usable instead of frozen on the boot screen.
+  const [fallback, setFallback] = useState(false);
+  const [fbLines, setFbLines] = useState<string>("");
+  const [fbInput, setFbInput] = useState<string>("");
+  const fbScrollRef = useRef<ScrollView>(null);
   // Buffer writes that arrive before the WebView has finished loading
   // xterm.js — flushed once we get the `ready` message.
   const pendingRef = useRef<string[]>([]);
@@ -382,7 +402,22 @@ export default function XTermView({ sessionId, onInput, resetToken }: Props) {
     }
   }, []);
 
-  // ── Subscribe to session line stream ──────────────────────────────────
+  // ── Stage file:// assets on mount + boot watchdog ─────────────────────
+  useEffect(() => {
+    let alive = true;
+    ensureXtermFiles()
+      .then((uri) => { if (alive) setHtmlUri(uri); })
+      .catch(() => { if (alive) setFallback(true); }); // can't stage → scrollback
+    // If xterm hasn't signalled `ready` within 6s, the WebView failed to
+    // boot (blank/hung) → switch to flat scrollback so it's never a dead
+    // screen. Cleared the moment `ready` arrives (see onMessage).
+    const t = setTimeout(() => {
+      if (alive && !readyRef.current) setFallback(true);
+    }, 6000);
+    return () => { alive = false; clearTimeout(t); };
+  }, []);
+
+
   useEffect(() => {
     if (!sessionId) {
       lastLineNoRef.current = 0;
@@ -393,17 +428,12 @@ export default function XTermView({ sessionId, onInput, resetToken }: Props) {
     // have been running before the user switched tabs back to AI).
     const s0 = sessionManager.sessions.get(sessionId);
     if (s0 && s0.lines.length) {
-      // Interactive PTY streams (zsh, wifite, etc.) emit a LOT of empty
-      // strings via the native line-splitter — one per zsh aesthetic
-      // blank line, one per prompt redraw, one per bracketed-paste
-      // toggle, and so on. Joining raw with \r\n produces walls of
-      // blank vertical space (5+ rows between commands on Kali). Fix:
-      // collapse runs of ≥2 consecutive empty lines down to 1. Genuine
-      // single blank lines pass through untouched.
       const initial = collapseBlankRuns(s0.lines.map((l) => l.line)).join("\r\n");
       writeToTerm(initial);
+      setFbLines(collapseBlankRuns(s0.lines.map((l) => l.line)).join("\n"));
       lastLineNoRef.current = s0.lineCount;
     } else {
+      setFbLines("");
       lastLineNoRef.current = 0;
     }
 
@@ -413,12 +443,11 @@ export default function XTermView({ sessionId, onInput, resetToken }: Props) {
       if (s.lineCount <= lastLineNoRef.current) return;
       const fresh = s.lines.filter((l) => l.line_no > lastLineNoRef.current);
       if (fresh.length) {
-        // Prepend \r\n only if we've already written something. If this
-        // is the very first write (initial replay was empty), no leading
-        // separator is needed.
         const prefix = hasWrittenRef.current ? "\r\n" : "";
         const chunk = prefix + collapseBlankRuns(fresh.map((l) => l.line)).join("\r\n");
         writeToTerm(chunk);
+        // Keep the flat scrollback (fallback view) in sync too.
+        setFbLines(collapseBlankRuns(s.lines.map((l) => l.line)).join("\n"));
       }
       lastLineNoRef.current = s.lineCount;
     });
@@ -465,13 +494,56 @@ export default function XTermView({ sessionId, onInput, resetToken }: Props) {
     }
   }, []);
 
-  // Stable source — never recompute (would force WebView reload).
-  // baseUrl is a concrete https origin (NOT "about:blank"): an opaque
-  // about:blank origin can suppress script execution / subresource
-  // access on Android WebView. A real origin lets the inline bootstrap
-  // and the injected xterm scripts run reliably. All assets are inlined
-  // (no network fetch happens), so the host never needs to resolve.
-  const source = useMemo(() => ({ html: XTERM_HTML, baseUrl: "https://localhost/" }), []);
+  // Stable source — file:// uri (no size ceiling, unlike inline html).
+  const source = useMemo(() => (htmlUri ? { uri: htmlUri } : undefined), [htmlUri]);
+
+  const submitFallback = useCallback(() => {
+    // Line-based input for the scrollback fallback (no PTY key handling).
+    onInput(fbInput + "\r");
+    setFbInput("");
+  }, [fbInput, onInput]);
+
+  // ── Flat scrollback fallback (xterm didn't boot) ──────────────────────
+  if (fallback) {
+    return (
+      <View style={s.root}>
+        <ScrollView
+          ref={fbScrollRef}
+          style={s.fbScroll}
+          contentContainerStyle={s.fbContent}
+          onContentSizeChange={() => fbScrollRef.current?.scrollToEnd({ animated: false })}
+        >
+          <Text style={s.fbText} selectable>{fbLines || "// terminal ready — type a command below"}</Text>
+        </ScrollView>
+        <View style={s.fbInputRow}>
+          <Text style={s.fbPrompt}>$</Text>
+          <TextInput
+            style={s.fbInput}
+            value={fbInput}
+            onChangeText={setFbInput}
+            onSubmitEditing={submitFallback}
+            placeholder="command…"
+            placeholderTextColor="#3c5a52"
+            autoCapitalize="none"
+            autoCorrect={false}
+            autoComplete="off"
+            spellCheck={false}
+            blurOnSubmit={false}
+            returnKeyType="send"
+          />
+        </View>
+      </View>
+    );
+  }
+
+  // Still staging the file:// assets — brief loading state.
+  if (!source) {
+    return (
+      <View style={[s.root, s.centered]}>
+        <Text style={s.fbText}>{"// staging terminal…"}</Text>
+      </View>
+    );
+  }
 
   return (
     <View style={s.root} onTouchStart={focusTerm}>
@@ -480,8 +552,13 @@ export default function XTermView({ sessionId, onInput, resetToken }: Props) {
         originWhitelist={["*"]}
         source={source}
         onMessage={onMessage}
+        onError={() => setFallback(true)}
+        onRenderProcessGone={() => setFallback(true)}
         javaScriptEnabled
         domStorageEnabled
+        allowFileAccess
+        allowFileAccessFromFileURLs
+        allowUniversalAccessFromFileURLs
         automaticallyAdjustContentInsets={false}
         scrollEnabled={false}
         bounces={false}
@@ -492,10 +569,8 @@ export default function XTermView({ sessionId, onInput, resetToken }: Props) {
         hideKeyboardAccessoryView
         mixedContentMode="always"
         setSupportMultipleWindows={false}
-        // Performance: skip overdraw on Android, smoother text rendering.
         cacheEnabled
         cacheMode="LOAD_DEFAULT"
-        // We render full-screen inside our own SafeAreaView already.
         contentInsetAdjustmentBehavior="never"
       />
     </View>
@@ -504,11 +579,29 @@ export default function XTermView({ sessionId, onInput, resetToken }: Props) {
 
 const s = StyleSheet.create({
   root: { flex: 1, backgroundColor: "#04070a" },
+  centered: { alignItems: "center", justifyContent: "center" },
   web: {
     flex: 1,
     backgroundColor: "#04070a",
-    // react-native-webview on Android sometimes flashes white on first
-    // mount; this ensures the underlying View matches our dark palette.
     opacity: Platform.OS === "android" ? 0.999 : 1,
+  },
+  fbScroll: { flex: 1, backgroundColor: "#04070a" },
+  fbContent: { padding: 8 },
+  fbText: { fontFamily: MONO, fontSize: 12, color: "#cfeadb", lineHeight: 17 },
+  fbInputRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    borderTopWidth: 1,
+    borderTopColor: "#163041",
+    paddingHorizontal: 8,
+    backgroundColor: "#0a1116",
+  },
+  fbPrompt: { fontFamily: MONO, fontSize: 13, color: "#00ff66", marginRight: 6 },
+  fbInput: {
+    flex: 1,
+    fontFamily: MONO,
+    fontSize: 13,
+    color: "#cfeadb",
+    paddingVertical: 10,
   },
 });
