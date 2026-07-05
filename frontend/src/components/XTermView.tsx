@@ -23,7 +23,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Platform, StyleSheet, View, ScrollView, Text, TextInput } from "react-native";
 import { WebView } from "react-native-webview";
-import * as FileSystem from "expo-file-system/legacy";
 import { sessionManager } from "../lib/sessionManager";
 
 const MONO = Platform.select({ ios: "Menlo", android: "monospace", default: "monospace" });
@@ -117,23 +116,18 @@ ${xtermBundle.cssContent}
 <body>
 <div id="boot">// booting xterm.js…</div>
 <div id="t"></div>
-<!--
-  xterm.js + fit addon are loaded from SIBLING file:// scripts written to
-  the app cache at runtime (see ensureXtermFiles()).
+</body>
+</html>`;
 
-  Why not inline the JS (data: URL or script body): the combined payload is
-  ~400 KB. Android WebView's loadDataWithBaseURL (used for source={{html}})
-  TRUNCATES very large documents — the early #boot div renders but the big
-  script downstream gets cut off and never executes, freezing the terminal
-  on "booting xterm.js…". Loading the HTML from a file:// URI (source={{uri}})
-  has no size ceiling, and sibling <script src> files load fine with
-  allowFileAccessFromFileURLs enabled.
--->
-<script src="./xterm.js"></script>
-<script src="./fit.js"></script>
-<script>
+// The entire terminal boot runs through injectedJavaScript, NOT page
+// <script> tags. Diagnostics proved this device's WebView does not execute
+// in-document <script> (inline OR file:// src) — "html loaded" fires but no
+// bootstrap runs. react-native-webview's injectedJavaScript uses the native
+// evaluateJavascript bridge, which DOES run reliably. We decode the vendored
+// xterm + fit base64 with atob() and append them as script elements (that
+// executes them synchronously in global scope), then boot xterm.
+const XTERM_BOOT_JS = `
 (function () {
-  // Helper that talks back to React Native.
   function post(msg) {
     try {
       if (window.ReactNativeWebView && window.ReactNativeWebView.postMessage) {
@@ -141,27 +135,27 @@ ${xtermBundle.cssContent}
       }
     } catch (e) {}
   }
+  if (window.__enforcerTermBooted) return; // injectedJavaScript can run twice
+  window.__enforcerTermBooted = true;
 
-  // ── DIAGNOSTIC ──────────────────────────────────────────────────────
-  // Report that the inline bootstrap actually executed, plus whether the
-  // sibling xterm/fit scripts defined their globals. This tells RN exactly
-  // where the boot fails: no probe at all → inline scripts don't run;
-  // probe with term=false → the file:// <script src> didn't load.
   window.onerror = function (m, src, line, col, err) {
     post({ type: "diag", stage: "window.onerror", detail: String(m) + " @" + line + ":" + col });
     return false;
   };
-  post({
-    type: "diag",
-    stage: "bootstrap-ran",
-    detail: "Terminal=" + (typeof Terminal) + " FitAddon=" + (typeof FitAddon),
-  });
+  post({ type: "diag", stage: "inject-start", detail: "atob=" + (typeof atob) });
 
-  // Guard against the vendored payload failing to eval for any reason.
+  // Decode + execute xterm.js and the fit addon from embedded base64.
+  try {
+    var s1 = document.createElement("script"); s1.text = atob("${xtermBundle.xtermJsB64}"); document.head.appendChild(s1);
+    var s2 = document.createElement("script"); s2.text = atob("${xtermBundle.fitAddonB64}"); document.head.appendChild(s2);
+  } catch (e) {
+    post({ type: "load_error", message: "inject failed: " + (e && e.message || e) });
+    return;
+  }
+  post({ type: "diag", stage: "lib-injected", detail: "Terminal=" + (typeof Terminal) + " FitAddon=" + (typeof FitAddon) });
+
   if (typeof Terminal === "undefined") {
-    document.getElementById("boot").innerText =
-      "// xterm scripts didn't load (Terminal undefined). Falling back to scrollback.";
-    post({ type: "load_error", message: "Terminal global missing (file:// script did not load)" });
+    post({ type: "load_error", message: "Terminal undefined after inject" });
     return;
   }
 
@@ -356,45 +350,12 @@ ${xtermBundle.cssContent}
   // pending writes queue.
   post({ type: "ready", cols: term.cols, rows: term.rows });
 })();
-</script>
-</body>
-</html>`;
-
-// ── file:// asset staging ───────────────────────────────────────────────
-// Write the HTML + xterm/fit JS to the app cache ONCE (per version), then
-// load the terminal via source={{ uri }}. This dodges the Android
-// loadDataWithBaseURL size ceiling that truncated the ~400 KB inline HTML.
-const XTERM_DIR = `${FileSystem.cacheDirectory}xterm-${xtermBundle.xtermVersion}-${xtermBundle.fitVersion}/`;
-const HTML_URI = `${XTERM_DIR}term.html`;
-
-let ensurePromise: Promise<string> | null = null;
-async function ensureXtermFiles(): Promise<string> {
-  if (ensurePromise) return ensurePromise;
-  ensurePromise = (async () => {
-    const info = await FileSystem.getInfoAsync(HTML_URI);
-    if (!info.exists) {
-      await FileSystem.makeDirectoryAsync(XTERM_DIR, { intermediates: true }).catch(() => {});
-      // base64 encoding writes the DECODED bytes → real .js files.
-      await FileSystem.writeAsStringAsync(`${XTERM_DIR}xterm.js`, xtermBundle.xtermJsB64, {
-        encoding: FileSystem.EncodingType.Base64,
-      });
-      await FileSystem.writeAsStringAsync(`${XTERM_DIR}fit.js`, xtermBundle.fitAddonB64, {
-        encoding: FileSystem.EncodingType.Base64,
-      });
-      await FileSystem.writeAsStringAsync(HTML_URI, XTERM_HTML, {
-        encoding: FileSystem.EncodingType.UTF8,
-      });
-    }
-    return HTML_URI;
-  })();
-  return ensurePromise;
-}
+true;
+`;
 
 export default function XTermView({ sessionId, onInput, resetToken }: Props) {
   const webRef = useRef<WebView>(null);
   const readyRef = useRef(false);
-  // file:// HTML uri (staged on mount). null until written.
-  const [htmlUri, setHtmlUri] = useState<string | null>(null);
   // If xterm never signals ready, drop to a flat scrollback so the
   // terminal is usable instead of frozen on the boot screen.
   const [fallback, setFallback] = useState(false);
@@ -431,15 +392,11 @@ export default function XTermView({ sessionId, onInput, resetToken }: Props) {
     }
   }, []);
 
-  // ── Stage file:// assets on mount + boot watchdog ─────────────────────
+  // ── Boot watchdog ─────────────────────────────────────────────────────
   useEffect(() => {
     let alive = true;
-    ensureXtermFiles()
-      .then((uri) => { if (alive) setHtmlUri(uri); })
-      .catch(() => { if (alive) setFallback(true); }); // can't stage → scrollback
-    // If xterm hasn't signalled `ready` within 6s, the WebView failed to
-    // boot (blank/hung) → switch to flat scrollback so it's never a dead
-    // screen. Cleared the moment `ready` arrives (see onMessage).
+    // If xterm hasn't signalled `ready` within 9s, the WebView failed to
+    // boot → switch to flat scrollback so it's never a dead screen.
     const t = setTimeout(() => {
       if (alive && !readyRef.current) setFallback(true);
     }, 9000);
@@ -525,8 +482,8 @@ export default function XTermView({ sessionId, onInput, resetToken }: Props) {
     }
   }, []);
 
-  // Stable source — file:// uri (no size ceiling, unlike inline html).
-  const source = useMemo(() => (htmlUri ? { uri: htmlUri } : undefined), [htmlUri]);
+  // Stable source — tiny inline skeleton; xterm boots via injectedJavaScript.
+  const source = useMemo(() => ({ html: XTERM_HTML, baseUrl: "https://localhost/" }), []);
 
   const submitFallback = useCallback(() => {
     // Line-based input for the scrollback fallback (no PTY key handling).
@@ -572,21 +529,14 @@ export default function XTermView({ sessionId, onInput, resetToken }: Props) {
     );
   }
 
-  // Still staging the file:// assets — brief loading state.
-  if (!source) {
-    return (
-      <View style={[s.root, s.centered]}>
-        <Text style={s.fbText}>{"// staging terminal…"}</Text>
-      </View>
-    );
-  }
-
   return (
     <View style={s.root} onTouchStart={focusTerm}>
       <WebView
         ref={webRef}
         originWhitelist={["*"]}
         source={source}
+        injectedJavaScript={XTERM_BOOT_JS}
+        injectedJavaScriptBeforeContentLoaded={`try{window.ReactNativeWebView&&window.ReactNativeWebView.postMessage(JSON.stringify({type:"diag",stage:"inject-before"}));}catch(e){} true;`}
         onMessage={onMessage}
         onError={(e) => { setDiag(`webview onError: ${e?.nativeEvent?.description || ""}`); setFallback(true); }}
         onHttpError={(e) => setDiag(`http ${e?.nativeEvent?.statusCode || "?"}`)}
@@ -594,9 +544,6 @@ export default function XTermView({ sessionId, onInput, resetToken }: Props) {
         onRenderProcessGone={() => { setDiag("webview process gone"); setFallback(true); }}
         javaScriptEnabled
         domStorageEnabled
-        allowFileAccess
-        allowFileAccessFromFileURLs
-        allowUniversalAccessFromFileURLs
         automaticallyAdjustContentInsets={false}
         scrollEnabled={false}
         bounces={false}
@@ -617,7 +564,6 @@ export default function XTermView({ sessionId, onInput, resetToken }: Props) {
 
 const s = StyleSheet.create({
   root: { flex: 1, backgroundColor: "#04070a" },
-  centered: { alignItems: "center", justifyContent: "center" },
   web: {
     flex: 1,
     backgroundColor: "#04070a",
