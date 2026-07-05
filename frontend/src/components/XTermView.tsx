@@ -103,16 +103,40 @@ ${xtermBundle.cssContent}
 <div id="boot">// booting xterm.js…</div>
 <div id="t"></div>
 <!--
-  Load xterm.js + fit addon via data:base64 URLs. The browser's native
-  <script src> loader decodes and executes them in global scope — no
-  eval(), no atob() dance, no IIFE that could fail silently. If the
-  data URL fails to parse, the second script below still runs and
-  displays the fallback message (since Terminal won't be defined).
-  Data URLs on Android WebView support ~2 MB payload; our combined
-  xterm + fit is ~ 300 KB base64, well under the limit.
+  Load xterm.js + fit addon by decoding the vendored base64 in the script
+  BODY (not a src= attribute) and injecting each as a real <script> element.
+
+  Why not <script src="data:...base64,...">: that stuffs a ~386 KB payload
+  into an HTML attribute. Android WebView chokes on the oversized attribute
+  value — parsing breaks on that tag and SWALLOWS the following inline
+  bootstrap <script>, which is exactly why the boot screen froze on
+  "booting xterm.js…" with no success and no guard message.
+
+  Base64 lives safely inside a JS string literal (alphabet is [A-Za-z0-9+/=],
+  no quotes/backslashes/'</script>'), so there's nothing to escape. atob()
+  is available in every Android WebView. s.text + appendChild executes the
+  decoded UMD in global scope, defining window.Terminal / FitAddon.
 -->
-<script src="data:text/javascript;base64,${xtermBundle.xtermJsB64}"></script>
-<script src="data:text/javascript;base64,${xtermBundle.fitAddonB64}"></script>
+<script>
+(function () {
+  function post(m) {
+    try { window.ReactNativeWebView && window.ReactNativeWebView.postMessage(JSON.stringify(m)); } catch (e) {}
+  }
+  function inject(b64, name) {
+    try {
+      var s = document.createElement("script");
+      s.text = atob(b64);
+      document.head.appendChild(s);
+    } catch (e) {
+      var b = document.getElementById("boot");
+      if (b) b.innerText = "// xterm bundle failed (" + name + "): " + (e && e.message || e);
+      post({ type: "load_error", message: name + ": " + (e && e.message || e) });
+    }
+  }
+  inject("${xtermBundle.xtermJsB64}", "xterm.js");
+  inject("${xtermBundle.fitAddonB64}", "addon-fit");
+})();
+</script>
 <script>
 (function () {
   // Helper that talks back to React Native.
@@ -442,11 +466,12 @@ export default function XTermView({ sessionId, onInput, resetToken }: Props) {
   }, []);
 
   // Stable source — never recompute (would force WebView reload).
-  // baseUrl is "about:blank" now that all assets are inlined; a real
-  // origin would only matter if we were loading external <script>/<img>
-  // resources, and the CDN loads used to hang forever on tailnet-routed
-  // devices. See vendor-xterm.sh + xterm-bundle.json.
-  const source = useMemo(() => ({ html: XTERM_HTML, baseUrl: "about:blank" }), []);
+  // baseUrl is a concrete https origin (NOT "about:blank"): an opaque
+  // about:blank origin can suppress script execution / subresource
+  // access on Android WebView. A real origin lets the inline bootstrap
+  // and the injected xterm scripts run reliably. All assets are inlined
+  // (no network fetch happens), so the host never needs to resolve.
+  const source = useMemo(() => ({ html: XTERM_HTML, baseUrl: "https://localhost/" }), []);
 
   return (
     <View style={s.root} onTouchStart={focusTerm}>
