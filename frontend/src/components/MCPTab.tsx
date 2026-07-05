@@ -2134,11 +2134,14 @@ export default function MCPTab() {
                         width: 8, height: 8, borderRadius: 4,
                         backgroundColor: dotColor, marginRight: 8,
                       }} />
-                      <Text style={[s.toolName, { color: n.enabled ? C.mcpAccent : C.textDim }]}>
+                      <Text
+                        numberOfLines={1}
+                        style={[s.toolName, { flexShrink: 1, color: n.enabled ? C.mcpAccent : C.textDim }]}
+                      >
                         {n.name}
                       </Text>
                       {n.is_primary && (
-                        <View style={[s.tag, { borderColor: C.yellow, marginLeft: 6 }]}>
+                        <View style={[s.tag, { borderColor: C.yellow, marginLeft: 6, flexShrink: 0 }]}>
                           <Text style={[s.tagText, { color: C.yellow }]}>PRIMARY</Text>
                         </View>
                       )}
