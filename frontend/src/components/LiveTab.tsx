@@ -189,7 +189,10 @@ export default function LiveTab(props: Props) {
   }, []);
 
   useEffect(() => sessionManager.subscribe(() => force((n) => n + 1)), []);
-  const sessions = sessionManager.list();
+  // Full isolation: Live view only ever shows sessions IT spawned. The Kali
+  // terminal (owner:"kali") and AI agent (owner:"ai") sessions are excluded
+  // so their output never bleeds into this tab.
+  const sessions = sessionManager.list().filter((s) => s.owner === "live");
 
   // Auto-select newest running session if nothing selected
   useEffect(() => {
@@ -234,6 +237,7 @@ export default function LiveTab(props: Props) {
       command: wrapped,
       iface: ifaceForCmd,
       label: opts.label || cmd.split(/\s+/)[0],
+      owner: "live",
       forceMock: props.execMode === "mock",
     });
     sessionViewModeRef.current.set(id, opts.viewMode || "scrollback");

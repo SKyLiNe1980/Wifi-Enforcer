@@ -144,10 +144,12 @@ const XTERM_BOOT_JS = `
   };
   post({ type: "diag", stage: "inject-start", detail: "atob=" + (typeof atob) });
 
-  // Decode + execute xterm.js and the fit addon from embedded base64.
+  // Decode + execute xterm.js and the fit addon. The base64 was streamed
+  // into window.__XB / window.__FB in small chunks (Android evaluateJavascript
+  // drops payloads that are too large in a single shot).
   try {
-    var s1 = document.createElement("script"); s1.text = atob("${xtermBundle.xtermJsB64}"); document.head.appendChild(s1);
-    var s2 = document.createElement("script"); s2.text = atob("${xtermBundle.fitAddonB64}"); document.head.appendChild(s2);
+    var s1 = document.createElement("script"); s1.text = atob(window.__XB || ""); document.head.appendChild(s1);
+    var s2 = document.createElement("script"); s2.text = atob(window.__FB || ""); document.head.appendChild(s2);
   } catch (e) {
     post({ type: "load_error", message: "inject failed: " + (e && e.message || e) });
     return;
@@ -239,30 +241,11 @@ const XTERM_BOOT_JS = `
   window.termReady = true;
 
   // ── Web → RN: keystrokes ────────────────────────────────────────────
-  //
-  // On Android WebViews the soft keyboard (Samsung/Gboard/SwiftKey) does
-  // not always dispatch individual keystrokes — it uses IME composition
-  // which xterm.js interprets by reading the helper <textarea> value.
-  // In practice this leads to two failure modes we hit on the S10+:
-  //
-  //   • The textarea is never cleared between commands, so every Enter
-  //     re-sends the whole accumulated buffer ("i" → "idid" → "ididls"…).
-  //   • Local echo appears delayed / invisible while typing because IME
-  //     is still composing and hasn't dispatched anything to xterm.
-  //
-  // Fix: bypass xterm's built-in input pipeline entirely. We attach our
-  // own capture-phase listeners on the helper textarea and:
-  //   1. Handle Enter / Backspace / Tab immediately via keydown (Android
-  //      IMEs fire keydown for these reliably, even during composition).
-  //   2. On every 'input' event, compute the delta beyond the last
-  //      known value, post it to RN, and clear the textarea so nothing
-  //      accumulates.
-  //   3. Suppress xterm's own onData for typed input (paste + programmatic
-  //      writes still work through term.paste()).
-  //
-  // This preserves ANSI escape encoding for arrow / function keys (still
-  // handled by xterm's keydown → onKey → onData path for non-printable
-  // keys we didn't preventDefault on).
+  // Let xterm OWN input. It handles IME/composition natively and already
+  // encodes Enter→\\r, Backspace→\\x7f, Tab, arrows/F-keys→escape sequences,
+  // and paste. The previous hand-rolled capture-phase textarea diffing was
+  // the source of the double-char / lag / re-sent-buffer bugs — removed.
+  // We just set sane mobile IME attributes and forward term.onData.
   var textarea = term.textarea;
   if (textarea) {
     textarea.setAttribute("autocorrect", "off");
@@ -270,76 +253,8 @@ const XTERM_BOOT_JS = `
     textarea.setAttribute("spellcheck", "false");
     textarea.setAttribute("autocomplete", "off");
     textarea.setAttribute("inputmode", "text");
-
-    var lastVal = "";
-
-    textarea.addEventListener("keydown", function (e) {
-      // Enter → \r (shell newline). Prevent default so IME doesn't
-      // ALSO commit a "\n" via the input event.
-      if (e.key === "Enter" || e.keyCode === 13) {
-        e.preventDefault();
-        e.stopImmediatePropagation();
-        post({ type: "data", data: "\\r" });
-        textarea.value = "";
-        lastVal = "";
-        return;
-      }
-      // Backspace → DEL (0x7f) as most PTYs expect.
-      if (e.key === "Backspace" || e.keyCode === 8) {
-        e.preventDefault();
-        e.stopImmediatePropagation();
-        post({ type: "data", data: "\\x7f" });
-        textarea.value = "";
-        lastVal = "";
-        return;
-      }
-      // Tab → literal tab. Prevent default so focus doesn't escape.
-      if (e.key === "Tab" || e.keyCode === 9) {
-        e.preventDefault();
-        e.stopImmediatePropagation();
-        post({ type: "data", data: "\\t" });
-        textarea.value = "";
-        lastVal = "";
-        return;
-      }
-    }, true);
-
-    // Printable text via IME / regular typing. This fires per-composition
-    // update on Android, so we must diff + clear every time.
-    textarea.addEventListener("input", function (e) {
-      var v = textarea.value;
-      if (!v) return;
-      // Compute delta beyond whatever we already sent this composition.
-      var delta;
-      if (v.length > lastVal.length && v.indexOf(lastVal) === 0) {
-        delta = v.substring(lastVal.length);
-      } else {
-        // Backwards/replace/paste — send the whole buffer.
-        delta = v;
-      }
-      if (delta) {
-        post({ type: "data", data: delta });
-      }
-      // Aggressively clear so the next keystroke can't re-send old chars.
-      textarea.value = "";
-      lastVal = "";
-      // Prevent xterm's internal handler from also processing this event.
-      e.stopImmediatePropagation();
-    }, true);
-
-    // Compositionend as a safety net — some IMEs commit here without
-    // firing input.
-    textarea.addEventListener("compositionend", function () {
-      textarea.value = "";
-      lastVal = "";
-    }, true);
   }
-
-  // Non-printable keys (arrows, F-keys, Ctrl-C, etc.) still flow through
-  // xterm's onData because we did NOT preventDefault them above. Those
-  // don't go through the textarea's input event on Android.
   term.onData(function (d) {
-    // Guard: skip empty payloads that could sneak through from IME.
     if (!d) return;
     post({ type: "data", data: d });
   });
@@ -395,12 +310,34 @@ export default function XTermView({ sessionId, onInput, resetToken }: Props) {
   // ── Boot watchdog ─────────────────────────────────────────────────────
   useEffect(() => {
     let alive = true;
-    // If xterm hasn't signalled `ready` within 9s, the WebView failed to
+    // If xterm hasn't signalled `ready` within 12s, the WebView failed to
     // boot → switch to flat scrollback so it's never a dead screen.
     const t = setTimeout(() => {
       if (alive && !readyRef.current) setFallback(true);
-    }, 9000);
+    }, 12000);
     return () => { alive = false; clearTimeout(t); };
+  }, []);
+
+  // Stream the xterm/fit base64 into the WebView in small chunks, then run
+  // the boot script. Android's evaluateJavascript silently drops a single
+  // huge payload (that's why injectedJavaScript with the inlined base64
+  // never fired), but many small imperative injectJavaScript() calls work.
+  const bootedRef = useRef(false);
+  const bootXterm = useCallback(() => {
+    const web = webRef.current;
+    if (!web || bootedRef.current) return;
+    bootedRef.current = true;
+    const CHUNK = 8000;
+    web.injectJavaScript(`window.__XB="";window.__FB="";true;`);
+    const feed = (b64: string, name: string) => {
+      for (let i = 0; i < b64.length; i += CHUNK) {
+        const part = b64.slice(i, i + CHUNK);
+        web.injectJavaScript(`window.${name}+=${JSON.stringify(part)};true;`);
+      }
+    };
+    feed(xtermBundle.xtermJsB64, "__XB");
+    feed(xtermBundle.fitAddonB64, "__FB");
+    web.injectJavaScript(XTERM_BOOT_JS);
   }, []);
 
 
@@ -535,12 +472,11 @@ export default function XTermView({ sessionId, onInput, resetToken }: Props) {
         ref={webRef}
         originWhitelist={["*"]}
         source={source}
-        injectedJavaScript={XTERM_BOOT_JS}
         injectedJavaScriptBeforeContentLoaded={`try{window.ReactNativeWebView&&window.ReactNativeWebView.postMessage(JSON.stringify({type:"diag",stage:"inject-before"}));}catch(e){} true;`}
         onMessage={onMessage}
         onError={(e) => { setDiag(`webview onError: ${e?.nativeEvent?.description || ""}`); setFallback(true); }}
         onHttpError={(e) => setDiag(`http ${e?.nativeEvent?.statusCode || "?"}`)}
-        onLoadEnd={() => setDiag((d) => d || "html loaded, waiting for xterm…")}
+        onLoadEnd={() => { setDiag((d) => d || "html loaded, streaming xterm…"); bootXterm(); }}
         onRenderProcessGone={() => { setDiag("webview process gone"); setFallback(true); }}
         javaScriptEnabled
         domStorageEnabled

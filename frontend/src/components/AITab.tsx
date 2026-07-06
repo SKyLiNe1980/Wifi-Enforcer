@@ -254,6 +254,7 @@ export default function AITab(props: Props) {
       const id = await sessionManager.start({
         command: wrappedShell,
         label: selectedProfile.name,
+        owner: "ai",
       });
       setActiveSessionId(id);
       force((n) => n + 1);
