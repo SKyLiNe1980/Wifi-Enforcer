@@ -17,7 +17,29 @@ import urllib.request
 import ssl
 from pathlib import Path
 
-CACHE = Path(__file__).parent / "gtfobins_cache.json"
+# Cache location resolution. The DB ships in the package's data/ dir and is
+# installed to /opt/enforcer-mcp/data/ by build-deb.sh. This script is
+# symlinked into /usr/bin, so __file__ may be a symlink — resolve() follows
+# it to the real /opt/enforcer-mcp/scripts/ location, making the repo/deb
+# `../data/` layout resolve correctly in both dev and installed trees.
+def _cache_path() -> Path:
+    env = os.environ.get("ENFORCER_GTFOBINS_CACHE")
+    if env:
+        return Path(env)
+    here = Path(__file__).resolve().parent
+    candidates = [
+        Path("/opt/enforcer-mcp/data/gtfobins_cache.json"),
+        here.parent / "data" / "gtfobins_cache.json",  # scripts/../data
+        here / "gtfobins_cache.json",
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    # No cache yet — prefer writing next to the package data dir if present.
+    data_dir = here.parent / "data"
+    return (data_dir / "gtfobins_cache.json") if data_dir.exists() else candidates[0]
+
+CACHE = _cache_path()
 API_URL = "https://gtfobins.org/api.json"
 
 # ── Cache management ──────────────────────────────────────────
