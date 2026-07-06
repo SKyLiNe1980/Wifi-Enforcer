@@ -126,10 +126,10 @@ const XTERM_BOOT_JS = `
   // drops payloads that are too large in a single shot).
   //
   // Execute via indirect eval FIRST — many hardened Android WebViews silently
-  // refuse to run dynamically-appended <script> elements (the same reason our
-  // in-document <script> never fired), but injectedJavaScript's evaluate
-  // context CAN eval. `(0, eval)(code)` runs in global scope so the xterm/fit
-  // UMD bundles attach Terminal/FitAddon to window. Fall back to <script>
+  // refuse to run dynamically-appended script elements (the same reason our
+  // in-document scripts never fired), but injectedJavaScript's evaluate
+  // context CAN eval. Indirect eval runs in global scope so the xterm/fit
+  // UMD bundles attach Terminal/FitAddon to window. Fall back to script
   // element injection only if eval throws.
   try {
     var xbSrc = atob(window.__XB || "");
