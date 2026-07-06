@@ -1,3 +1,19 @@
+enforcer-mcp (0.3.8) unstable; urgency=medium
+
+  * New MCP tool self_update: nodes pull + install their own enforcer-node
+    .deb (deb_url or apt) and restart the service, all over the MCP
+    websocket — no more manual SSH upgrades. Cockpit MCP tab gains
+    "UPDATE ALL NODES" + per-node UPDATE actions.
+  * GTFOBins relocated: handlers/gtfobins/ -> scripts/gtfobins-mcp (now
+    symlinked into /usr/bin like wpasec-upload), cache shipped in data/.
+    Tool templates call `gtfobins-mcp --cli ...`. build-deb.sh packages
+    data/ and no longer needs the handlers-subdir copy loop.
+  * docs: APERTURE.md + packaging/aperture-connector.example.json for
+    federating this server through a Tailscale Aperture tailnet gateway.
+
+ -- enforcer-swarm <enforcer@localhost>  Sat, 06 Jul 2026 16:30:00 +0000
+
+
 enforcer-mcp (0.3.7) unstable; urgency=medium
 
   * GTFOBins integration: ships handlers/gtfobins/ with the 478-binary

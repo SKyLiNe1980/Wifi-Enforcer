@@ -43,6 +43,7 @@ import {
   type RosterEntry,
 } from "../lib/tokenStash";
 import NodesMap from "./NodesMap";
+import { callMcpTool } from "../lib/mcpClient";
 
 // Keep palette identical to the rest of the cockpit so the tab feels native.
 const C = {
@@ -830,6 +831,79 @@ export default function MCPTab() {
       refreshLists();
     }
   }, [syncToolsNow, refreshLists]);
+
+  // ─── Remote self-update over MCP ─────────────────────────────────────
+  // Invokes the node's `self_update` tool over the MCP Streamable-HTTP
+  // transport. The node pulls + installs its own .deb detached and restarts
+  // enforcer-mcp, so we just get back {status: scheduled, version_before}.
+  const updateOneNode = useCallback(async (node: MCPNode): Promise<{ ok: boolean; detail: string }> => {
+    const r = await callMcpTool({
+      host: node.host,
+      port: node.port,
+      token: node.bearer_token || undefined,
+      name: "self_update",
+      arguments: {},
+      timeoutMs: 12000,
+    });
+    if (!r.ok) return { ok: false, detail: r.error || "failed" };
+    // FastMCP wraps handler output as { content: [{ type:"text", text }], ... }.
+    // Our tool returns a JSON string in output; the internal handler result is
+    // JSON-encoded into content text. Surface the pre-upgrade version if present.
+    let detail = "update scheduled";
+    try {
+      const txt = r.result?.content?.[0]?.text ?? r.result?.output ?? "";
+      const parsed = typeof txt === "string" && txt.trim().startsWith("{") ? JSON.parse(txt) : null;
+      const inner = parsed?.output ? JSON.parse(parsed.output) : parsed;
+      if (inner?.status) {
+        detail = `${inner.status}${inner.version_before ? ` · was ${inner.version_before}` : ""}`;
+      }
+    } catch { /* best-effort parse — keep default detail */ }
+    return { ok: true, detail };
+  }, []);
+
+  const handleUpdateNode = useCallback(async (node: MCPNode) => {
+    Alert.alert(
+      `Update ${node.name}?`,
+      "The node will pull + install its latest enforcer-node .deb and restart its MCP service. It'll be briefly unreachable during the restart.",
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Update",
+          onPress: async () => {
+            const r = await updateOneNode(node);
+            Alert.alert(r.ok ? "Update triggered" : "Update failed", `${node.name}: ${r.detail}`);
+          },
+        },
+      ],
+    );
+  }, [updateOneNode]);
+
+  const handleUpdateAllNodes = useCallback(() => {
+    const targets = nodes.filter((n) => n.enabled);
+    if (targets.length === 0) {
+      Alert.alert("No nodes", "Add at least one enabled node first.");
+      return;
+    }
+    Alert.alert(
+      `Update ${targets.length} node(s)?`,
+      "Every enabled node pulls + installs its latest .deb and restarts. Nodes go briefly unreachable during restart.",
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Update all",
+          onPress: async () => {
+            const results = await Promise.all(
+              targets.map(async (n) => {
+                const r = await updateOneNode(n);
+                return `${r.ok ? "✓" : "✗"} ${n.name}: ${r.detail}`;
+              }),
+            );
+            Alert.alert("Self-update results", results.join("\n"));
+          },
+        },
+      ],
+    );
+  }, [nodes, updateOneNode]);
 
 
   // ─── Tier 1 deploy state ────────────────────────────────────────────
@@ -2111,6 +2185,17 @@ export default function MCPTab() {
                 PUSH .DEB TO CLOUD
               </Text>
             </TouchableOpacity>
+            <TouchableOpacity
+              style={[s.btn, { flexGrow: 1, flexBasis: "47%", backgroundColor: C.panel2, borderColor: C.yellow }]}
+              disabled={nodes.length === 0}
+              onPress={handleUpdateAllNodes}
+            >
+              <MaterialCommunityIcons name="update" size={14}
+                color={nodes.length ? C.yellow : C.textDim} />
+              <Text style={[s.btnText, { color: nodes.length ? C.yellow : C.textDim }]}>
+                UPDATE ALL NODES
+              </Text>
+            </TouchableOpacity>
           </View>
 
           <Text style={[s.sectionTitle, { marginBottom: 10 }]}>{"// nodes map"}</Text>
@@ -2532,6 +2617,15 @@ export default function MCPTab() {
                   <Text style={[s.smallBtnText, {
                     color: (!n.bearer_token || health !== "running") ? C.textDim : C.cyan,
                   }]}>SYNC TOOLS</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[s.smallBtn, { borderColor: C.yellow }]}
+                  onPress={() => { setMapSheetNode(null); handleUpdateNode(n); }}
+                  disabled={health !== "running"}
+                >
+                  <Text style={[s.smallBtnText, {
+                    color: health !== "running" ? C.textDim : C.yellow,
+                  }]}>UPDATE</Text>
                 </TouchableOpacity>
                 <TouchableOpacity
                   style={[s.smallBtn, { borderColor: C.mcpAccent }]}
