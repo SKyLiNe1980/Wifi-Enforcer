@@ -51,29 +51,6 @@ type Props = {
 };
 
 /**
- * Collapse runs of ≥2 consecutive empty strings down to a single empty
- * string. Rationale: the native line-splitter emits an entry for every
- * `\n` in the PTY byte stream, including the ones zsh sprinkles for
- * aesthetic vertical spacing around its prompt and the ones inside
- * bracketed-paste toggles. Rejoining them naively produces walls of
- * blank vertical space between commands (5+ blank rows was the
- * observed baseline on Kali's default zsh setup). We preserve single
- * intentional blank lines (harmless) but cap consecutive-empty runs at
- * one so the terminal reads like an actual terminal.
- */
-function collapseBlankRuns(lines: string[]): string[] {
-  const out: string[] = [];
-  let prevEmpty = false;
-  for (const l of lines) {
-    const isEmpty = l.length === 0;
-    if (isEmpty && prevEmpty) continue; // drop
-    out.push(l);
-    prevEmpty = isEmpty;
-  }
-  return out;
-}
-
-/**
  * Strip ANSI/VT escape sequences (SGR colors, cursor moves, OSC titles,
  * bracketed-paste, charset selects, and lone control bytes) so the flat
  * scrollback fallback shows clean readable text instead of raw `[0m[01;34m`
@@ -228,6 +205,20 @@ const XTERM_BOOT_JS = `
   window.termWrite = function (data) {
     try { term.write(data); } catch (e) {}
   };
+  // Raw byte path: RN sends the native PTY chunk as base64. We decode it to
+  // a Uint8Array and hand xterm the exact bytes — xterm does its own
+  // incremental UTF-8 decode and buffers partial multi-byte sequences across
+  // calls, so \r cursor-resets, ANSI colors and full-screen TUIs render
+  // correctly (unlike the old line-joined text path).
+  window.termWriteB64 = function (b64) {
+    try {
+      var bin = atob(b64);
+      var len = bin.length;
+      var u8 = new Uint8Array(len);
+      for (var i = 0; i < len; i++) u8[i] = bin.charCodeAt(i);
+      term.write(u8);
+    } catch (e) {}
+  };
   window.termWriteln = function (data) {
     try { term.writeln(data); } catch (e) {}
   };
@@ -279,32 +270,40 @@ export default function XTermView({ sessionId, onInput, resetToken }: Props) {
   const fbScrollRef = useRef<ScrollView>(null);
   // Diagnostic line surfaced from the WebView (why xterm did/didn't boot).
   const [diag, setDiag] = useState<string>("");
-  // Buffer writes that arrive before the WebView has finished loading
-  // xterm.js — flushed once we get the `ready` message.
+  // Buffer raw base64 chunks that arrive before the WebView has finished
+  // loading xterm.js — flushed once we get the `ready` message.
   const pendingRef = useRef<string[]>([]);
-  // The last line_no we've forwarded to the terminal; we only ever push
-  // forward (never re-write older lines) so the terminal sees a clean
-  // append-only byte stream.
-  const lastLineNoRef = useRef<number>(0);
+  // Mirror sessionId / fallback into refs so the stable onMessage callback
+  // can read them without being re-created (which would re-mount listeners).
+  const sessionIdRef = useRef<string | null>(sessionId);
+  sessionIdRef.current = sessionId;
+  const fallbackRef = useRef<boolean>(false);
 
-  // Track whether we've ever written anything so the very first fresh
-  // batch doesn't get a spurious leading blank line (there's nothing to
-  // separate FROM if the initial replay was empty).
-  const hasWrittenRef = useRef<boolean>(false);
-
-  // ── RN → Web: write bytes ─────────────────────────────────────────────
-  const writeToTerm = useCallback((data: string) => {
-    if (!data) return;
-    // JSON.stringify gives us a JS-safe quoted string with escapes intact —
-    // CRITICAL for preserving \x1b (ESC) and other control bytes when we
-    // bake the data into a JS snippet for injectJavaScript.
-    const encoded = JSON.stringify(data);
+  // ── RN → Web: write raw PTY bytes ─────────────────────────────────────
+  // Native relays the exact PTY byte stream as base64; we forward it as-is
+  // to the WebView which decodes + term.write()s the bytes. No line joining,
+  // no \r\n synthesis, no blank-run collapsing — the terminal emulator owns
+  // interpretation, which is the whole point of a true PTY relay.
+  const writeRawB64 = useCallback((b64: string) => {
+    if (!b64) return;
+    const encoded = JSON.stringify(b64);
     if (readyRef.current && webRef.current) {
-      webRef.current.injectJavaScript(`window.termWrite && window.termWrite(${encoded}); true;`);
-      hasWrittenRef.current = true;
+      webRef.current.injectJavaScript(`window.termWriteB64 && window.termWriteB64(${encoded}); true;`);
     } else {
-      pendingRef.current.push(data);
+      pendingRef.current.push(b64);
     }
+  }, []);
+
+  // Flip to the flat scrollback fallback (xterm failed to boot / crashed)
+  // and prime it with whatever text we've derived so far.
+  const enterFallback = useCallback(() => {
+    fallbackRef.current = true;
+    const sid = sessionIdRef.current;
+    if (sid) {
+      const s = sessionManager.sessions.get(sid);
+      if (s) setFbLines(s.lines.map((l) => l.line).join("\n"));
+    }
+    setFallback(true);
   }, []);
 
   // ── Boot watchdog ─────────────────────────────────────────────────────
@@ -313,10 +312,10 @@ export default function XTermView({ sessionId, onInput, resetToken }: Props) {
     // If xterm hasn't signalled `ready` within 12s, the WebView failed to
     // boot → switch to flat scrollback so it's never a dead screen.
     const t = setTimeout(() => {
-      if (alive && !readyRef.current) setFallback(true);
+      if (alive && !readyRef.current) enterFallback();
     }, 12000);
     return () => { alive = false; clearTimeout(t); };
-  }, []);
+  }, [enterFallback]);
 
   // Stream the xterm/fit base64 into the WebView in small chunks, then run
   // the boot script. Android's evaluateJavascript silently drops a single
@@ -342,41 +341,29 @@ export default function XTermView({ sessionId, onInput, resetToken }: Props) {
 
 
   useEffect(() => {
-    if (!sessionId) {
-      lastLineNoRef.current = 0;
-      hasWrittenRef.current = false;
-      return;
-    }
-    // Replay whatever the session already has in its ring buffer (it may
-    // have been running before the user switched tabs back to AI).
+    if (!sessionId) return;
+    // Replay the raw byte scrollback so a tab-switch re-mount restores the
+    // screen (the session keeps running in the background; only the WebView
+    // was torn down). Each chunk is written as its own decode+write so
+    // independently-base64'd chunks don't need to be concatenation-valid.
+    const log = sessionManager.getRawLog(sessionId);
+    for (const c of log) writeRawB64(c.b64);
+    // Prime the flat fallback text once.
     const s0 = sessionManager.sessions.get(sessionId);
-    if (s0 && s0.lines.length) {
-      const initial = collapseBlankRuns(s0.lines.map((l) => l.line)).join("\r\n");
-      writeToTerm(initial);
-      setFbLines(collapseBlankRuns(s0.lines.map((l) => l.line)).join("\n"));
-      lastLineNoRef.current = s0.lineCount;
-    } else {
-      setFbLines("");
-      lastLineNoRef.current = 0;
-    }
+    if (s0) setFbLines(s0.lines.map((l) => l.line).join("\n"));
 
+    // Live: forward every new raw chunk straight into xterm.
+    const unsubRaw = sessionManager.subscribeRaw(sessionId, (b64) => writeRawB64(b64));
+    // Keep the flat fallback in sync — but only pay the join cost when the
+    // fallback view is actually active (xterm failed to boot).
     const unsub = sessionManager.subscribe(() => {
+      if (!fallbackRef.current) return;
       const s = sessionManager.sessions.get(sessionId);
-      if (!s) return;
-      if (s.lineCount <= lastLineNoRef.current) return;
-      const fresh = s.lines.filter((l) => l.line_no > lastLineNoRef.current);
-      if (fresh.length) {
-        const prefix = hasWrittenRef.current ? "\r\n" : "";
-        const chunk = prefix + collapseBlankRuns(fresh.map((l) => l.line)).join("\r\n");
-        writeToTerm(chunk);
-        // Keep the flat scrollback (fallback view) in sync too.
-        setFbLines(collapseBlankRuns(s.lines.map((l) => l.line)).join("\n"));
-      }
-      lastLineNoRef.current = s.lineCount;
+      if (s) setFbLines(s.lines.map((l) => l.line).join("\n"));
     });
-    return unsub;
-    // resetToken intentionally in deps so a new session swaps the
-    // subscription. writeToTerm is stable (memoized).
+    return () => { unsubRaw(); unsub(); };
+    // resetToken in deps so a new session swaps the subscription.
+    // writeRawB64 is stable (memoized).
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId, resetToken]);
 
@@ -392,12 +379,24 @@ export default function XTermView({ sessionId, onInput, resetToken }: Props) {
     if (msg.type === "ready") {
       readyRef.current = true;
       setDiag(`xterm ready · ${msg.cols}x${msg.rows}`);
-      // Flush anything that arrived before the WebView booted xterm.
+      // Flush raw chunks that arrived before xterm booted — one decode+write
+      // per chunk (they were independently base64-encoded by native).
       if (pendingRef.current.length && webRef.current) {
-        const buf = pendingRef.current.join("");
+        const buf = pendingRef.current;
         pendingRef.current = [];
-        const encoded = JSON.stringify(buf);
-        webRef.current.injectJavaScript(`window.termWrite && window.termWrite(${encoded}); true;`);
+        for (const b64 of buf) {
+          webRef.current.injectJavaScript(`window.termWriteB64 && window.termWriteB64(${JSON.stringify(b64)}); true;`);
+        }
+      }
+      // Tell the PTY our real size right away.
+      if (sessionIdRef.current && msg.cols && msg.rows) {
+        sessionManager.resize(sessionIdRef.current, msg.cols, msg.rows);
+      }
+    } else if (msg.type === "resize") {
+      // xterm re-fit (rotation / keyboard / layout). Reflow the PTY so
+      // full-screen apps and prompt wrapping match the visible width.
+      if (sessionIdRef.current && msg.cols && msg.rows) {
+        sessionManager.resize(sessionIdRef.current, msg.cols, msg.rows);
       }
     } else if (msg.type === "data") {
       // Raw keystroke (already a properly-encoded escape sequence for
@@ -474,10 +473,10 @@ export default function XTermView({ sessionId, onInput, resetToken }: Props) {
         source={source}
         injectedJavaScriptBeforeContentLoaded={`try{window.ReactNativeWebView&&window.ReactNativeWebView.postMessage(JSON.stringify({type:"diag",stage:"inject-before"}));}catch(e){} true;`}
         onMessage={onMessage}
-        onError={(e) => { setDiag(`webview onError: ${e?.nativeEvent?.description || ""}`); setFallback(true); }}
+        onError={(e) => { setDiag(`webview onError: ${e?.nativeEvent?.description || ""}`); enterFallback(); }}
         onHttpError={(e) => setDiag(`http ${e?.nativeEvent?.statusCode || "?"}`)}
         onLoadEnd={() => { setDiag((d) => d || "html loaded, streaming xterm…"); bootXterm(); }}
-        onRenderProcessGone={() => { setDiag("webview process gone"); setFallback(true); }}
+        onRenderProcessGone={() => { setDiag("webview process gone"); enterFallback(); }}
         javaScriptEnabled
         domStorageEnabled
         automaticallyAdjustContentInsets={false}

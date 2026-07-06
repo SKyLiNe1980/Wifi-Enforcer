@@ -1,0 +1,35 @@
+{
+  "//": "Tailscale Aperture config snippet — federates enforcer-mcp into the tailnet MCP gateway.",
+  "//1": "Paste these blocks into your Aperture config (Settings page / config file). Merge with any existing flags/connectors/grants — don't overwrite them.",
+  "//2": "After applying, connect an MCP client to http://enforcer.tailf5f9bc.ts.net/v1/mcp and list tools; enforcer-mcp tools appear prefixed, e.g. enforcer_self_update, enforcer_start_session, enforcer_gtfobins_lookup.",
+
+  "flags": {
+    "connectors": { "value": true }
+  },
+
+  "connectors": {
+    "servers": {
+      "enforcer": {
+        "protocol": "mcp",
+        "description": "Enforcer NetHunter cockpit — root shell, PTY sessions, attack profiles, GTFOBins, remote self-update.",
+        "context": "Wi-Fi pentest rig running inside a Kali NetHunter chroot. Use start_session/write_stdin/read_session for interactive PTY tools (airodump-ng, wifite, tcpdump), gtfobins_* for living-off-the-land triage, and self_update to push a .deb upgrade to the node.",
+        "url": "http://enforcer-cockpit.tailf5f9bc.ts.net:8765/mcp",
+        "auth": {
+          "type": "bearer_token",
+          "secret": "REPLACE_WITH_64_HEX_CHARS_FROM_COCKPIT_MCP_TAB"
+        }
+      }
+    }
+  },
+
+  "grants": [
+    {
+      "src": ["*"],
+      "app": {
+        "tailscale.com/cap/aperture": [
+          { "connectors": ["enforcer/**"] }
+        ]
+      }
+    }
+  ]
+}

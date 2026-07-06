@@ -14,7 +14,12 @@ a module-level singleton so we don't need a parallel signature.
 from __future__ import annotations
 
 import json
+import os
+import shlex
+import shutil
 import sqlite3
+import stat
+import subprocess
 from typing import Any, Awaitable, Callable, Dict, List
 
 from .sessions import get_session_manager
@@ -167,6 +172,96 @@ async def _resize_session(args: Dict[str, Any], conn: sqlite3.Connection) -> Dic
         return _err(e)
 
 
+# ─── Self-update — remote .deb upgrade over MCP ───────────────────────
+# Lets the cockpit trigger a node to pull + install its own enforcer-node
+# .deb update over the MCP websocket, eliminating manual SSH upgrades.
+# The install must outlive THIS process (dpkg restarts enforcer-mcp), so we
+# stage a detached updater script and return immediately with the current
+# version + a log path the operator can tail. The node's MCP server runs as
+# root under systemd, so dpkg/apt/systemctl work without sudo; we fall back
+# to `sudo -n` when not uid 0 just in case.
+
+UPDATE_LOG = "/tmp/enforcer-self-update.log"
+UPDATE_SCRIPT = "/tmp/enforcer-self-update.sh"
+
+
+def _dpkg_version(pkg: str) -> str:
+    """Installed version of `pkg`, or '' if not installed / dpkg missing."""
+    try:
+        out = subprocess.run(
+            ["dpkg-query", "-W", "-f=${Version}", pkg],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=10,
+        )
+        return (out.stdout or "").strip() if out.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+async def _self_update(args: Dict[str, Any], conn: sqlite3.Connection) -> Dict[str, Any]:
+    pkg = str(args.get("package", "enforcer-node")).strip() or "enforcer-node"
+    deb_url = str(args.get("deb_url", "") or os.environ.get("ENFORCER_UPDATE_URL", "")).strip()
+    # apt mode = upgrade from a configured apt repo. Default when no deb_url.
+    use_apt = bool(args.get("apt", not deb_url))
+    restart = bool(args.get("restart", True))
+
+    if not deb_url and not use_apt:
+        return {"status": "error", "detail": "no deb_url provided and apt mode disabled"}
+
+    sudo = "" if os.geteuid() == 0 else "sudo -n "
+    restart_line = f"{sudo}systemctl restart enforcer-mcp || true\n" if restart else ""
+
+    if deb_url:
+        fetch = (
+            f'tmp="$(mktemp /tmp/{pkg}.XXXXXX.deb)"\n'
+            f'curl -fsSL {shlex.quote(deb_url)} -o "$tmp" || wget -qO "$tmp" {shlex.quote(deb_url)}\n'
+            f'{sudo}dpkg -i "$tmp" || {sudo}apt-get -f install -y\n'
+            f'rm -f "$tmp"\n'
+        )
+        mode = "deb_url"
+    else:
+        fetch = (
+            f"{sudo}apt-get update\n"
+            f"{sudo}apt-get install -y --only-upgrade {shlex.quote(pkg)}\n"
+        )
+        mode = "apt"
+
+    script = (
+        "#!/bin/bash\n"
+        "set -x\n"
+        "sleep 2   # let the MCP response flush before dpkg restarts us\n"
+        f"exec >>{shlex.quote(UPDATE_LOG)} 2>&1\n"
+        f'echo "=== enforcer self-update $(date -u +%FT%TZ) mode={mode} ==="\n'
+        f"{fetch}"
+        f"{restart_line}"
+        'echo "=== self-update done ==="\n'
+    )
+
+    ver_before = _dpkg_version(pkg)
+    try:
+        with open(UPDATE_SCRIPT, "w", encoding="utf-8") as fh:
+            fh.write(script)
+        os.chmod(UPDATE_SCRIPT, os.stat(UPDATE_SCRIPT).st_mode | stat.S_IEXEC)
+        bash = shutil.which("bash") or "/bin/bash"
+        # Detached session so it survives this process being restarted by dpkg.
+        subprocess.Popen(
+            [bash, UPDATE_SCRIPT],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, start_new_session=True,
+        )
+    except Exception as e:
+        return _err(e)
+
+    return {
+        "status": "scheduled",
+        "package": pkg,
+        "mode": mode,
+        "version_before": ver_before,
+        "restart": restart,
+        "log_path": UPDATE_LOG,
+        "note": "update runs detached; service will restart. poll /health or version after ~30s.",
+    }
+
+
 Handler = Callable[[Dict[str, Any], sqlite3.Connection], Awaitable[Dict[str, Any]]]
 
 INTERNAL_HANDLERS: Dict[str, Handler] = {
@@ -180,4 +275,6 @@ INTERNAL_HANDLERS: Dict[str, Handler] = {
     "stop_session": _stop_session,
     "list_sessions": _list_sessions,
     "resize_session": _resize_session,
+    # Remote self-update — pull + install this node's own .deb over MCP
+    "self_update": _self_update,
 }

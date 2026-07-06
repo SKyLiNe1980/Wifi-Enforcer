@@ -1,5 +1,6 @@
 package com.wifienforcer.rootshell
 
+import android.util.Base64
 import android.util.Log
 import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.ReactApplicationContext
@@ -9,6 +10,7 @@ import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.WritableMap
 import com.facebook.react.modules.core.DeviceEventManagerModule
 import java.io.BufferedReader
+import java.io.ByteArrayOutputStream
 import java.io.DataOutputStream
 import java.io.InputStream
 import java.io.InputStreamReader
@@ -64,15 +66,24 @@ class RootShellModule(private val reactContext: ReactApplicationContext) :
         val lineCount: AtomicInteger = AtomicInteger(0),
         var ended: Boolean = false,
         // ----------------------------------------------------------------
-        // BATCHING BUFFERS — accumulate lines on the reader threads and
-        // flush as a single RootShell.lines event every ~80ms (or eagerly
-        // at 250-line high-watermark). Without this, `dmesg -k` (and any
-        // tool that bursts thousands of lines/sec) drives the RN bridge
-        // serializer at 100% CPU on the JS thread → ANR → app killed.
-        // See crash log 2026-05-29 23:21:34: 184% CPU, 200k page faults.
+        // RAW BYTE BUFFERS — accumulate the exact PTY byte stream on the
+        // reader threads and flush as a single base64 RootShell.chunk event
+        // every ~80ms (or eagerly at a 64 KiB high-watermark). We MUST NOT
+        // use BufferedReader.readLine() here: it strips carriage returns
+        // (`\r`) and invents line boundaries, which destroys zsh/p10k prompt
+        // redraws and full-screen TUI apps (vim/htop). A true PTY relay has
+        // to transmit raw bytes so xterm.js can interpret the cursor/escape
+        // sequences itself. Batching still bounds the RN bridge cost on
+        // dmesg-style bursts (see crash log 2026-05-29: 184% CPU → ANR).
         // ----------------------------------------------------------------
-        val stdoutBuf: ArrayList<String> = ArrayList(256),
-        val stderrBuf: ArrayList<String> = ArrayList(64),
+        val stdoutBytes: ByteArrayOutputStream = ByteArrayOutputStream(8192),
+        val stderrBytes: ByteArrayOutputStream = ByteArrayOutputStream(2048),
+        // PID-marker preamble parser state (stdout only). Before the first
+        // `__WE_PID__<pid>\n` line is consumed we buffer stdout here so we
+        // can strip that marker line before forwarding real output. `exec`
+        // hands the pipe off to the user's command afterward.
+        val preamble: ByteArrayOutputStream = ByteArrayOutputStream(64),
+        var pidCaptured: Boolean = false,
     )
 
     private val sessions = ConcurrentHashMap<String, Session>()
@@ -108,39 +119,40 @@ class RootShellModule(private val reactContext: ReactApplicationContext) :
     }
 
     private fun flushSession(s: Session) {
-        val outBatch: ArrayList<String>? = synchronized(s.stdoutBuf) {
-            if (s.stdoutBuf.isEmpty()) null
+        val outBatch: ByteArray? = synchronized(s.stdoutBytes) {
+            if (s.stdoutBytes.size() == 0) null
             else {
-                val copy = ArrayList(s.stdoutBuf)
-                s.stdoutBuf.clear()
+                val copy = s.stdoutBytes.toByteArray()
+                s.stdoutBytes.reset()
                 copy
             }
         }
-        val errBatch: ArrayList<String>? = synchronized(s.stderrBuf) {
-            if (s.stderrBuf.isEmpty()) null
+        val errBatch: ByteArray? = synchronized(s.stderrBytes) {
+            if (s.stderrBytes.size() == 0) null
             else {
-                val copy = ArrayList(s.stderrBuf)
-                s.stderrBuf.clear()
+                val copy = s.stderrBytes.toByteArray()
+                s.stderrBytes.reset()
                 copy
             }
         }
-        if (outBatch != null) emitLineBatch(s, "stdout", outBatch)
-        if (errBatch != null) emitLineBatch(s, "stderr", errBatch)
+        if (outBatch != null) emitChunk(s, "stdout", outBatch)
+        if (errBatch != null) emitChunk(s, "stderr", errBatch)
     }
 
-    private fun emitLineBatch(s: Session, label: String, lines: List<String>) {
+    /**
+     * Emit a raw byte chunk to JS, base64-encoded. Base64 (not putString on a
+     * decoded String) is deliberate: the PTY byte stream can contain partial
+     * multi-byte UTF-8 sequences at chunk boundaries and arbitrary control
+     * bytes; base64 round-trips them losslessly so xterm.js can do its own
+     * incremental UTF-8 decoding on the JS/WebView side.
+     */
+    private fun emitChunk(s: Session, label: String, bytes: ByteArray) {
         val m = Arguments.createMap()
         m.putString("sessionId", s.id)
         m.putString("stream", label)
-        val arr = Arguments.createArray()
-        for (l in lines) arr.pushString(l)
-        m.putArray("lines", arr)
-        m.putInt("count", lines.size)
-        // The cumulative line counter at the END of this batch — JS can use
-        // (toLineNo - count + 1)..toLineNo to reconstruct individual line_no
-        // values if it needs them. Cheaper than putting an Int per line.
-        m.putInt("toLineNo", s.lineCount.get())
-        emit(EVT_LINES, m)
+        m.putString("dataB64", Base64.encodeToString(bytes, Base64.NO_WRAP))
+        m.putInt("bytes", bytes.size)
+        emit(EVT_CHUNK, m)
     }
 
     private fun emit(event: String, params: WritableMap) {
@@ -284,10 +296,10 @@ class RootShellModule(private val reactContext: ReactApplicationContext) :
             stdin.writeBytes("exec $command\n")
             stdin.flush()
 
-            // Line-reader threads
-            Thread({ readStreamLines(session, proc.inputStream, "stdout") },
+            // Raw byte-stream reader threads (one per fd). See readStreamRaw.
+            Thread({ readStreamRaw(session, proc.inputStream, "stdout") },
                 "rootshell-stdout-$sessionId").start()
-            Thread({ readStreamLines(session, proc.errorStream, "stderr") },
+            Thread({ readStreamRaw(session, proc.errorStream, "stderr") },
                 "rootshell-stderr-$sessionId").start()
 
             // Waiter
@@ -323,43 +335,84 @@ class RootShellModule(private val reactContext: ReactApplicationContext) :
         }
     }
 
-    private fun readStreamLines(session: Session, stream: InputStream, label: String) {
+    /**
+     * Read a raw byte stream and relay it verbatim to JS in batched base64
+     * chunks. Preserves every byte — `\r`, `\n`, ESC sequences — so xterm.js
+     * renders true PTY output (prompt redraws, colors, TUI apps) instead of
+     * the mangled line-reconstructed text the old readLine() path produced.
+     *
+     * On stdout, before the `__WE_PID__<pid>\n` marker line is consumed, we
+     * buffer bytes into `session.preamble` and strip that line so it never
+     * reaches the terminal. Everything after the marker's newline is real
+     * output. The marker may arrive split across reads — the preamble
+     * accumulates until a newline shows up.
+     */
+    private fun readStreamRaw(session: Session, stream: InputStream, label: String) {
+        val target = if (label == "stdout") session.stdoutBytes else session.stderrBytes
+        val buf = ByteArray(4096)
         try {
-            val reader = BufferedReader(InputStreamReader(stream))
-            var line = reader.readLine()
-            val buf = if (label == "stdout") session.stdoutBuf else session.stderrBuf
-            while (line != null) {
-                // Intercept the PID marker on stdout — always single-emit so JS
-                // sees it ASAP and can store the PID for killSession().
-                if (label == "stdout" && session.pid == null && line.startsWith("__WE_PID__")) {
-                    session.pid = line.removePrefix("__WE_PID__").trim().toIntOrNull()
-                    val m = Arguments.createMap()
-                    m.putString("sessionId", session.id)
-                    m.putInt("pid", session.pid ?: -1)
-                    emit(EVT_PID, m)
-                } else {
-                    session.lineCount.incrementAndGet()
-                    var eagerFlush = false
-                    synchronized(buf) {
-                        buf.add(line)
-                        if (buf.size >= FLUSH_HIGH_WATERMARK) eagerFlush = true
+            while (true) {
+                val n = stream.read(buf)
+                if (n < 0) break
+                if (n == 0) continue
+
+                if (label == "stdout" && !session.pidCaptured) {
+                    session.preamble.write(buf, 0, n)
+                    val pre = session.preamble.toByteArray()
+                    var nl = -1
+                    for (i in pre.indices) { if (pre[i] == '\n'.code.toByte()) { nl = i; break } }
+                    if (nl < 0) continue  // marker line not complete yet
+                    val lineStr = String(pre, 0, nl, Charsets.UTF_8)
+                    val markerIdx = lineStr.indexOf("__WE_PID__")
+                    if (markerIdx >= 0) {
+                        session.pid = lineStr.substring(markerIdx + "__WE_PID__".length).trim().toIntOrNull()
+                        val m = Arguments.createMap()
+                        m.putString("sessionId", session.id)
+                        m.putInt("pid", session.pid ?: -1)
+                        emit(EVT_PID, m)
+                        // Forward anything AFTER the marker's newline as output.
+                        val remStart = nl + 1
+                        val remLen = pre.size - remStart
+                        if (remLen > 0) appendChunk(session, target, label, pre, remStart, remLen)
+                    } else {
+                        // No marker — unexpected, but forward the whole preamble
+                        // verbatim so nothing is silently dropped.
+                        appendChunk(session, target, label, pre, 0, pre.size)
                     }
-                    if (eagerFlush) {
-                        // Drain THIS stream only — don't drag the other one's
-                        // batch boundary along; they're independent fds.
-                        val drained: ArrayList<String> = synchronized(buf) {
-                            val copy = ArrayList(buf)
-                            buf.clear()
-                            copy
-                        }
-                        if (drained.isNotEmpty()) emitLineBatch(session, label, drained)
-                    }
+                    session.pidCaptured = true
+                    session.preamble.reset()
+                    continue
                 }
-                line = reader.readLine()
+
+                appendChunk(session, target, label, buf, 0, n)
             }
         } catch (e: Exception) {
             // stream closed — normal on process exit
             Log.d(TAG, "reader($label) for ${session.id} closed: ${e.message}")
+        }
+    }
+
+    /**
+     * Append bytes to a session's raw batch buffer, eager-flushing that
+     * stream alone if it crosses the byte high-watermark (bounds peak memory
+     * on dmesg-style bursts). The scheduled 80ms flusher drains the rest.
+     */
+    private fun appendChunk(
+        session: Session, target: ByteArrayOutputStream, label: String,
+        data: ByteArray, off: Int, len: Int,
+    ) {
+        var eagerFlush = false
+        synchronized(target) {
+            target.write(data, off, len)
+            if (target.size() >= FLUSH_HIGH_WATERMARK_BYTES) eagerFlush = true
+        }
+        if (eagerFlush) {
+            val drained: ByteArray = synchronized(target) {
+                val copy = target.toByteArray()
+                target.reset()
+                copy
+            }
+            if (drained.isNotEmpty()) emitChunk(session, label, drained)
         }
     }
 
@@ -467,6 +520,41 @@ class RootShellModule(private val reactContext: ReactApplicationContext) :
         }, "rootshell-stdin-$sessionId").start()
     }
 
+    /**
+     * Resize the session's PTY to match xterm's dimensions. The interactive
+     * shell runs under util-linux `script`, which owns the pty; we can't
+     * ioctl(TIOCSWINSZ) it directly from Kotlin, so we send `stty` down the
+     * shell's stdin. The kernel then sets the winsize and delivers SIGWINCH
+     * to the foreground process group — so vim/htop/zsh reflow to the real
+     * width instead of assuming 80 columns. Sent on a worker thread; may
+     * echo a single `stty` line if the user is at a bare prompt (the prompt
+     * reprints), so callers should debounce and only send on real changes.
+     */
+    @ReactMethod
+    fun resizeSession(sessionId: String, cols: Int, rows: Int, promise: Promise) {
+        val session = sessions[sessionId]
+        if (session == null || session.ended) {
+            promise.resolve(false)
+            return
+        }
+        val c = if (cols in 1..1000) cols else 80
+        val r = if (rows in 1..1000) rows else 24
+        Thread({
+            try {
+                val payload = "stty cols $c rows $r 2>/dev/null\n"
+                val out = session.proc.outputStream
+                synchronized(out) {
+                    out.write(payload.toByteArray(Charsets.UTF_8))
+                    out.flush()
+                }
+                promise.resolve(true)
+            } catch (e: Exception) {
+                Log.w(TAG, "resizeSession failed for $sessionId", e)
+                promise.resolve(false)
+            }
+        }, "rootshell-resize-$sessionId").start()
+    }
+
     // ------------------------------------------------------------------
     // RN NativeEventEmitter stubs — declared LAST as a defensive measure.
     // ------------------------------------------------------------------
@@ -482,17 +570,17 @@ class RootShellModule(private val reactContext: ReactApplicationContext) :
 
     companion object {
         private const val TAG = "RootShell"
-        const val EVT_LINE = "RootShell.line"          // legacy single-line — no longer emitted by readStreamLines; kept for back-compat
-        const val EVT_LINES = "RootShell.lines"        // batched lines event — preferred
+        const val EVT_LINE = "RootShell.line"          // legacy single-line — no longer emitted; kept for back-compat
+        const val EVT_LINES = "RootShell.lines"        // legacy batched-lines — no longer emitted; kept for back-compat
+        const val EVT_CHUNK = "RootShell.chunk"        // raw base64 byte chunk — the PTY relay path (preferred)
         const val EVT_EXIT = "RootShell.exit"
         const val EVT_ERROR = "RootShell.error"
         const val EVT_PID = "RootShell.pid"
         // Tuning knobs for the output batcher. Drains every 80ms, OR eagerly when a
-        // single stream's buffer hits 250 lines (whichever comes first). 250 lines
-        // is roughly one screen of dense terminal output; 80ms is 12 Hz which is
-        // below the 16ms-per-frame budget so we never block the JS thread for a
-        // visible-stutter duration.
+        // single stream's raw buffer hits 64 KiB (whichever comes first). 80ms is
+        // 12 Hz which is below the 16ms-per-frame budget so we never block the JS
+        // thread for a visible-stutter duration.
         const val FLUSH_INTERVAL_MS = 80L
-        const val FLUSH_HIGH_WATERMARK = 250
+        const val FLUSH_HIGH_WATERMARK_BYTES = 64 * 1024
     }
 }

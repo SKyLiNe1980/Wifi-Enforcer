@@ -10,7 +10,7 @@
  * (e.g. airodump on wlan2, tcpdump on wlan3, wifite on wlan4) can run
  * simultaneously.
  */
-import { startStream, killStream, hasNativeStreaming, writeStdin } from "./rootShell";
+import { startStream, killStream, hasNativeStreaming, writeStdin, resizeSession } from "./rootShell";
 
 export type LineRecord = {
   stream: "stdout" | "stderr";
@@ -32,15 +32,58 @@ export type SessionState = {
   /** Which tab owns this session — enforces full isolation between the
    *  Kali terminal / Live view / AI agent so their streams never mix. */
   owner?: "kali" | "live" | "ai";
-  lines: LineRecord[];        // ring buffer
+  lines: LineRecord[];        // ring buffer (derived from raw chunks — for Live/flat views + backend)
   lineCount: number;          // total lines ever (including dropped from ring)
   errorMessage?: string;
   mocked: boolean;
+  /** Raw PTY byte chunks (base64, native order) kept for xterm re-mount
+   *  replay. Bounded by RAW_LOG_MAX_BYTES; oldest chunks drop first. Not
+   *  used by the flat/Live views — those read `lines`. */
+  rawLog?: { stream: "stdout" | "stderr"; b64: string; bytes: number }[];
+  rawLogBytes?: number;
+  /** Partial (un-terminated) line carried across chunks while deriving
+   *  `lines` from the raw byte stream. Latin1/binary string. */
+  partial?: string;
+  /** Last PTY size we told native, so resize() can dedupe. */
+  ptyCols?: number;
+  ptyRows?: number;
 };
+
+/** Callback for raw base64 chunk delivery — the xterm.js render path. */
+type RawListener = (b64: string, stream: "stdout" | "stderr") => void;
 
 type Listener = () => void;
 
+// Base64 → binary (Latin1) string. RN Hermes exposes a global atob; fall
+// back to a tiny decoder so line-derivation works everywhere. We keep the
+// result as a byte-preserving binary string (each char code = one byte) so
+// splitting on '\n' (0x0a) and trimming '\r' (0x0d) is exact.
+const B64_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+function b64ToBinary(b64: string): string {
+  const g: any = globalThis as any;
+  if (typeof g.atob === "function") {
+    try { return g.atob(b64); } catch { /* fall through */ }
+  }
+  let out = "";
+  let buffer = 0;
+  let bits = 0;
+  for (let i = 0; i < b64.length; i++) {
+    const c = b64.charCodeAt(i);
+    if (c === 61) break; // '='
+    const v = B64_CHARS.indexOf(b64[i]);
+    if (v < 0) continue;
+    buffer = (buffer << 6) | v;
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      out += String.fromCharCode((buffer >> bits) & 0xff);
+    }
+  }
+  return out;
+}
+
 const RING_MAX = 1500;          // lines kept in memory per session
+const RAW_LOG_MAX_BYTES = 262144; // 256 KiB of raw scrollback kept for xterm re-mount replay
 const FLUSH_INTERVAL_MS = 1500;  // how often we POST a batch to backend
 const FLUSH_BATCH_MAX = 200;     // max lines in one POST
 // Coalesce UI notifications to ~30Hz max. Without this, a dmesg-style burst
@@ -55,6 +98,7 @@ class SessionManager {
   private pendingFlush = new Map<string, LineRecord[]>();
   private unsubscribers = new Map<string, () => void>();
   private listeners = new Set<Listener>();
+  private rawListeners = new Map<string, Set<RawListener>>();
   private flushTimer: ReturnType<typeof setInterval> | null = null;
   private apiBase: string = "";
   // Notify-throttle state — coalesce multiple line batches arriving inside
@@ -124,6 +168,9 @@ class SessionManager {
       lines: [],
       lineCount: 0,
       mocked: false,  // determined below via lazy probe
+      rawLog: [],
+      rawLogBytes: 0,
+      partial: "",
     };
     this.sessions.set(id, state);
     this.pendingFlush.set(id, []);
@@ -170,13 +217,14 @@ class SessionManager {
         s.pid = e.pid; s.status = "running";
         this.notify();
       },
-      // Preferred path — native batches lines and we apply them as one
-      // push + one bounded splice + one notify per batch. This is what
-      // keeps dmesg-style bursts (~30k lines/sec) from ANR'ing the JS thread.
+      // Preferred path — native relays the raw PTY byte stream as base64
+      // chunks. We fan them straight to xterm subscribers (which decode +
+      // term.write() the exact bytes so \r redraws / colors / TUIs work)
+      // AND derive clean lines for the flat Live view + backend.
+      onChunk: (e) => this.handleChunk(id, e.stream, e.dataB64),
+      // Legacy line paths — only old APKs still emit these; kept wired so a
+      // build mismatch degrades gracefully instead of showing nothing.
       onLines: (e) => this.handleLinesBatch(id, e.stream, e.lines, e.toLineNo),
-      // Fallback for any straggler `RootShell.line` events (PID was emitted
-      // per-line, no other code path uses this now — but keep the listener
-      // wired so old APKs that still emit it don't break.)
       onLine: (e) => this.handleLine(id, { stream: e.stream, line: e.line, line_no: e.lineNo }),
       onExit: (e) => this.handleExit(id, e.exit_code, e.duration_ms),
       onError: (e) => {
@@ -229,6 +277,75 @@ class SessionManager {
     const pf = this.pendingFlush.get(id);
     if (pf) pf.push(...records);
     this.notify();
+  }
+
+  // ── Raw chunk path (xterm PTY relay) ──────────────────────────────────
+  /**
+   * A raw base64 byte chunk arrived from native. Two things happen:
+   *   1. Fan it out verbatim to any xterm subscribers (they decode + write
+   *      the exact bytes so \r redraws / ANSI colors / TUIs render right),
+   *      and append it to the bounded raw log for re-mount replay.
+   *   2. Derive clean text lines (split on \n, drop \r) for the flat Live
+   *      view + backend session store, keeping those consumers working.
+   */
+  private handleChunk(id: string, stream: "stdout" | "stderr", b64: string) {
+    const s = this.sessions.get(id);
+    if (!s || !b64) return;
+    if (s.status === "starting") s.status = "running";
+
+    // 1) raw log (bounded) + fan-out to xterm
+    const bin = b64ToBinary(b64);
+    if (!s.rawLog) { s.rawLog = []; s.rawLogBytes = 0; }
+    s.rawLog.push({ stream, b64, bytes: bin.length });
+    s.rawLogBytes = (s.rawLogBytes || 0) + bin.length;
+    while ((s.rawLogBytes || 0) > RAW_LOG_MAX_BYTES && s.rawLog.length > 1) {
+      const dropped = s.rawLog.shift();
+      s.rawLogBytes = (s.rawLogBytes || 0) - (dropped?.bytes || 0);
+    }
+    const rl = this.rawListeners.get(id);
+    if (rl) rl.forEach((cb) => { try { cb(b64, stream); } catch {} });
+
+    // 2) derive lines for flat/Live/backend
+    s.partial = (s.partial || "") + bin;
+    let nl: number;
+    // eslint-disable-next-line no-cond-assign
+    while ((nl = s.partial.indexOf("\n")) >= 0) {
+      let line = s.partial.slice(0, nl);
+      s.partial = s.partial.slice(nl + 1);
+      if (line.endsWith("\r")) line = line.slice(0, -1);
+      const rec: LineRecord = { stream, line, line_no: s.lineCount + 1, ts: Date.now() };
+      s.lines.push(rec);
+      s.lineCount += 1;
+      const pf = this.pendingFlush.get(id); if (pf) pf.push(rec);
+    }
+    if (s.lines.length > RING_MAX) s.lines.splice(0, s.lines.length - RING_MAX);
+    this.notify();
+  }
+
+  /** Subscribe to raw base64 chunks for a session (xterm render path). */
+  subscribeRaw(id: string, cb: RawListener): () => void {
+    let set = this.rawListeners.get(id);
+    if (!set) { set = new Set(); this.rawListeners.set(id, set); }
+    set.add(cb);
+    return () => {
+      const s = this.rawListeners.get(id);
+      if (s) { s.delete(cb); if (s.size === 0) this.rawListeners.delete(id); }
+    };
+  }
+
+  /** The raw base64 chunk log for a session (for xterm re-mount replay). */
+  getRawLog(id: string): { stream: "stdout" | "stderr"; b64: string }[] {
+    return this.sessions.get(id)?.rawLog || [];
+  }
+
+  /** Resize a session's PTY (debounced/deduped) to xterm's dimensions. */
+  resize(id: string, cols: number, rows: number): void {
+    const s = this.sessions.get(id);
+    if (!s || (s.status !== "running" && s.status !== "starting")) return;
+    if (cols < 2 || rows < 2) return;
+    if (s.ptyCols === cols && s.ptyRows === rows) return;
+    s.ptyCols = cols; s.ptyRows = rows;
+    resizeSession(id, cols, rows).catch(() => {});
   }
 
   private handleExit(id: string, exitCode: number, durationMs: number) {
@@ -299,6 +416,7 @@ class SessionManager {
   async remove(id: string): Promise<void> {
     this.sessions.delete(id);
     this.pendingFlush.delete(id);
+    this.rawListeners.delete(id);
     const u = this.unsubscribers.get(id); if (u) { u(); this.unsubscribers.delete(id); }
     this.notify();
     if (this.apiBase) {
