@@ -253,8 +253,8 @@ const XTERM_BOOT_JS = `
   // Raw byte path: RN sends the native PTY chunk as base64. We decode it to
   // a Uint8Array and hand xterm the exact bytes — xterm does its own
   // incremental UTF-8 decode and buffers partial multi-byte sequences across
-  // calls, so \r cursor-resets, ANSI colors and full-screen TUIs render
-  // correctly (unlike the old line-joined text path).
+  // calls, so carriage-return cursor-resets, ANSI colors and full-screen TUIs
+  // render correctly (unlike the old line-joined text path).
   window.termWriteB64 = function (b64) {
     try {
       // Defensive: unwrap an object payload (e.g. { dataB64 }, { data }) so a
