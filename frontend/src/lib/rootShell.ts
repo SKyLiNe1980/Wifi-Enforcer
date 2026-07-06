@@ -83,7 +83,19 @@ if (RootShell) {
   }
 }
 
-const emitter = RootShell ? new NativeEventEmitter(NativeModules.RootShell) : null;
+// NativeEventEmitter binding. Guarded + try/caught: on some RN/Hermes boot
+// orderings the native module's method table (incl. the RN-reserved
+// addListener/removeListeners stubs the emitter binds to) isn't ready at
+// module-eval time, which can throw "Cannot read property 'addEventListener'
+// /'addListener' of undefined". We degrade to `null` (mock/no-stream mode)
+// instead of taking down the whole JS bundle on boot.
+let emitter: NativeEventEmitter | null = null;
+try {
+  if (RootShell) emitter = new NativeEventEmitter(NativeModules.RootShell as any);
+} catch (e) {
+  console.warn("[RootShell] NativeEventEmitter init failed — streaming disabled", e);
+  emitter = null;
+}
 
 export async function checkRoot(): Promise<boolean> {
   if (!RootShell) return false;
