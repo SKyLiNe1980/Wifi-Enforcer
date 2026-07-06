@@ -93,6 +93,12 @@ ${xtermBundle.cssContent}
 <body>
 <div id="boot">// booting xterm.js…</div>
 <div id="t"></div>
+<!-- xterm/fit bundles embedded as TEXT (not <script>): the HTML loads fine
+     even when large, and the boot reads + evals this from the injectedJavaScript
+     prop. Avoids both (a) the device refusing to execute in-document <script>
+     and (b) Android dropping large imperative injectJavaScript payloads. -->
+<div id="__xb" style="display:none">${xtermBundle.xtermJsB64}</div>
+<div id="__fb" style="display:none">${xtermBundle.fitAddonB64}</div>
 </body>
 </html>`;
 
@@ -121,19 +127,27 @@ const XTERM_BOOT_JS = `
   };
   post({ type: "diag", stage: "inject-start", detail: "atob=" + (typeof atob) });
 
-  // Decode + execute xterm.js and the fit addon. The base64 was streamed
-  // into window.__XB / window.__FB in small chunks (Android evaluateJavascript
-  // drops payloads that are too large in a single shot).
-  //
+  // Get the xterm + fit source. Primary: read the base64 embedded as text in
+  // the HTML (#__xb/#__fb) — reliable, no imperative injection needed. Legacy
+  // fallback: window.__XB/__FB streamed in via injectJavaScript chunks.
+  var xbB64 = window.__XB || "";
+  var fbB64 = window.__FB || "";
+  try {
+    var xbEl = document.getElementById("__xb");
+    var fbEl = document.getElementById("__fb");
+    if (xbEl && xbEl.textContent) xbB64 = xbEl.textContent;
+    if (fbEl && fbEl.textContent) fbB64 = fbEl.textContent;
+  } catch (e) {}
+
   // Execute via indirect eval FIRST — many hardened Android WebViews silently
   // refuse to run dynamically-appended script elements (the same reason our
-  // in-document scripts never fired), but injectedJavaScript's evaluate
+  // in-document scripts never fired), but the injectedJavaScript evaluate
   // context CAN eval. Indirect eval runs in global scope so the xterm/fit
   // UMD bundles attach Terminal/FitAddon to window. Fall back to script
   // element injection only if eval throws.
   try {
-    var xbSrc = atob(window.__XB || "");
-    var fbSrc = atob(window.__FB || "");
+    var xbSrc = atob(xbB64);
+    var fbSrc = atob(fbB64);
     try {
       (0, eval)(xbSrc);
       (0, eval)(fbSrc);
@@ -386,35 +400,26 @@ export default function XTermView({ sessionId, onInput, resetToken }: Props) {
     }
   }, []);
 
-  // Stream the xterm/fit base64 into the WebView in small chunks, then run
-  // the boot script. Android's evaluateJavascript silently drops a single
-  // huge payload (that's why injectedJavaScript with the inlined base64
-  // never fired), but many small imperative injectJavaScript() calls work.
+  // Secondary boot trigger + readiness poll. The PRIMARY boot path is the
+  // injectedJavaScript prop (auto-run by RN after load — the reliable
+  // mechanism on this device). We still fire XTERM_BOOT_JS imperatively here
+  // as a belt-and-suspenders (it self-guards against double-boot via
+  // window.__enforcerTermBooted), and — crucially — start the poll that
+  // confirms boot success and (re-)announces `ready`.
   const bootedRef = useRef(false);
   const bootXterm = useCallback(() => {
     const web = webRef.current;
     if (!web || bootedRef.current) return;
     bootedRef.current = true;
-    const CHUNK = 8000;
-    web.injectJavaScript(`window.__XB="";window.__FB="";true;`);
-    const feed = (b64: string, name: string) => {
-      for (let i = 0; i < b64.length; i += CHUNK) {
-        const part = b64.slice(i, i + CHUNK);
-        web.injectJavaScript(`window.${name}+=${JSON.stringify(part)};true;`);
-      }
-    };
-    feed(xtermBundle.xtermJsB64, "__XB");
-    feed(xtermBundle.fitAddonB64, "__FB");
-    web.injectJavaScript(XTERM_BOOT_JS);
+    setDiag((d) => (d && d.startsWith("xterm ready") ? d : "boot: injecting xterm…"));
+    web.injectJavaScript(XTERM_BOOT_JS + "\ntrue;");
 
     // CONFIRM boot success — never assume it. The boot script sets
     // window.termReady=true ONLY after `new Terminal()` + term.open() succeed.
-    // We poll for that flag and re-announce `ready` (the initial postMessage
-    // can be dropped on flaky WebViews). If the terminal genuinely never boots
-    // (e.g. the WebView refuses to eval the xterm bundle), readyRef stays
-    // false and the watchdog drops us to the flat scrollback fallback — which
-    // still shows real output derived from the raw chunks. Never a permanent
-    // "booting…" screen (the previous unconditional flip removed that safety).
+    // We poll for that flag and announce `ready`. If the terminal genuinely
+    // never boots, readyRef stays false and the watchdog drops us to the flat
+    // scrollback fallback (which still shows real output derived from the raw
+    // chunks) — never a permanent "booting…" screen.
     let attempts = 0;
     if (bootPollRef.current) clearInterval(bootPollRef.current);
     bootPollRef.current = setInterval(() => {
@@ -429,6 +434,15 @@ export default function XTermView({ sessionId, onInput, resetToken }: Props) {
       );
     }, 250);
   }, []);
+
+  // Boot is triggered from multiple lifecycle points because onLoadEnd is
+  // unreliable on some Android WebViews (it sometimes never fires with an
+  // html source). bootedRef makes this idempotent. A mount timer guarantees
+  // an attempt even if NO load event fires.
+  useEffect(() => {
+    const t = setTimeout(() => bootXterm(), 1200);
+    return () => clearTimeout(t);
+  }, [bootXterm]);
 
 
   useEffect(() => {
@@ -558,10 +572,12 @@ export default function XTermView({ sessionId, onInput, resetToken }: Props) {
         originWhitelist={["*"]}
         source={source}
         injectedJavaScriptBeforeContentLoaded={`try{window.ReactNativeWebView&&window.ReactNativeWebView.postMessage(JSON.stringify({type:"diag",stage:"inject-before"}));}catch(e){} true;`}
+        injectedJavaScript={XTERM_BOOT_JS}
         onMessage={onMessage}
         onError={(e) => { setDiag(`webview onError: ${e?.nativeEvent?.description || ""}`); enterFallback(); }}
         onHttpError={(e) => setDiag(`http ${e?.nativeEvent?.statusCode || "?"}`)}
-        onLoadEnd={() => { setDiag((d) => d || "html loaded, streaming xterm…"); bootXterm(); }}
+        onLoad={() => bootXterm()}
+        onLoadEnd={() => { setDiag((d) => (d && (d.startsWith("xterm ready") || d.startsWith("boot:")) ? d : "html loaded, booting…")); bootXterm(); }}
         onRenderProcessGone={() => { setDiag("webview process gone"); enterFallback(); }}
         javaScriptEnabled
         domStorageEnabled
