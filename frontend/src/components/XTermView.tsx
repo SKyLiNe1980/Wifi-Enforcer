@@ -138,6 +138,11 @@ const XTERM_BOOT_JS = `
     if (xbEl && xbEl.textContent) xbB64 = xbEl.textContent;
     if (fbEl && fbEl.textContent) fbB64 = fbEl.textContent;
   } catch (e) {}
+  // Strip any whitespace the DOM may have introduced — atob() throws
+  // InvalidCharacterError on stray newlines/spaces.
+  xbB64 = (xbB64 || "").replace(/\\s+/g, "");
+  fbB64 = (fbB64 || "").replace(/\\s+/g, "");
+  post({ type: "diag", stage: "src-read", detail: "xb=" + xbB64.length + " fb=" + fbB64.length });
 
   // Execute via indirect eval FIRST — many hardened Android WebViews silently
   // refuse to run dynamically-appended script elements (the same reason our
@@ -316,6 +321,13 @@ export default function XTermView({ sessionId, onInput, resetToken }: Props) {
   const fbScrollRef = useRef<ScrollView>(null);
   // Diagnostic line surfaced from the WebView (why xterm did/didn't boot).
   const [diag, setDiag] = useState<string>("");
+  // Full boot trace (accumulates every stage) so the fallback bar shows the
+  // exact progression — inject-before › inject-start › lib-eval › … — and we
+  // can see precisely where boot stopped, instead of one clobbered line.
+  const [trace, setTrace] = useState<string[]>([]);
+  const pushTrace = useCallback((s: string) => {
+    setTrace((p) => { const n = [...p, s]; return n.length > 8 ? n.slice(-8) : n; });
+  }, []);
   // Buffer raw base64 chunks that arrive before the WebView has finished
   // loading xterm.js — flushed once we get the `ready` message.
   const pendingRef = useRef<string[]>([]);
@@ -411,7 +423,7 @@ export default function XTermView({ sessionId, onInput, resetToken }: Props) {
     const web = webRef.current;
     if (!web || bootedRef.current) return;
     bootedRef.current = true;
-    setDiag((d) => (d && d.startsWith("xterm ready") ? d : "boot: injecting xterm…"));
+    pushTrace("rn:bootXterm→inject");
     web.injectJavaScript(XTERM_BOOT_JS + "\ntrue;");
 
     // CONFIRM boot success — never assume it. The boot script sets
@@ -433,7 +445,7 @@ export default function XTermView({ sessionId, onInput, resetToken }: Props) {
         `(function(){try{ if(window.termReady && window.ReactNativeWebView){ window.ReactNativeWebView.postMessage(JSON.stringify({type:"ready", cols:(window.__termCols||0), rows:(window.__termRows||0)})); } }catch(e){}})(); true;`,
       );
     }, 250);
-  }, []);
+  }, [pushTrace]);
 
   // Boot is triggered from multiple lifecycle points because onLoadEnd is
   // unreliable on some Android WebViews (it sometimes never fires with an
@@ -504,11 +516,13 @@ export default function XTermView({ sessionId, onInput, resetToken }: Props) {
       onInput(msg.data);
     } else if (msg.type === "diag") {
       setDiag(`${msg.stage}: ${msg.detail || ""}`);
+      pushTrace(`${msg.stage}${msg.detail ? ": " + msg.detail : ""}`);
     } else if (msg.type === "load_error") {
       setDiag(`load_error: ${msg.message}`);
+      pushTrace(`load_error: ${msg.message}`);
       console.warn("[XTermView] xterm.js failed to load in WebView:", msg.message);
     }
-  }, [onInput, markReadyAndFlush]);
+  }, [onInput, markReadyAndFlush, pushTrace]);
 
   // ── Inject focus when the component mounts/becomes visible ────────────
   // Keeps the soft-keyboard usable as soon as the user taps inside.
@@ -531,9 +545,11 @@ export default function XTermView({ sessionId, onInput, resetToken }: Props) {
   if (fallback) {
     return (
       <View style={s.root}>
-        {diag ? (
+        {(trace.length || diag) ? (
           <View style={s.diagBar}>
-            <Text style={s.diagText} numberOfLines={2}>{`⚠ xterm didn't boot · ${diag}`}</Text>
+            <Text style={s.diagText} numberOfLines={6} selectable>
+              {`⚠ xterm didn't boot\n${trace.length ? trace.join("\n") : diag}`}
+            </Text>
           </View>
         ) : null}
         <ScrollView
@@ -574,11 +590,11 @@ export default function XTermView({ sessionId, onInput, resetToken }: Props) {
         injectedJavaScriptBeforeContentLoaded={`try{window.ReactNativeWebView&&window.ReactNativeWebView.postMessage(JSON.stringify({type:"diag",stage:"inject-before"}));}catch(e){} true;`}
         injectedJavaScript={XTERM_BOOT_JS}
         onMessage={onMessage}
-        onError={(e) => { setDiag(`webview onError: ${e?.nativeEvent?.description || ""}`); enterFallback(); }}
-        onHttpError={(e) => setDiag(`http ${e?.nativeEvent?.statusCode || "?"}`)}
-        onLoad={() => bootXterm()}
-        onLoadEnd={() => { setDiag((d) => (d && (d.startsWith("xterm ready") || d.startsWith("boot:")) ? d : "html loaded, booting…")); bootXterm(); }}
-        onRenderProcessGone={() => { setDiag("webview process gone"); enterFallback(); }}
+        onError={(e) => { pushTrace(`evt:onError ${e?.nativeEvent?.description || ""}`); setDiag(`webview onError`); enterFallback(); }}
+        onHttpError={(e) => pushTrace(`evt:http ${e?.nativeEvent?.statusCode || "?"}`)}
+        onLoad={() => { pushTrace("evt:onLoad"); bootXterm(); }}
+        onLoadEnd={() => { pushTrace("evt:onLoadEnd"); bootXterm(); }}
+        onRenderProcessGone={() => { pushTrace("evt:renderProcessGone"); setDiag("webview process gone"); enterFallback(); }}
         javaScriptEnabled
         domStorageEnabled
         automaticallyAdjustContentInsets={false}
