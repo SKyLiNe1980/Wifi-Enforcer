@@ -144,10 +144,12 @@ const XTERM_BOOT_JS = `
   };
   post({ type: "diag", stage: "inject-start", detail: "atob=" + (typeof atob) });
 
-  // Decode + execute xterm.js and the fit addon from embedded base64.
+  // Decode + execute xterm.js and the fit addon. The base64 was streamed
+  // into window.__XB / window.__FB in small chunks (Android evaluateJavascript
+  // drops payloads that are too large in a single shot).
   try {
-    var s1 = document.createElement("script"); s1.text = atob("${xtermBundle.xtermJsB64}"); document.head.appendChild(s1);
-    var s2 = document.createElement("script"); s2.text = atob("${xtermBundle.fitAddonB64}"); document.head.appendChild(s2);
+    var s1 = document.createElement("script"); s1.text = atob(window.__XB || ""); document.head.appendChild(s1);
+    var s2 = document.createElement("script"); s2.text = atob(window.__FB || ""); document.head.appendChild(s2);
   } catch (e) {
     post({ type: "load_error", message: "inject failed: " + (e && e.message || e) });
     return;
@@ -395,12 +397,34 @@ export default function XTermView({ sessionId, onInput, resetToken }: Props) {
   // ── Boot watchdog ─────────────────────────────────────────────────────
   useEffect(() => {
     let alive = true;
-    // If xterm hasn't signalled `ready` within 9s, the WebView failed to
+    // If xterm hasn't signalled `ready` within 12s, the WebView failed to
     // boot → switch to flat scrollback so it's never a dead screen.
     const t = setTimeout(() => {
       if (alive && !readyRef.current) setFallback(true);
-    }, 9000);
+    }, 12000);
     return () => { alive = false; clearTimeout(t); };
+  }, []);
+
+  // Stream the xterm/fit base64 into the WebView in small chunks, then run
+  // the boot script. Android's evaluateJavascript silently drops a single
+  // huge payload (that's why injectedJavaScript with the inlined base64
+  // never fired), but many small imperative injectJavaScript() calls work.
+  const bootedRef = useRef(false);
+  const bootXterm = useCallback(() => {
+    const web = webRef.current;
+    if (!web || bootedRef.current) return;
+    bootedRef.current = true;
+    const CHUNK = 8000;
+    web.injectJavaScript(`window.__XB="";window.__FB="";true;`);
+    const feed = (b64: string, name: string) => {
+      for (let i = 0; i < b64.length; i += CHUNK) {
+        const part = b64.slice(i, i + CHUNK);
+        web.injectJavaScript(`window.${name}+=${JSON.stringify(part)};true;`);
+      }
+    };
+    feed(xtermBundle.xtermJsB64, "__XB");
+    feed(xtermBundle.fitAddonB64, "__FB");
+    web.injectJavaScript(XTERM_BOOT_JS);
   }, []);
 
 
@@ -535,12 +559,11 @@ export default function XTermView({ sessionId, onInput, resetToken }: Props) {
         ref={webRef}
         originWhitelist={["*"]}
         source={source}
-        injectedJavaScript={XTERM_BOOT_JS}
         injectedJavaScriptBeforeContentLoaded={`try{window.ReactNativeWebView&&window.ReactNativeWebView.postMessage(JSON.stringify({type:"diag",stage:"inject-before"}));}catch(e){} true;`}
         onMessage={onMessage}
         onError={(e) => { setDiag(`webview onError: ${e?.nativeEvent?.description || ""}`); setFallback(true); }}
         onHttpError={(e) => setDiag(`http ${e?.nativeEvent?.statusCode || "?"}`)}
-        onLoadEnd={() => setDiag((d) => d || "html loaded, waiting for xterm…")}
+        onLoadEnd={() => { setDiag((d) => d || "html loaded, streaming xterm…"); bootXterm(); }}
         onRenderProcessGone={() => { setDiag("webview process gone"); setFallback(true); }}
         javaScriptEnabled
         domStorageEnabled
