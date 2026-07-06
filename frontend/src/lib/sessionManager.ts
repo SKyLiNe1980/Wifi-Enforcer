@@ -221,7 +221,7 @@ class SessionManager {
       // chunks. We fan them straight to xterm subscribers (which decode +
       // term.write() the exact bytes so \r redraws / colors / TUIs work)
       // AND derive clean lines for the flat Live view + backend.
-      onChunk: (e) => this.handleChunk(id, e.stream, e.dataB64),
+      onChunk: (e) => this.handleChunk(id, e.stream, (e as any).dataB64 ?? (e as any).data),
       // Legacy line paths — only old APKs still emit these; kept wired so a
       // build mismatch degrades gracefully instead of showing nothing.
       onLines: (e) => this.handleLinesBatch(id, e.stream, e.lines, e.toLineNo),

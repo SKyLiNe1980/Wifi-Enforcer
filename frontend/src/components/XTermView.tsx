@@ -203,7 +203,15 @@ const XTERM_BOOT_JS = `
 
   // Public surface called by RN via injectJavaScript().
   window.termWrite = function (data) {
-    try { term.write(data); } catch (e) {}
+    try {
+      // Defensive: if a whole event/payload object slips through, extract the
+      // string it carries instead of writing "[object Object]".
+      if (data && typeof data === "object") {
+        data = (data.data != null ? data.data : (data.text != null ? data.text : ""));
+      }
+      if (typeof data !== "string") return;
+      term.write(data);
+    } catch (e) {}
   };
   // Raw byte path: RN sends the native PTY chunk as base64. We decode it to
   // a Uint8Array and hand xterm the exact bytes — xterm does its own
@@ -212,6 +220,12 @@ const XTERM_BOOT_JS = `
   // correctly (unlike the old line-joined text path).
   window.termWriteB64 = function (b64) {
     try {
+      // Defensive: unwrap an object payload (e.g. { dataB64 }, { data }) so a
+      // caller that forwards the raw event object never renders as text.
+      if (b64 && typeof b64 === "object") {
+        b64 = b64.dataB64 || b64.data || "";
+      }
+      if (typeof b64 !== "string" || !b64) return;
       var bin = atob(b64);
       var len = bin.length;
       var u8 = new Uint8Array(len);
@@ -284,8 +298,14 @@ export default function XTermView({ sessionId, onInput, resetToken }: Props) {
   // to the WebView which decodes + term.write()s the bytes. No line joining,
   // no \r\n synthesis, no blank-run collapsing — the terminal emulator owns
   // interpretation, which is the whole point of a true PTY relay.
-  const writeRawB64 = useCallback((b64: string) => {
-    if (!b64) return;
+  const writeRawB64 = useCallback((chunk: any) => {
+    // Defensive extraction: accept a plain base64 string, or an event/payload
+    // object ({ dataB64 } from native, { data }, { b64 }) — never forward a
+    // raw object to the WebView (that's what rendered as "[object Object]").
+    let b64: string | undefined;
+    if (typeof chunk === "string") b64 = chunk;
+    else if (chunk && typeof chunk === "object") b64 = chunk.dataB64 || chunk.data || chunk.b64;
+    if (!b64 || typeof b64 !== "string") return;
     const encoded = JSON.stringify(b64);
     if (readyRef.current && webRef.current) {
       webRef.current.injectJavaScript(`window.termWriteB64 && window.termWriteB64(${encoded}); true;`);
