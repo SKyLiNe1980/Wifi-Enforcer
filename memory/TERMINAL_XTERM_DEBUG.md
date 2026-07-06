@@ -70,3 +70,17 @@ User is on Samsung (S10+ primary, also tested S25 Ultra stock). NetHunter chroot
 xterm/WebView + root PTY are DEVICE-ONLY (EAS build). Cannot test in web preview / Expo Go.
 Every attempt costs the user a build + credits — they are LOW ON CREDITS. Prefer diagnostics
 that yield the exact failure over blind swings.
+
+## AUDIT FIXES APPLIED (user's "Terminal Architecture Refactor" audit) — one build:
+1. ISOLATION: added owner:"kali"|"live"|"ai" to SessionState + start(). TerminalShell
+   owner:"kali", AITab owner:"ai", LiveTab owner:"live" AND LiveTab now
+   list().filter(s=>s.owner==="live") so it never adopts Kali/AI sessions. (Root cause was
+   LiveTab auto-selecting newest running session from the shared list, not XTermView.)
+2. IME (Issue 3): removed hand-rolled capture-phase textarea diffing in XTERM_BOOT_JS.
+   Now pure native term.onData + sane textarea attrs. Kills double-char/lag/re-sent-buffer.
+3. BOOT (Issue 2): kept chunked injectJavaScript (evidence-based; page <script> don't run,
+   injected JS does). base64 blob does NOT drain agent context (require()'d, never read).
+
+## NEXT if chunked-inject still fails: propose a DEVELOPMENT BUILD (expo-dev-client) so JS
+## hot-reloads from Metro — all terminal work is JS → one dev build = free instant iteration
+## instead of one full build per change. Route exact steps via support_agent.

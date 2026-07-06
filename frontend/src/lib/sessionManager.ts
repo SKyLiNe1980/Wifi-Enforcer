@@ -29,6 +29,9 @@ export type SessionState = {
   pid?: number;
   exitCode?: number;
   status: "starting" | "running" | "ended" | "killed" | "error";
+  /** Which tab owns this session — enforces full isolation between the
+   *  Kali terminal / Live view / AI agent so their streams never mix. */
+  owner?: "kali" | "live" | "ai";
   lines: LineRecord[];        // ring buffer
   lineCount: number;          // total lines ever (including dropped from ring)
   errorMessage?: string;
@@ -108,7 +111,7 @@ class SessionManager {
    * - Subscribes to native events and buffers lines
    * - Falls back to a "mock" mode if native streaming isn't available (preview)
    */
-  async start(opts: { command: string; iface?: string; label?: string; id?: string; forceMock?: boolean }): Promise<string> {
+  async start(opts: { command: string; iface?: string; label?: string; id?: string; owner?: "kali" | "live" | "ai"; forceMock?: boolean }): Promise<string> {
     const id = opts.id || `s${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
     const state: SessionState = {
       id,
@@ -117,6 +120,7 @@ class SessionManager {
       label: opts.label || (opts.command.split(/\s+/)[0] || "session"),
       startedAt: Date.now(),
       status: "starting",
+      owner: opts.owner,
       lines: [],
       lineCount: 0,
       mocked: false,  // determined below via lazy probe

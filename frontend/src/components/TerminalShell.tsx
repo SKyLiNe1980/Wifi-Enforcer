@@ -105,6 +105,7 @@ export default function TerminalShell({ execMode, wrap, pendingInjection }: Prop
       const id = await sessionManager.start({
         command: wrap(shellInvocation()),
         label: "shell",
+        owner: "kali",
       });
       persistent.sessionId = id;
       setSessionId(id);
