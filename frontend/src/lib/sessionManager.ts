@@ -82,6 +82,29 @@ function b64ToBinary(b64: string): string {
   return out;
 }
 
+// Binary (Latin1) string → base64. Inverse of b64ToBinary; used to re-encode
+// a chunk after we strip the echoed resize command out of it.
+function binaryToB64(bin: string): string {
+  const g: any = globalThis as any;
+  if (typeof g.btoa === "function") {
+    try { return g.btoa(bin); } catch { /* fall through */ }
+  }
+  let out = "";
+  let i = 0;
+  while (i < bin.length) {
+    const c1 = bin.charCodeAt(i++) & 0xff;
+    const has2 = i < bin.length; const c2 = has2 ? bin.charCodeAt(i++) & 0xff : 0;
+    const has3 = i < bin.length; const c3 = has3 ? bin.charCodeAt(i++) & 0xff : 0;
+    const e1 = c1 >> 2;
+    const e2 = ((c1 & 3) << 4) | (c2 >> 4);
+    const e3 = has2 ? (((c2 & 15) << 2) | (c3 >> 6)) : 64;
+    const e4 = has3 ? (c3 & 63) : 64;
+    out += B64_CHARS[e1] + B64_CHARS[e2] + (e3 === 64 ? "=" : B64_CHARS[e3]) + (e4 === 64 ? "=" : B64_CHARS[e4]);
+  }
+  return out;
+}
+
+
 const RING_MAX = 1500;          // lines kept in memory per session
 const RAW_LOG_MAX_BYTES = 262144; // 256 KiB of raw scrollback kept for xterm re-mount replay
 const FLUSH_INTERVAL_MS = 1500;  // how often we POST a batch to backend
@@ -99,6 +122,11 @@ class SessionManager {
   private unsubscribers = new Map<string, () => void>();
   private listeners = new Set<Listener>();
   private rawListeners = new Map<string, Set<RawListener>>();
+  // Echoed-input suppression: the pty echoes any stdin we inject (e.g. the
+  // stty resize command), which would otherwise render as visible noise. We
+  // record the exact command strings we send here and strip them from the
+  // output stream for a short window. Keyed by session id.
+  private suppress = new Map<string, { needle: string; until: number }[]>();
   private flushTimer: ReturnType<typeof setInterval> | null = null;
   private apiBase: string = "";
   // Notify-throttle state — coalesce multiple line batches arriving inside
@@ -293,8 +321,19 @@ class SessionManager {
     if (!s || !b64) return;
     if (s.status === "starting") s.status = "running";
 
+    // Strip any echoed resize command (pty echoes injected stdin). We re-encode
+    // the cleaned bytes so xterm + the raw replay log never see the noise.
+    let bin = b64ToBinary(b64);
+    if (stream === "stdout") {
+      const cleaned = this.stripEcho(id, bin);
+      if (cleaned !== bin) {
+        bin = cleaned;
+        if (!bin) return;             // whole chunk was the echoed command
+        b64 = binaryToB64(bin);       // re-encode for raw fan-out + replay log
+      }
+    }
+
     // 1) raw log (bounded) + fan-out to xterm
-    const bin = b64ToBinary(b64);
     if (!s.rawLog) { s.rawLog = []; s.rawLogBytes = 0; }
     s.rawLog.push({ stream, b64, bytes: bin.length });
     s.rawLogBytes = (s.rawLogBytes || 0) + bin.length;
@@ -345,7 +384,43 @@ class SessionManager {
     if (cols < 2 || rows < 2) return;
     if (s.ptyCols === cols && s.ptyRows === rows) return;
     s.ptyCols = cols; s.ptyRows = rows;
+    // Register the exact command the native side is about to inject so its
+    // pty echo gets stripped from the output stream (see stripEcho). Must
+    // match RootShellModule.resizeSession's payload verbatim.
+    const needle = `stty cols ${cols} rows ${rows} 2>/dev/null`;
+    const list = this.suppress.get(id) || [];
+    list.push({ needle, until: Date.now() + 2500 });
+    this.suppress.set(id, list);
     resizeSession(id, cols, rows).catch(() => {});
+  }
+
+  /**
+   * Remove echoed resize commands from a stdout chunk. The pty echoes injected
+   * stdin verbatim, so `stty cols X rows Y 2>/dev/null` (plus its trailing
+   * newline) shows up in the output. We strip the exact strings we registered
+   * in resize() within their time window. Single-chunk match — the echo is
+   * small and arrives immediately, so it's virtually always in one chunk.
+   */
+  private stripEcho(id: string, bin: string): string {
+    const list = this.suppress.get(id);
+    if (!list || !list.length) return bin;
+    const now = Date.now();
+    let out = bin;
+    const remaining: { needle: string; until: number }[] = [];
+    for (const n of list) {
+      if (n.until <= now) continue;                 // expired — drop
+      const idx = out.indexOf(n.needle);
+      if (idx >= 0) {
+        let end = idx + n.needle.length;
+        if (out.slice(end, end + 2) === "\r\n") end += 2;
+        else if (out[end] === "\n" || out[end] === "\r") end += 1;
+        out = out.slice(0, idx) + out.slice(end);   // consumed — don't keep
+      } else {
+        remaining.push(n);                          // still pending
+      }
+    }
+    this.suppress.set(id, remaining);
+    return out;
   }
 
   private handleExit(id: string, exitCode: number, durationMs: number) {
@@ -417,6 +492,7 @@ class SessionManager {
     this.sessions.delete(id);
     this.pendingFlush.delete(id);
     this.rawListeners.delete(id);
+    this.suppress.delete(id);
     const u = this.unsubscribers.get(id); if (u) { u(); this.unsubscribers.delete(id); }
     this.notify();
     if (this.apiBase) {
