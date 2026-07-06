@@ -124,9 +124,25 @@ const XTERM_BOOT_JS = `
   // Decode + execute xterm.js and the fit addon. The base64 was streamed
   // into window.__XB / window.__FB in small chunks (Android evaluateJavascript
   // drops payloads that are too large in a single shot).
+  //
+  // Execute via indirect eval FIRST — many hardened Android WebViews silently
+  // refuse to run dynamically-appended <script> elements (the same reason our
+  // in-document <script> never fired), but injectedJavaScript's evaluate
+  // context CAN eval. `(0, eval)(code)` runs in global scope so the xterm/fit
+  // UMD bundles attach Terminal/FitAddon to window. Fall back to <script>
+  // element injection only if eval throws.
   try {
-    var s1 = document.createElement("script"); s1.text = atob(window.__XB || ""); document.head.appendChild(s1);
-    var s2 = document.createElement("script"); s2.text = atob(window.__FB || ""); document.head.appendChild(s2);
+    var xbSrc = atob(window.__XB || "");
+    var fbSrc = atob(window.__FB || "");
+    try {
+      (0, eval)(xbSrc);
+      (0, eval)(fbSrc);
+      post({ type: "diag", stage: "lib-eval", detail: "Terminal=" + (typeof Terminal) });
+    } catch (evalErr) {
+      post({ type: "diag", stage: "eval-failed", detail: String(evalErr && evalErr.message || evalErr) });
+      var s1 = document.createElement("script"); s1.text = xbSrc; document.head.appendChild(s1);
+      var s2 = document.createElement("script"); s2.text = fbSrc; document.head.appendChild(s2);
+    }
   } catch (e) {
     post({ type: "load_error", message: "inject failed: " + (e && e.message || e) });
     return;
@@ -189,6 +205,8 @@ const XTERM_BOOT_JS = `
   function tryFit() {
     try {
       fit.fit();
+      window.__termCols = term.cols;
+      window.__termRows = term.rows;
       post({ type: "resize", cols: term.cols, rows: term.rows });
     } catch (e) {}
   }
@@ -292,6 +310,9 @@ export default function XTermView({ sessionId, onInput, resetToken }: Props) {
   const sessionIdRef = useRef<string | null>(sessionId);
   sessionIdRef.current = sessionId;
   const fallbackRef = useRef<boolean>(false);
+  // Interval that polls the WebView for boot success (window.termReady) and
+  // re-announces `ready`, so a dropped ready postMessage never strands us.
+  const bootPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // ── RN → Web: write raw PTY bytes ─────────────────────────────────────
   // Native relays the exact PTY byte stream as base64; we forward it as-is
@@ -329,12 +350,17 @@ export default function XTermView({ sessionId, onInput, resetToken }: Props) {
   // ── Boot watchdog ─────────────────────────────────────────────────────
   useEffect(() => {
     let alive = true;
-    // If xterm hasn't signalled `ready` within 12s, the WebView failed to
-    // boot → switch to flat scrollback so it's never a dead screen.
+    // If xterm hasn't signalled `ready` within 8s, the WebView failed to
+    // boot → switch to flat scrollback so it's never a dead screen. The flat
+    // view still shows real output (lines derived from the raw chunks).
     const t = setTimeout(() => {
       if (alive && !readyRef.current) enterFallback();
-    }, 12000);
-    return () => { alive = false; clearTimeout(t); };
+    }, 8000);
+    return () => {
+      alive = false;
+      clearTimeout(t);
+      if (bootPollRef.current) { clearInterval(bootPollRef.current); bootPollRef.current = null; }
+    };
   }, [enterFallback]);
 
   // Flip readiness the moment xterm is mounted and flush any queued chunks.
@@ -348,6 +374,7 @@ export default function XTermView({ sessionId, onInput, resetToken }: Props) {
   const markReadyAndFlush = useCallback(() => {
     if (readyRef.current) return;
     readyRef.current = true;
+    if (bootPollRef.current) { clearInterval(bootPollRef.current); bootPollRef.current = null; }
     setDiag((d) => (d && d.startsWith("xterm ready") ? d : "xterm ready"));
     const web = webRef.current;
     if (web && pendingRef.current.length) {
@@ -379,12 +406,29 @@ export default function XTermView({ sessionId, onInput, resetToken }: Props) {
     feed(xtermBundle.xtermJsB64, "__XB");
     feed(xtermBundle.fitAddonB64, "__FB");
     web.injectJavaScript(XTERM_BOOT_JS);
-    // Terminal object is now mounted (the boot script ran synchronously in
-    // the injected eval). Flip ready + flush immediately rather than waiting
-    // for the `ready` postMessage — that round-trip can be dropped on some
-    // Android WebViews, which would strand queued chunks indefinitely.
-    markReadyAndFlush();
-  }, [markReadyAndFlush]);
+
+    // CONFIRM boot success — never assume it. The boot script sets
+    // window.termReady=true ONLY after `new Terminal()` + term.open() succeed.
+    // We poll for that flag and re-announce `ready` (the initial postMessage
+    // can be dropped on flaky WebViews). If the terminal genuinely never boots
+    // (e.g. the WebView refuses to eval the xterm bundle), readyRef stays
+    // false and the watchdog drops us to the flat scrollback fallback — which
+    // still shows real output derived from the raw chunks. Never a permanent
+    // "booting…" screen (the previous unconditional flip removed that safety).
+    let attempts = 0;
+    if (bootPollRef.current) clearInterval(bootPollRef.current);
+    bootPollRef.current = setInterval(() => {
+      attempts += 1;
+      const w = webRef.current;
+      if (!w || readyRef.current || attempts > 40) {
+        if (bootPollRef.current) { clearInterval(bootPollRef.current); bootPollRef.current = null; }
+        return;
+      }
+      w.injectJavaScript(
+        `(function(){try{ if(window.termReady && window.ReactNativeWebView){ window.ReactNativeWebView.postMessage(JSON.stringify({type:"ready", cols:(window.__termCols||0), rows:(window.__termRows||0)})); } }catch(e){}})(); true;`,
+      );
+    }, 250);
+  }, []);
 
 
   useEffect(() => {
