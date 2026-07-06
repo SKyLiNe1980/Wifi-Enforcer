@@ -317,6 +317,28 @@ export default function XTermView({ sessionId, onInput, resetToken }: Props) {
     return () => { alive = false; clearTimeout(t); };
   }, [enterFallback]);
 
+  // Flip readiness the moment xterm is mounted and flush any queued chunks.
+  // CRITICAL: readiness must NOT depend on the data stream (the old build's
+  // bug — its ready flag was gated on the discrete line-array event, so once
+  // native switched to raw chunks it never toggled and the terminal hung on
+  // the boot screen forever). We drive readiness purely from the boot
+  // lifecycle: injectJavaScript calls are serialized in the WebView JS queue,
+  // so by the time these flushed writes execute, the boot script (injected
+  // just before) has already created `term` + defined window.termWriteB64.
+  const markReadyAndFlush = useCallback(() => {
+    if (readyRef.current) return;
+    readyRef.current = true;
+    setDiag((d) => (d && d.startsWith("xterm ready") ? d : "xterm ready"));
+    const web = webRef.current;
+    if (web && pendingRef.current.length) {
+      const buf = pendingRef.current;
+      pendingRef.current = [];
+      for (const b64 of buf) {
+        web.injectJavaScript(`window.termWriteB64 && window.termWriteB64(${JSON.stringify(b64)}); true;`);
+      }
+    }
+  }, []);
+
   // Stream the xterm/fit base64 into the WebView in small chunks, then run
   // the boot script. Android's evaluateJavascript silently drops a single
   // huge payload (that's why injectedJavaScript with the inlined base64
@@ -337,7 +359,12 @@ export default function XTermView({ sessionId, onInput, resetToken }: Props) {
     feed(xtermBundle.xtermJsB64, "__XB");
     feed(xtermBundle.fitAddonB64, "__FB");
     web.injectJavaScript(XTERM_BOOT_JS);
-  }, []);
+    // Terminal object is now mounted (the boot script ran synchronously in
+    // the injected eval). Flip ready + flush immediately rather than waiting
+    // for the `ready` postMessage — that round-trip can be dropped on some
+    // Android WebViews, which would strand queued chunks indefinitely.
+    markReadyAndFlush();
+  }, [markReadyAndFlush]);
 
 
   useEffect(() => {
@@ -377,17 +404,12 @@ export default function XTermView({ sessionId, onInput, resetToken }: Props) {
     }
     if (!msg || typeof msg !== "object") return;
     if (msg.type === "ready") {
-      readyRef.current = true;
+      // Boot lifecycle already flipped readiness in bootXterm; this message
+      // is now just the authoritative cols/rows. markReadyAndFlush is
+      // idempotent, so call it too in case bootXterm hasn't run yet (e.g. the
+      // WebView posted ready via its own path first).
+      markReadyAndFlush();
       setDiag(`xterm ready · ${msg.cols}x${msg.rows}`);
-      // Flush raw chunks that arrived before xterm booted — one decode+write
-      // per chunk (they were independently base64-encoded by native).
-      if (pendingRef.current.length && webRef.current) {
-        const buf = pendingRef.current;
-        pendingRef.current = [];
-        for (const b64 of buf) {
-          webRef.current.injectJavaScript(`window.termWriteB64 && window.termWriteB64(${JSON.stringify(b64)}); true;`);
-        }
-      }
       // Tell the PTY our real size right away.
       if (sessionIdRef.current && msg.cols && msg.rows) {
         sessionManager.resize(sessionIdRef.current, msg.cols, msg.rows);
@@ -408,7 +430,7 @@ export default function XTermView({ sessionId, onInput, resetToken }: Props) {
       setDiag(`load_error: ${msg.message}`);
       console.warn("[XTermView] xterm.js failed to load in WebView:", msg.message);
     }
-  }, [onInput]);
+  }, [onInput, markReadyAndFlush]);
 
   // ── Inject focus when the component mounts/becomes visible ────────────
   // Keeps the soft-keyboard usable as soon as the user taps inside.
