@@ -67,3 +67,18 @@ authorized_keys. Nothing on the node's login policy changes; enforcer stays
 CANNOT be tested in sandbox/Expo Go (needs native root shell + real nodes + SSH).
 Verification here = lint + shellcheck-style + base64 correctness + .deb build.
 Requires on-device build test by the operator.
+
+### Follow-up fixes (bearer persistence, roster-authoritative restore, adopt-node revive)
+- **Bearer never expires:** `rotateBearer` writes `enforcer:bearer:current` with
+  NO TTL (was 30-min `EX`). Redis expiry deletes the whole key, which is why the
+  key "vanished" — not an installer wipe. Confirmed nothing in app/scripts DELs
+  the bearer/roster keys (only `enforcer-cloud-restore --wipe` touches
+  `enforcer:mcp:*`, a different namespace, opt-in).
+- **RESTORE FROM CLOUD is roster-authoritative:** iterates the Redis roster and
+  restores exactly those nodes; tailnet discovery is used ONLY to refresh a known
+  member's live IP, never to mass-add `enforcer-node`-named peers. Empty roster →
+  errors instead of tailnet fallback.
+- **Adopt-an-old-node revive:** per-node `ssh_user`/`ssh_port` (schema v13);
+  Edit Node now has SSH user/port fields + "INSTALL KEY" (one-time password
+  bootstrap of the cockpit revive key) + "REVIVE NOW". reviveNode/auto-revive use
+  per-node SSH details. `installReviveKey()` added to nodeProvision.ts.

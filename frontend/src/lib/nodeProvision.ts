@@ -238,6 +238,38 @@ export async function provisionNode(
 }
 
 /**
+ * Install the cockpit's revive key onto an already-installed node, using the
+ * operator's password ONCE. This is the "adopt an existing node" path — e.g.
+ * a box installed the old way that the cockpit has no SSH access to yet.
+ * After this succeeds, reviveNode()/auto-revive work for that node.
+ */
+export async function installReviveKey(
+  opts: { host: string; sshUser: string; sshPass: string; sshPort?: number },
+  execChroot: ExecChroot,
+): Promise<{ ok: boolean; detail: string }> {
+  const port = opts.sshPort ?? 22;
+  const user = (opts.sshUser || "root").trim();
+  try {
+    const sp = await ensureSshpass(execChroot);
+    if (!sp.ok) return { ok: false, detail: sp.detail };
+    const pub = await ensureCockpitKeypair(execChroot);
+    const bootstrap =
+      "set -e\n" +
+      "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys\n" +
+      `grep -qxF ${sq(pub)} ~/.ssh/authorized_keys || echo ${sq(pub)} >> ~/.ssh/authorized_keys\n` +
+      "chmod 600 ~/.ssh/authorized_keys\n" +
+      "echo KEY_INSTALLED\n";
+    const b = await execChroot(sshPassExec(user, opts.sshPass, opts.host, port, bootstrap));
+    if ((b.output || "").includes("KEY_INSTALLED")) {
+      return { ok: true, detail: `revive key installed for ${user}@${opts.host}` };
+    }
+    return { ok: false, detail: (b.output || "no output").slice(-200) };
+  } catch (e: any) {
+    return { ok: false, detail: e?.message || String(e) };
+  }
+}
+
+/**
  * Key-based one-shot revive. Tries systemd first, falls back to init.d.
  * Returns {ok, detail}. Requires the cockpit key to already be installed
  * (i.e. the node was provisioned through this cockpit).

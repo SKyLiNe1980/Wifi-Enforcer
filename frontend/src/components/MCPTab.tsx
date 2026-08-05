@@ -45,7 +45,7 @@ import {
 import NodesMap from "./NodesMap";
 import { callMcpTool } from "../lib/mcpClient";
 import ProvisionNodeModal, { type NodeDraft } from "./ProvisionNodeModal";
-import { reviveNode } from "../lib/nodeProvision";
+import { reviveNode, installReviveKey } from "../lib/nodeProvision";
 
 // Keep palette identical to the rest of the cockpit so the tab feels native.
 const C = {
@@ -90,6 +90,9 @@ export default function MCPTab() {
   const [nodeToolCount, setNodeToolCount] = useState<Record<string, number>>({});
   const [editingNode, setEditingNode] = useState<Partial<MCPNode> | null>(null);
   const [provisionOpen, setProvisionOpen] = useState(false);
+  const [editSshPass, setEditSshPass] = useState("");
+  const [sshActionBusy, setSshActionBusy] = useState(false);
+  const [sshActionStatus, setSshActionStatus] = useState("");
   // Node-map tap sheets (// status pane radial map)
   const [mapSheetNode, setMapSheetNode] = useState<MCPNode | null>(null);
   const [showLocalSheet, setShowLocalSheet] = useState(false);
@@ -773,6 +776,8 @@ export default function MCPTab() {
           tags: editingNode.tags || [],
           description: editingNode.description || "",
           enabled: editingNode.enabled ?? true,
+          ssh_user: (editingNode.ssh_user || "root").trim(),
+          ssh_port: editingNode.ssh_port ?? 22,
         });
       } else {
         await nodesLocal.create({
@@ -781,6 +786,8 @@ export default function MCPTab() {
           tags: editingNode.tags || [],
           description: editingNode.description || "",
           enabled: editingNode.enabled ?? true,
+          ssh_user: (editingNode.ssh_user || "root").trim(),
+          ssh_port: editingNode.ssh_port ?? 22,
         });
       }
       setEditingNode(null);
@@ -812,6 +819,50 @@ export default function MCPTab() {
           "\n\nA node with this host:port already exists." : ""));
     }
   }, [editingNode, refreshLists, mirrorRosterToCloud]);
+
+  // Reset the one-time SSH password + status whenever the edit target changes.
+  useEffect(() => {
+    setEditSshPass("");
+    setSshActionStatus("");
+  }, [editingNode?.id]);
+
+  // Adopt an already-installed node: push the cockpit revive key using the
+  // node's SSH password ONCE. After this, revive works for that node.
+  const handleInstallReviveKey = useCallback(async () => {
+    if (!editingNode) return;
+    if (!HAS_NATIVE_ROOT) { setSshActionStatus("✗ root shell unavailable (needs deployed APK)"); return; }
+    const host = (editingNode.host || "").trim();
+    if (!host) { setSshActionStatus("✗ set host first"); return; }
+    if (!editSshPass) { setSshActionStatus("✗ enter the node's SSH password (used once)"); return; }
+    setSshActionBusy(true); setSshActionStatus("↻ installing revive key…");
+    const r = await installReviveKey(
+      {
+        host,
+        sshUser: (editingNode.ssh_user || "root").trim(),
+        sshPass: editSshPass,
+        sshPort: editingNode.ssh_port ?? 22,
+      },
+      execChroot,
+    );
+    setSshActionStatus((r.ok ? "✓ " : "✗ ") + r.detail);
+    if (r.ok) setEditSshPass("");
+    setSshActionBusy(false);
+  }, [editingNode, editSshPass, execChroot]);
+
+  // Manual one-shot revive from the edit sheet (key-based).
+  const handleManualRevive = useCallback(async () => {
+    if (!editingNode) return;
+    const host = (editingNode.host || "").trim();
+    if (!host) { setSshActionStatus("✗ set host first"); return; }
+    if (!HAS_NATIVE_ROOT) { setSshActionStatus("✗ root shell unavailable (needs deployed APK)"); return; }
+    setSshActionBusy(true); setSshActionStatus("↻ sending revive…");
+    const r = await reviveNode(
+      host, execChroot, editingNode.ssh_port ?? 22, (editingNode.ssh_user || "root").trim(),
+    );
+    setSshActionStatus((r.ok ? "✓ " : "✗ ") + r.detail +
+      (r.ok ? "" : " — if auth failed, tap INSTALL REVIVE KEY first"));
+    setSshActionBusy(false);
+  }, [editingNode, execChroot]);
 
   const handleDeleteNode = useCallback((node: MCPNode) => {
     Alert.alert(
@@ -970,7 +1021,7 @@ export default function MCPTab() {
       return;
     }
     reviveAtRef.current[node.id] = Date.now();
-    const r = await reviveNode(node.host, execChroot);
+    const r = await reviveNode(node.host, execChroot, node.ssh_port ?? 22, node.ssh_user || "root");
     if (opts.manual) {
       Alert.alert(r.ok ? "Revive sent" : "Revive failed", `${node.name}: ${r.detail}`);
     } else {
@@ -2889,6 +2940,74 @@ export default function MCPTab() {
                 placeholderTextColor={C.textDim}
                 multiline
               />
+
+              {/* SSH + SELF-HEAL ─────────────────────────────────────── */}
+              <View style={{ marginTop: 18, borderTopColor: C.border, borderTopWidth: 1, paddingTop: 14 }}>
+                <Text style={[s.sectionTitle, { marginBottom: 6 }]}>{"// ssh + self-heal"}</Text>
+                <Text style={s.helperFine}>
+                  Lets the cockpit SSH-revive this node when it goes down. Wizard-provisioned
+                  nodes already have the key — adopt an older node by installing it once below.
+                </Text>
+                <View style={[s.row, { marginTop: 10 }]}>
+                  <View style={{ flex: 1, marginRight: 6 }}>
+                    <Text style={s.kvLabel}>ssh user</Text>
+                    <TextInput
+                      style={[s.input, { fontFamily: MONO }]}
+                      value={editingNode.ssh_user ?? "root"}
+                      onChangeText={(v) => setEditingNode((p) => p ? { ...p, ssh_user: v.trim() } : p)}
+                      autoCapitalize="none" autoCorrect={false}
+                      placeholder="root" placeholderTextColor={C.textDim}
+                    />
+                  </View>
+                  <View style={{ width: 90 }}>
+                    <Text style={s.kvLabel}>ssh port</Text>
+                    <TextInput
+                      style={[s.input, { fontFamily: MONO }]}
+                      value={String(editingNode.ssh_port ?? 22)}
+                      onChangeText={(v) => {
+                        const n = parseInt(v.replace(/[^\d]/g, ""), 10);
+                        setEditingNode((p) => p ? { ...p, ssh_port: isNaN(n) ? 22 : Math.min(65535, Math.max(1, n)) } : p);
+                      }}
+                      keyboardType="number-pad" placeholder="22" placeholderTextColor={C.textDim}
+                    />
+                  </View>
+                </View>
+                <Text style={[s.kvLabel, { marginTop: 12 }]}>ssh password (used once to install revive key)</Text>
+                <View style={s.row}>
+                  <TextInput
+                    style={[s.input, { flex: 1, fontFamily: MONO }]}
+                    value={editSshPass}
+                    onChangeText={setEditSshPass}
+                    placeholder="node SSH password" placeholderTextColor={C.textDim}
+                    secureTextEntry autoCapitalize="none" autoCorrect={false}
+                    editable={!sshActionBusy}
+                  />
+                  <TouchableOpacity
+                    style={[s.smallBtn, { marginLeft: 6, borderColor: C.green }]}
+                    disabled={sshActionBusy}
+                    onPress={handleInstallReviveKey}
+                  >
+                    <Text style={[s.smallBtnText, { color: C.green }]}>INSTALL KEY</Text>
+                  </TouchableOpacity>
+                </View>
+                <TouchableOpacity
+                  style={[s.btn, { backgroundColor: C.panel2, borderColor: C.cyan, marginTop: 10 }]}
+                  disabled={sshActionBusy}
+                  onPress={handleManualRevive}
+                >
+                  <MaterialCommunityIcons name="restart" size={14} color={C.cyan} />
+                  <Text style={[s.btnText, { color: C.cyan }]}>REVIVE NOW</Text>
+                </TouchableOpacity>
+                {sshActionStatus ? (
+                  <Text style={[s.helperFine, {
+                    marginTop: 8,
+                    color: sshActionStatus.startsWith("✓") ? C.green
+                      : sshActionStatus.startsWith("✗") ? C.red : C.yellow,
+                  }]}>
+                    {sshActionStatus}
+                  </Text>
+                ) : null}
+              </View>
 
               <View style={[s.row, { marginTop: 16, justifyContent: "space-between" }]}>
                 <TouchableOpacity
