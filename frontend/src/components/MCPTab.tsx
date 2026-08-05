@@ -1188,64 +1188,42 @@ export default function MCPTab() {
       ]);
       const peers = discovered.peers;
 
-      if (peers.length === 0 && roster.length === 0) {
-        // Surface the first failed probe's diagnostic — huge time-saver
-        // vs opening logcat. Ex: "socket unreachable inside chroot".
-        const diag = discovered.tried[0]?.note || "unknown";
+      if (roster.length === 0) {
+        // Roster is authoritative for what belongs in the swarm. If it's
+        // empty there's nothing to restore — we deliberately do NOT fall
+        // back to "add every enforcer-named tailnet peer", which would
+        // mass-add machines that were never part of the roster.
         throw new Error(
-          `nothing to restore. tailnet=0 peers (${diag}) AND redis roster is empty. ` +
-          `either fix chroot tailscale visibility, or add one node manually first.`,
+          "redis roster is empty — nothing to restore. Add a node (or provision one) so the roster gets populated first.",
         );
       }
       if (!rec?.token) {
         throw new Error("no bearer in upstash yet — add one node manually first so the bearer gets pushed, or paste one via [+ ADD NODE]");
       }
 
-      // Build a lookup from roster by name/host so we can enrich the
-      // tailnet-discovered entries (which only have hostname + IP).
-      const rosterByHost = new Map<string, RosterEntry>();
-      const rosterByName = new Map<string, RosterEntry>();
-      for (const r of roster) {
-        rosterByHost.set(r.host, r);
-        rosterByName.set(r.name.toLowerCase(), r);
-      }
-
-      let added = 0;
-      const seenHosts = new Set<string>();
-
-      // Tailnet-first: peers that ARE reachable right now win the IP.
+      // Index the live tailnet peers so we can refresh a roster member's
+      // current IP. Tailnet is used ONLY to enrich known roster entries —
+      // never to introduce new nodes.
+      const peerByName = new Map<string, typeof peers[number]>();
+      const peerByIp = new Map<string, typeof peers[number]>();
       for (const p of peers) {
-        seenHosts.add(p.tailIp);
-        const enriched = rosterByName.get(p.hostname.toLowerCase())
-          ?? rosterByHost.get(p.tailIp);
-        try {
-          await nodesLocal.upsert({
-            name: enriched?.name || p.hostname,
-            host: p.tailIp,
-            port: enriched?.port ?? 8765,
-            bearer_token: rec.token,
-            transport: enriched?.transport || "http_sse",
-            enabled: true,
-            is_primary: !!enriched?.is_primary,
-            tags: enriched?.tags?.length ? enriched.tags : [p.dnsName],
-            description: enriched?.description ||
-              `restored from tailnet ${new Date().toISOString().slice(0, 16)}`,
-          } as any);
-          added++;
-        } catch (e) { console.warn("[cloudSync] upsert failed for", p.hostname, e); }
+        peerByName.set(p.hostname.toLowerCase(), p);
+        peerByIp.set(p.tailIp, p);
       }
 
-      // Roster-only fallback: entries in Redis but NOT visible on tailnet
-      // right now. Still restore them — the node may be offline / user
-      // may be on a different network. They'll auto-verify when tailscale
-      // reconnects.
-      let rosterOnly = 0;
+      // Roster-authoritative restore: iterate the roster, and if a matching
+      // peer is live right now, prefer its current tailnet IP (handles IP
+      // churn); otherwise fall back to the roster's stored host.
+      let added = 0;
+      let liveMatched = 0;
       for (const r of roster) {
-        if (seenHosts.has(r.host)) continue; // already added via tailnet
+        const live = peerByName.get(r.name.toLowerCase()) ?? peerByIp.get(r.host);
+        const host = live?.tailIp || r.host;
+        if (live) liveMatched++;
         try {
           await nodesLocal.upsert({
             name: r.name,
-            host: r.host,
+            host,
             port: r.port,
             bearer_token: rec.token,
             transport: r.transport || "http_sse",
@@ -1253,16 +1231,15 @@ export default function MCPTab() {
             is_primary: !!r.is_primary,
             tags: r.tags || [],
             description: r.description ||
-              `restored from redis roster ${new Date().toISOString().slice(0, 16)}`,
+              `restored from roster ${new Date().toISOString().slice(0, 16)}`,
           } as any);
-          rosterOnly++;
           added++;
         } catch (e) { console.warn("[cloudSync] roster upsert failed for", r.name, e); }
       }
       await refreshLists();
       setCloudSyncStatus(
-        `ok: restored ${added} node(s) ` +
-        `(${peers.length} live on tailnet, ${rosterOnly} from redis roster only)`,
+        `ok: restored ${added} roster node(s) ` +
+        `(${liveMatched} IP-refreshed from tailnet, ${peers.length} peer(s) seen)`,
       );
     } catch (e: any) {
       setCloudSyncStatus(`err: ${e?.message || e}`);

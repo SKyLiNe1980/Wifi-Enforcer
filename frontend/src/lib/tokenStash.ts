@@ -64,7 +64,10 @@ export const TTL_ROSTER_SEC = 90 * 24 * 60 * 60;
 // purpose and actively breaks recovery. We give CURRENT the SAME long
 // TTL as the roster so the two survive together. (When real rotation
 // lands it can shorten this again, since the loop will keep re-asserting.)
-export const TTL_CURRENT_SEC = TTL_ROSTER_SEC;  // was 30min — see note above
+// NOTE: CURRENT is now written with NO TTL (persists forever) — see
+// rotateBearer(). This constant is retained only for a future rotation
+// loop that may re-introduce a short TTL once it actively refreshes.
+export const TTL_CURRENT_SEC = TTL_ROSTER_SEC;  // unused for CURRENT writes now
 export const TTL_PREVIOUS_SEC = 20 * 60;  // 20min — covers grace period well
 export const TTL_HEARTBEAT_SEC = 60 * 60; // 60min
 
@@ -215,9 +218,12 @@ export async function rotateBearer(
     ]);
   }
   // 3) Now write CURRENT.
+  //    NO expiry — the current bearer must persist indefinitely so a
+  //    cockpit reinstalled weeks later still finds it (reinstall recovery
+  //    is its whole purpose). A stale bearer is simply overwritten on the
+  //    next rotate/seed; it never needs to self-evict.
   await upstashCmd(restUrl, restToken, [
     "SET", KEY_CURRENT, JSON.stringify(newRec),
-    "EX", TTL_CURRENT_SEC,
   ]);
   // 4) Heartbeat.
   await upstashCmd(restUrl, restToken, [
