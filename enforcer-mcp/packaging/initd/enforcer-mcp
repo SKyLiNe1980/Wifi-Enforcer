@@ -1,0 +1,76 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          enforcer-mcp
+# Required-Start:    $network $remote_fs
+# Required-Stop:     $network $remote_fs
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: Enforcer MCP swarm node (non-systemd / chroot)
+# Description:       SysV init wrapper for nodes without systemd (Kali
+#                    chroot, minimal images). Runs server.py under a tiny
+#                    supervisor loop so a crash auto-respawns — the same
+#                    self-heal systemd's Restart= gives on real VPSes.
+### END INIT INFO
+#
+# enforcer-mcp init script.
+#   • start   — launch the supervisor (which runs + respawns server.py)
+#   • stop    — SIGTERM the supervisor (it kills its child), reap strays
+#   • restart — stop then start
+#   • status  — pidfile + liveness check (exit 0 running, 3 stopped)
+#
+# Runs as root (init scripts do), which is what a pentest node needs for
+# raw sockets / monitor mode — no CAP juggling required in the chroot.
+
+PIDFILE=/var/lib/enforcer-mcp/enforcer-mcp.pid
+SUPERVISOR=/usr/bin/enforcer-mcp-supervise
+LOG=/var/lib/enforcer-mcp/supervise.log
+STATE_DIR=/var/lib/enforcer-mcp
+
+is_running() {
+    [ -f "$PIDFILE" ] || return 1
+    _pid=$(cat "$PIDFILE" 2>/dev/null)
+    [ -n "$_pid" ] && kill -0 "$_pid" 2>/dev/null
+}
+
+case "$1" in
+    start)
+        if is_running; then
+            echo "enforcer-mcp: already running (supervisor pid $(cat "$PIDFILE"))"
+            exit 0
+        fi
+        mkdir -p "$STATE_DIR"
+        # Detach fully so the supervisor outlives this shell / the ssh
+        # session that kicked us off.
+        nohup "$SUPERVISOR" >>"$LOG" 2>&1 &
+        echo $! > "$PIDFILE"
+        echo "enforcer-mcp: started (supervisor pid $(cat "$PIDFILE"))"
+        ;;
+    stop)
+        if is_running; then
+            kill -TERM "$(cat "$PIDFILE")" 2>/dev/null || true
+        fi
+        rm -f "$PIDFILE"
+        # Belt-and-suspenders: sweep any server.py that slipped its leash.
+        pkill -f "server.py --config /etc/enforcer-mcp/config.yaml" 2>/dev/null || true
+        echo "enforcer-mcp: stopped"
+        ;;
+    restart|force-reload)
+        "$0" stop
+        sleep 1
+        "$0" start
+        ;;
+    status)
+        if is_running; then
+            echo "enforcer-mcp: running (supervisor pid $(cat "$PIDFILE"))"
+            exit 0
+        else
+            echo "enforcer-mcp: stopped"
+            exit 3
+        fi
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|status}" >&2
+        exit 1
+        ;;
+esac
+exit 0

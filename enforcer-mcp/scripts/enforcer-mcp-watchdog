@@ -1,0 +1,35 @@
+#!/bin/sh
+# enforcer-mcp-watchdog — cron safety net for non-systemd nodes.
+#
+# The init-script supervisor already respawns server.py on crash, but it
+# can't help if:
+#   • the supervisor process itself was killed (OOM, stray pkill),
+#   • the node rebooted and nothing re-ran the init script,
+#   • the server is alive-but-wedged (accepts no connections).
+#
+# This script — driven by /etc/cron.d/enforcer-mcp every couple of minutes
+# — covers those gaps. It's a no-op on healthy nodes.
+#
+# NOTE: requires cron to actually be running in the environment. On systemd
+# nodes we don't install this (systemd Restart= + WantedBy handle it).
+
+INITD=/etc/init.d/enforcer-mcp
+CONFIG=/etc/enforcer-mcp/config.yaml
+
+[ -x "$INITD" ] || exit 0
+
+# 1) Down entirely → start it.
+if ! "$INITD" status >/dev/null 2>&1; then
+    "$INITD" start
+    exit 0
+fi
+
+# 2) Alive but wedged → verify it actually answers /health, else restart.
+#    Pull the port straight out of the server: block in config.yaml.
+PORT=$(awk '/^server:/{f=1; next} /^[^[:space:]]/{f=0} f && /port:/{print $2; exit}' "$CONFIG" 2>/dev/null | tr -d '"')
+[ -z "$PORT" ] && PORT=8765
+
+if command -v curl >/dev/null 2>&1; then
+    curl -fsS -m 5 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 || "$INITD" restart
+fi
+exit 0

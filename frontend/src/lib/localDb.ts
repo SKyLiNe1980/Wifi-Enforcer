@@ -22,7 +22,7 @@ let _db: SQLite.SQLiteDatabase | null = null;
 // pre-migration → re-run the seed → insert 9 attack + 5 AI profiles AGAIN.
 // With 8 concurrent callers that produced 72 attack profiles. Fun.
 let _dbPromise: Promise<SQLite.SQLiteDatabase> | null = null;
-const TARGET_VERSION = 11;
+const TARGET_VERSION = 12;
 
 export async function openLocalDb(): Promise<SQLite.SQLiteDatabase> {
   if (_db) return _db;
@@ -366,6 +366,16 @@ async function runMigrations(db: SQLite.SQLiteDatabase) {
             ON mcp_nodes(enabled);
           CREATE INDEX IF NOT EXISTS idx_mcp_nodes_primary
             ON mcp_nodes(is_primary);
+        `);
+        break;
+      case 12:
+        // Phase 2b — remote node self-heal. When a provisioned remote node
+        // goes unreachable for a sustained window, the cockpit SSHes in
+        // (key-based, as root, using the keypair installed during the
+        // Add-Node wizard) and restarts the service. Opt-in — off by
+        // default so nobody's surprised by background SSH.
+        await db.execAsync(`
+          ALTER TABLE mcp_config ADD COLUMN remote_revive_enabled INTEGER DEFAULT 0;
         `);
         break;
       default:
@@ -874,6 +884,7 @@ export type MCPConfig = {
   chroot_yaml_cmd: string;
   chroot_autosync_enabled: boolean;
   last_chroot_sync_at: string | null;
+  remote_revive_enabled: boolean;
   updated_at: string;
 };
 export type MCPTool = {
@@ -925,6 +936,7 @@ export const mcpLocal = {
       chroot_yaml_cmd: row.chroot_yaml_cmd || 'cat /etc/enforcer-mcp/config.yaml',
       chroot_autosync_enabled: !!row.chroot_autosync_enabled,
       last_chroot_sync_at: row.last_chroot_sync_at || null,
+      remote_revive_enabled: !!row.remote_revive_enabled,
       server_enabled: !!row.server_enabled,
       require_token: !!row.require_token,
     };
@@ -944,6 +956,7 @@ export const mcpLocal = {
         bearer_token=?, transport=?, require_token=?,
         autospawn_enabled=?, autospawn_cmd=?,
         chroot_yaml_cmd=?, chroot_autosync_enabled=?, last_chroot_sync_at=?,
+        remote_revive_enabled=?,
         updated_at=? WHERE id = 1`,
       [
         merged.server_enabled ? 1 : 0,
@@ -958,6 +971,7 @@ export const mcpLocal = {
         merged.chroot_yaml_cmd,
         merged.chroot_autosync_enabled ? 1 : 0,
         merged.last_chroot_sync_at,
+        merged.remote_revive_enabled ? 1 : 0,
         merged.updated_at,
       ],
     );
