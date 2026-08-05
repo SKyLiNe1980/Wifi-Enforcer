@@ -16,6 +16,13 @@ server:
   mcp_path: "/mcp"
   bearer_token_hex: "REPLACE_WITH_64_HEX_CHARS_FROM_COCKPIT_MCP_TAB"
   require_token: true
+  # Absolute path for the audit SQLite DB. MUST live under a writable dir
+  # (systemd's ProtectSystem=full makes /etc read-only inside the service
+  # mount namespace, so the "next-to-config" fallback crashes on startup).
+  # server.py reads this as `server.db_path`. The .deb postinst guarantees
+  # this line is present; keeping it in the template means fresh installs
+  # never boot without it.
+  db_path: "/var/lib/enforcer-mcp/audit.db"
   # Cap audit log to N most-recent entries. Server trims on every insert.
   audit_max_entries: 2000
   # Optional CORS allowlist for the /audit/since + /health endpoints when

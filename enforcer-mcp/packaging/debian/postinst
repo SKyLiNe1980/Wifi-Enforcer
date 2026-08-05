@@ -54,15 +54,18 @@ case "$1" in
                 "$INSTALL_DIR/config.yaml.example" > "$CONFIG_FILE"
             # systemd's ProtectSystem=full makes /etc read-only inside the
             # service's mount namespace — the default "next-to-config"
-            # audit DB path would crash on startup. Inject an explicit
-            # absolute path under the writable state dir.
-            if grep -q '^audit:' "$CONFIG_FILE"; then
-                # Insert db_path right after the `audit:` line.
-                sed -i "/^audit:/a\\  db_path: \"$STATE_DIR/audit.db\"" "$CONFIG_FILE"
-            else
-                # No audit: block in the template — append a fresh one.
-                printf '\naudit:\n  db_path: "%s/audit.db"\n' "$STATE_DIR" \
-                    >> "$CONFIG_FILE"
+            # audit DB path would crash on startup. The bundled template
+            # now ships an explicit server.db_path, but guard anyway in
+            # case an operator stripped it: only inject if truly absent.
+            if ! grep -q 'db_path:' "$CONFIG_FILE"; then
+                if grep -q '^audit:' "$CONFIG_FILE"; then
+                    # Insert db_path right after the `audit:` line.
+                    sed -i "/^audit:/a\\  db_path: \"$STATE_DIR/audit.db\"" "$CONFIG_FILE"
+                else
+                    # No audit: block — append a fresh top-level one.
+                    printf '\naudit:\n  db_path: "%s/audit.db"\n' "$STATE_DIR" \
+                        >> "$CONFIG_FILE"
+                fi
             fi
             chown root:"$GROUP_NAME" "$CONFIG_FILE"
             chmod 0640 "$CONFIG_FILE"
@@ -76,6 +79,22 @@ case "$1" in
             chown root:"$GROUP_NAME" "$CONFIG_FILE" || true
             chmod 0640 "$CONFIG_FILE" || true
             echo "enforcer-mcp: existing config preserved at $CONFIG_FILE"
+            # ── 3a. db_path self-heal ────────────────────────────────────
+            # Older/partial installs sometimes ended up WITHOUT a db_path
+            # anywhere in config.yaml, which makes server.py fall back to
+            # the /etc "next-to-config" path — read-only under systemd's
+            # ProtectSystem=full → the service crash-loops on boot. If this
+            # config is missing db_path, inject it now so the upgrade also
+            # repairs the broken node. Safe: we only ADD a missing line.
+            if ! grep -q 'db_path:' "$CONFIG_FILE"; then
+                if grep -q '^audit:' "$CONFIG_FILE"; then
+                    sed -i "/^audit:/a\\  db_path: \"$STATE_DIR/audit.db\"" "$CONFIG_FILE"
+                else
+                    printf '\naudit:\n  db_path: "%s/audit.db"\n' "$STATE_DIR" \
+                        >> "$CONFIG_FILE"
+                fi
+                echo "enforcer-mcp: repaired missing audit db_path → $STATE_DIR/audit.db"
+            fi
             # ── 3b. loopback-bind trap (pre-0.3.1 default) ──────────────
             # Fresh installs before 0.3.1 defaulted server.host to
             # "127.0.0.1", which made the node invisible to remote
@@ -151,10 +170,33 @@ case "$1" in
             # so it's safe on both paths.
             systemctl start enforcer-mcp.service || true
         else
-            echo "enforcer-mcp: no real systemd detected — this looks like a"
-            echo "enforcer-mcp:   chroot / non-systemd environment. Lifecycle is"
-            echo "enforcer-mcp:   managed by the cockpit's autospawn (// mcp →"
-            echo "enforcer-mcp:   Autospawn toggle). Not touching systemctl."
+            # ── non-systemd (Kali chroot / minimal image) ──────────────
+            # No systemd Restart= to lean on, so we self-manage lifecycle
+            # with the shipped SysV init script + a supervisor loop, plus a
+            # cron watchdog as a second safety net. This is the node-side
+            # equivalent of the cockpit's autospawn — but local to the node
+            # so it self-heals even when the cockpit is asleep/offline.
+            echo "enforcer-mcp: no real systemd detected — using SysV init + cron self-heal."
+            if [ -f /etc/init.d/enforcer-mcp ]; then
+                chmod 0755 /etc/init.d/enforcer-mcp
+                if command -v update-rc.d >/dev/null 2>&1; then
+                    update-rc.d enforcer-mcp defaults >/dev/null 2>&1 || true
+                fi
+                # Cron watchdog — restarts the service if it's down or wedged.
+                # Requires cron to be running in the environment; harmless if
+                # it isn't (the init supervisor still covers crash-respawn).
+                cat > /etc/cron.d/enforcer-mcp <<'CRON'
+# enforcer-mcp self-heal watchdog (non-systemd nodes). Every 2 minutes.
+*/2 * * * * root /usr/bin/enforcer-mcp-watchdog >/dev/null 2>&1
+CRON
+                chmod 0644 /etc/cron.d/enforcer-mcp
+                # Start now (idempotent — no-op if already running).
+                /etc/init.d/enforcer-mcp start || true
+                echo "enforcer-mcp:   started via /etc/init.d/enforcer-mcp + installed cron watchdog"
+            else
+                echo "enforcer-mcp:   WARNING — /etc/init.d/enforcer-mcp missing; cannot self-manage."
+                echo "enforcer-mcp:   Lifecycle falls back to the cockpit's autospawn toggle."
+            fi
         fi
         ;;
 

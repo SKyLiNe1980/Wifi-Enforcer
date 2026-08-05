@@ -44,6 +44,8 @@ import {
 } from "../lib/tokenStash";
 import NodesMap from "./NodesMap";
 import { callMcpTool } from "../lib/mcpClient";
+import ProvisionNodeModal, { type NodeDraft } from "./ProvisionNodeModal";
+import { reviveNode } from "../lib/nodeProvision";
 
 // Keep palette identical to the rest of the cockpit so the tab feels native.
 const C = {
@@ -87,6 +89,7 @@ export default function MCPTab() {
   const [nodeHealth, setNodeHealth] = useState<Record<string, string>>({});
   const [nodeToolCount, setNodeToolCount] = useState<Record<string, number>>({});
   const [editingNode, setEditingNode] = useState<Partial<MCPNode> | null>(null);
+  const [provisionOpen, setProvisionOpen] = useState(false);
   // Node-map tap sheets (// status pane radial map)
   const [mapSheetNode, setMapSheetNode] = useState<MCPNode | null>(null);
   const [showLocalSheet, setShowLocalSheet] = useState(false);
@@ -654,6 +657,10 @@ export default function MCPTab() {
   // probes in parallel via Promise.allSettled so a 3.5s timeout on one
   // dead node doesn't block the others. Snapshot results back to SQLite
   // so the // nodes view paints instantly on tab switch.
+  // Auto-revive dispatcher — populated by an effect below so probeNode
+  // (deps []) can trigger it without stale closures.
+  const autoReviveRef = useRef<((n: MCPNode, status: string) => void) | null>(null);
+
   const probeNode = useCallback(async (node: MCPNode) => {
     if (!node.enabled) return;
     setNodeHealth((p) => ({ ...p, [node.id]: "probing" }));
@@ -682,6 +689,7 @@ export default function MCPTab() {
       await nodesLocal.updateHealth(node.id, {
         status: "running", info, tool_count: toolCount,
       });
+      autoReviveRef.current?.(node, "running");
     } catch (e: any) {
       const msg = e?.message || String(e);
       const isUnreachable = msg.includes("Network") || msg.includes("aborted") ||
@@ -690,6 +698,7 @@ export default function MCPTab() {
       const status = isUnreachable ? "unreachable" : "error";
       setNodeHealth((p) => ({ ...p, [node.id]: status }));
       await nodesLocal.updateHealth(node.id, { status });
+      autoReviveRef.current?.(node, status);
     }
   }, []);
 
@@ -905,6 +914,77 @@ export default function MCPTab() {
     );
   }, [nodes, updateOneNode]);
 
+  // ─── Node provisioning + remote revive ───────────────────────────────
+  // execChroot for nodeProvision helpers: enter Kali via the same
+  // settings.chroot_path wrapper the rest of the tab uses.
+  const execChroot = useCallback(async (inner: string) => {
+    const wrapped = await wrapChrootCmd(inner);
+    const r = await execReal(wrapped);
+    return { output: r.output, exit_code: r.exit_code };
+  }, [wrapChrootCmd]);
+
+  // Persist a freshly-provisioned node into the roster (+ cloud mirror).
+  const handleNodeProvisioned = useCallback(async (draft: NodeDraft) => {
+    try {
+      await nodesLocal.upsert({
+        name: draft.name,
+        host: draft.host,
+        port: draft.port,
+        bearer_token: draft.bearer_token,
+        transport: "http_sse",
+        enabled: true,
+        is_primary: false,
+        tags: draft.is_systemd === false ? ["sysv"] : [],
+        description: draft.description,
+      } as any);
+      await refreshLists();
+      mirrorRosterToCloud();
+      Alert.alert("Node provisioned", `${draft.name} added to the roster.`);
+    } catch (e: any) {
+      Alert.alert("Save failed", e?.message || String(e));
+    }
+  }, [refreshLists, mirrorRosterToCloud]);
+
+  // Auto-revive bookkeeping: consecutive-unreachable count + last attempt
+  // per node id, so we only SSH-kick after a sustained outage and never
+  // hammer a box that's legitimately being rebuilt.
+  const reviveMissRef = useRef<Record<string, number>>({});
+  const reviveAtRef = useRef<Record<string, number>>({});
+  const REVIVE_MISS_THRESHOLD = 3;    // ~30s unreachable at the 10s probe cadence
+  const REVIVE_COOLDOWN_MS = 120_000; // 2 min between attempts per node
+
+  const reviveOneNode = useCallback(async (node: MCPNode, opts: { manual?: boolean } = {}) => {
+    if (!HAS_NATIVE_ROOT) {
+      if (opts.manual) Alert.alert("Root shell unavailable", "Revive needs the deployed APK (not Expo Go / web).");
+      return;
+    }
+    reviveAtRef.current[node.id] = Date.now();
+    const r = await reviveNode(node.host, execChroot);
+    if (opts.manual) {
+      Alert.alert(r.ok ? "Revive sent" : "Revive failed", `${node.name}: ${r.detail}`);
+    } else {
+      console.log(`[revive] ${node.name}: ${r.ok ? "sent" : "failed"} — ${r.detail}`);
+    }
+  }, [execChroot]);
+
+  // Wire the auto-revive dispatcher used by probeNode. Fires an SSH revive
+  // only after a sustained outage (miss threshold) + honours a per-node
+  // cooldown. Guarded by the opt-in remote_revive_enabled flag.
+  useEffect(() => {
+    autoReviveRef.current = (node: MCPNode, status: string) => {
+      if (status === "running") { reviveMissRef.current[node.id] = 0; return; }
+      if (status !== "unreachable") return;
+      if (!configRef.current?.remote_revive_enabled) return;
+      const miss = (reviveMissRef.current[node.id] || 0) + 1;
+      reviveMissRef.current[node.id] = miss;
+      if (miss < REVIVE_MISS_THRESHOLD) return;
+      const last = reviveAtRef.current[node.id] || 0;
+      if (Date.now() - last < REVIVE_COOLDOWN_MS) return;
+      reviveOneNode(node);
+    };
+  }, [reviveOneNode]);
+
+
 
   // ─── Tier 1 deploy state ────────────────────────────────────────────
   // The user taps [DEPLOY NEW NODE], we:
@@ -976,12 +1056,12 @@ export default function MCPTab() {
         setCloudSyncTokenSaved(true);
         setCloudSyncToken("");
       }
-      // Auto-snapshot right after save. This is the whole point of the
-      // Cloud Sync — the user should be able to verify Redis is populated
-      // on the very next power cycle without having to add/edit a node
-      // first. If the DB is empty (fresh install), this is a no-op with
-      // roster=[]; still writes the update timestamp so RESTORE has
-      // something to eyeball.
+      // After saving creds, reconcile local ↔ cloud. CRITICAL data-loss
+      // guard: on a fresh reinstall the local roster is EMPTY, and blindly
+      // pushing that empty array would WIPE the cloud roster. So we branch
+      // on local roster size:
+      //   • local EMPTY  → PULL from cloud (auto-restore), never push [].
+      //   • local NON-EMPTY → PUSH snapshot as before.
       const [finalUrl, finalTok] = await Promise.all([loadUpstashUrl(), loadUpstashToken()]);
       if (finalUrl && finalTok) {
         try {
@@ -991,6 +1071,46 @@ export default function MCPTab() {
             transport: n.transport, is_primary: n.is_primary,
             tags: n.tags, description: n.description,
           }));
+
+          if (roster.length === 0) {
+            // ── Fresh install / empty local → PULL, never overwrite cloud ──
+            const [cloudRoster, rec] = await Promise.all([
+              fetchRoster(finalUrl, finalTok),
+              fetchCurrentBearer(finalUrl, finalTok),
+            ]);
+            if (cloudRoster.length > 0) {
+              let added = 0;
+              const stamp = new Date().toISOString().slice(0, 16);
+              for (const r of cloudRoster) {
+                try {
+                  await nodesLocal.upsert({
+                    name: r.name,
+                    host: r.host,
+                    port: r.port,
+                    bearer_token: rec?.token || "",
+                    transport: r.transport || "http_sse",
+                    enabled: true,
+                    is_primary: !!r.is_primary,
+                    tags: r.tags || [],
+                    description: r.description || `restored from cloud ${stamp}`,
+                  } as any);
+                  added++;
+                } catch (e) { console.warn("[cloudSync] auto-restore upsert failed for", r.name, e); }
+              }
+              await refreshLists();
+              setCloudSyncStatus(
+                `ok: creds saved + auto-restored ${added} node${added === 1 ? "" : "s"} from cloud` +
+                (rec?.token ? "" : " (no bearer in cloud yet — add one to connect)"),
+              );
+              return;
+            }
+            // Cloud is ALSO empty — nothing to pull, and we must NOT push an
+            // empty array. Just confirm creds are stored.
+            setCloudSyncStatus("ok: creds saved (local + cloud both empty — add a node to seed the cloud)");
+            return;
+          }
+
+          // ── Local has nodes → safe to push snapshot ──
           await pushRoster(finalUrl, finalTok, roster);
           // Also seed the bearer if a local node has one and Redis
           // doesn't yet — solves the chicken-and-egg where DISCOVER
@@ -1006,7 +1126,7 @@ export default function MCPTab() {
           setCloudSyncStatus(`ok: creds saved + snapshot pushed (${roster.length} node${roster.length === 1 ? "" : "s"})`);
           return;
         } catch (e: any) {
-          setCloudSyncStatus(`ok: creds saved (snapshot failed: ${e?.message || e})`);
+          setCloudSyncStatus(`ok: creds saved (sync failed: ${e?.message || e})`);
           return;
         }
       }
@@ -1014,7 +1134,7 @@ export default function MCPTab() {
     } catch (e: any) {
       setCloudSyncStatus(`err: ${e?.message || e}`);
     } finally { setCloudSyncBusy(false); }
-  }, [cloudSyncUrl, cloudSyncToken]);
+  }, [cloudSyncUrl, cloudSyncToken, refreshLists]);
 
   const handleTestCloudSync = useCallback(async () => {
     setCloudSyncBusy(true);
@@ -1162,6 +1282,18 @@ export default function MCPTab() {
         transport: n.transport, is_primary: n.is_primary,
         tags: n.tags, description: n.description,
       }));
+      if (roster.length === 0) {
+        // Refuse to push an empty roster — that would wipe any cloud roster
+        // a sibling cockpit / previous install already populated.
+        const cloudRoster = await fetchRoster(url, tok);
+        if (cloudRoster.length > 0) {
+          setCloudSyncStatus(
+            `skipped: local is empty but cloud has ${cloudRoster.length} node(s). ` +
+            `Use RESTORE to pull them down instead of overwriting the cloud.`,
+          );
+          return;
+        }
+      }
       await pushRoster(url, tok, roster);
       let bearerPushed = false;
       const localBearer = rows.find((n) => n.bearer_token)?.bearer_token;
@@ -2121,6 +2253,17 @@ export default function MCPTab() {
               </Text>
             </TouchableOpacity>
             <TouchableOpacity
+              style={[s.btn, { flexGrow: 1, flexBasis: "47%", backgroundColor: C.panel2, borderColor: C.green }]}
+              onPress={() => setProvisionOpen(true)}
+              disabled={!HAS_NATIVE_ROOT}
+            >
+              <MaterialCommunityIcons name="server-plus" size={14}
+                color={HAS_NATIVE_ROOT ? C.green : C.textDim} />
+              <Text style={[s.btnText, { color: HAS_NATIVE_ROOT ? C.green : C.textDim }]}>
+                PROVISION NODE
+              </Text>
+            </TouchableOpacity>
+            <TouchableOpacity
               style={[s.btn, { flexGrow: 1, flexBasis: "47%", backgroundColor: C.panel2, borderColor: C.mcpAccent }]}
               onPress={() => setEditingNode({
                 name: "", host: "", port: 8765, bearer_token: "",
@@ -2196,6 +2339,23 @@ export default function MCPTab() {
                 UPDATE ALL NODES
               </Text>
             </TouchableOpacity>
+          </View>
+
+          {/* Remote self-heal toggle — SSH-revives a node (as root, via the
+              key installed at provision time) after a sustained outage. */}
+          <View style={[s.row, { alignItems: "center", justifyContent: "space-between", marginBottom: 14 }]}>
+            <View style={{ flex: 1, paddingRight: 10 }}>
+              <Text style={[s.btnText, { color: C.text }]}>Auto-revive unreachable nodes</Text>
+              <Text style={{ color: C.textDim, fontFamily: MONO, fontSize: 10, marginTop: 2 }}>
+                SSH-restarts a provisioned node after ~30s down (2 min cooldown)
+              </Text>
+            </View>
+            <Switch
+              value={!!config.remote_revive_enabled}
+              onValueChange={(v) => patchConfig({ remote_revive_enabled: v })}
+              trackColor={{ true: C.green, false: C.border }}
+              thumbColor={config.remote_revive_enabled ? C.green : C.textDim}
+            />
           </View>
 
           <Text style={[s.sectionTitle, { marginBottom: 10 }]}>{"// nodes map"}</Text>
@@ -2761,6 +2921,13 @@ export default function MCPTab() {
           </View>
         </View>
       )}
+      {/* PROVISION NODE WIZARD ───────────────────────────────────────── */}
+      <ProvisionNodeModal
+        visible={provisionOpen}
+        onClose={() => setProvisionOpen(false)}
+        onProvisioned={handleNodeProvisioned}
+      />
+
       {/* DEPLOY NEW NODE MODAL ───────────────────────────────────────── */}
       {deployOpen && (
         <View style={s.overlay} pointerEvents="auto">

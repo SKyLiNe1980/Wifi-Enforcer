@@ -121,6 +121,13 @@ install -d -m 0755 "$STAGE/lib/systemd/system"
 install -m 0644 "$SCRIPT_DIR/systemd/enforcer-mcp.service" \
                 "$STAGE/lib/systemd/system/enforcer-mcp.service"
 
+# SysV init script — for non-systemd nodes (Kali chroot, minimal images).
+# postinst registers it (update-rc.d) + installs a cron watchdog ONLY when
+# real systemd is absent; on systemd hosts it sits inert and unused.
+install -d -m 0755 "$STAGE/etc/init.d"
+install -m 0755 "$SCRIPT_DIR/initd/enforcer-mcp" \
+                "$STAGE/etc/init.d/enforcer-mcp"
+
 # Empty /etc/enforcer-mcp/ — postinst populates it on first install,
 # `conffiles` protects it on upgrade. Creating the dir here so dpkg owns it.
 install -d -m 0755 "$STAGE/etc/enforcer-mcp"

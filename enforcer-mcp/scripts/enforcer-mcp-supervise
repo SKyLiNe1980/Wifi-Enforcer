@@ -1,0 +1,41 @@
+#!/bin/sh
+# enforcer-mcp-supervise — minimal restart loop for non-systemd nodes.
+#
+# Why this exists: Kali chroots (and other minimal images) have no systemd,
+# so there's no `Restart=on-failure` to bounce the MCP server when it dies.
+# This tiny supervisor gives the same self-heal: run server.py, and if it
+# exits for ANY reason, log it and respawn after a short backoff.
+#
+# The init script (/etc/init.d/enforcer-mcp) launches THIS under nohup and
+# records ITS pid. On `stop`, the init script SIGTERMs us; the trap below
+# forwards the signal to the live server child and exits the loop cleanly.
+
+VENVPY=/opt/enforcer-mcp/.venv/bin/python
+SERVER=/opt/enforcer-mcp/server.py
+CONFIG=/etc/enforcer-mcp/config.yaml
+BACKOFF=3
+
+child=""
+_term() {
+    [ -n "$child" ] && kill -TERM "$child" 2>/dev/null
+    exit 0
+}
+trap _term TERM INT
+
+# Fall back to system python3 if the venv interpreter is missing — better a
+# possibly-degraded server than none at all (postinst normally builds the
+# venv, but an offline first-boot may have skipped it).
+if [ ! -x "$VENVPY" ]; then
+    VENVPY=$(command -v python3 || echo python3)
+fi
+
+echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] supervisor up — interpreter=$VENVPY"
+while true; do
+    "$VENVPY" "$SERVER" --config "$CONFIG" &
+    child=$!
+    wait "$child"
+    code=$?
+    child=""
+    echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] server exited (code $code) — respawning in ${BACKOFF}s"
+    sleep "$BACKOFF"
+done
