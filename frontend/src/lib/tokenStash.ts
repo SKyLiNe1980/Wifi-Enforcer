@@ -54,7 +54,17 @@ export const TTL_ROSTER_SEC = 90 * 24 * 60 * 60;
 
 // Suggested TTLs so orphaned rows self-evict from Upstash if the cockpit
 // stops rotating (e.g. app uninstalled while a rotation was in flight).
-export const TTL_CURRENT_SEC = 30 * 60;   // 30min — 2× rotation cadence
+//
+// IMPORTANT — reinstall recovery: the CURRENT bearer is the key a
+// freshly-reinstalled cockpit needs to re-authenticate to every node. A
+// short TTL here made the bearer silently self-evict long before the
+// operator reinstalled, so the roster restored but every node came back
+// token-less ("roster stays, bearer gone"). The ~15-min rotation loop
+// that would keep it fresh isn't live yet, so a short TTL serves no
+// purpose and actively breaks recovery. We give CURRENT the SAME long
+// TTL as the roster so the two survive together. (When real rotation
+// lands it can shorten this again, since the loop will keep re-asserting.)
+export const TTL_CURRENT_SEC = TTL_ROSTER_SEC;  // was 30min — see note above
 export const TTL_PREVIOUS_SEC = 20 * 60;  // 20min — covers grace period well
 export const TTL_HEARTBEAT_SEC = 60 * 60; // 60min
 

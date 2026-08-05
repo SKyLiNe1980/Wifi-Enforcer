@@ -741,6 +741,17 @@ export default function MCPTab() {
       }));
       await pushRoster(url, tok, roster);
       console.log(`[cloudSync] mirrored ${roster.length} node(s) to Upstash`);
+      // Keep the cloud bearer alive alongside the roster: if any local node
+      // carries a token and Redis has none (expired / never seeded), push it
+      // so reinstall recovery always finds BOTH roster and bearer. Uses the
+      // long roster-matched TTL now, so it survives to the next reinstall.
+      const localBearer = rows.find((n) => n.bearer_token)?.bearer_token;
+      if (localBearer) {
+        try {
+          const existing = await fetchCurrentBearer(url, tok);
+          if (!existing?.token) await rotateBearer(url, tok, localBearer);
+        } catch (e) { console.warn("[cloudSync] bearer seed skipped:", e); }
+      }
     } catch (e) {
       console.warn("[cloudSync] mirrorRosterToCloud failed:", e);
     }
