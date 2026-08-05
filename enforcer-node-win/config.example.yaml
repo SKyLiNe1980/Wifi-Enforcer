@@ -1,0 +1,24 @@
+# enforcer-node-win config.yaml
+# Same shape as the Linux nodes' config.yaml so the fleet stays consistent.
+# Place this next to enforcer-node.exe (the service finds it automatically),
+# or pass --config <path>.
+
+server:
+  host: "0.0.0.0"          # bind all interfaces (incl. the Tailscale one)
+  port: 8765               # cockpit probes http://<tailscale-ip>:8765/health
+  # MUST match this node's entry in the cockpit roster. Paste the 64-hex
+  # bearer the cockpit generated for this node (Edit Node → bearer token).
+  bearer_token_hex: "REPLACE_WITH_64_HEX_FROM_COCKPIT"
+  require_token: true
+  mcp_path: "/mcp"
+
+node:
+  name: "win-gpu-01"
+  # Advertised via /health so the cockpit can schedule GPU work.
+  # "cuda" is auto-appended at runtime if nvidia-smi is present.
+  capabilities: ["hashcat", "cuda"]
+
+tools:
+  # Full path if hashcat isn't on PATH, e.g. "C:\\tools\\hashcat\\hashcat.exe"
+  hashcat_path: "hashcat"
+  exec_timeout_sec: 300
