@@ -64,9 +64,15 @@ try {
     Write-Host "-> firewall rule added for TCP $Port"
 } catch { Write-Host "warning: could not add firewall rule: $_" }
 
-# Register + start the service (idempotent-ish: uninstall first if present).
+# Register + start the service. If a previous install exists, remove it first —
+# but only when it's actually present (a blind `uninstall` on a fresh box makes
+# the binary log.Fatal to stderr, which PowerShell surfaces as a red error).
 $exe = Join-Path $InstallDir "enforcer-node.exe"
-& $exe uninstall 2>$null | Out-Null
+if (Get-Service -Name "enforcer-node" -ErrorAction SilentlyContinue) {
+    Write-Host "-> existing service found, removing it first"
+    & $exe uninstall | Out-Null
+    Start-Sleep -Seconds 1
+}
 & $exe install --config $configPath
 Write-Host ""
 Write-Host "Installed. Verify locally:  curl http://localhost:$Port/health"
