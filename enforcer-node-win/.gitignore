@@ -1,0 +1,5 @@
+# build artifacts
+/dist/
+*.exe
+enforcer-node
+config.yaml

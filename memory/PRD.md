@@ -67,3 +67,42 @@ authorized_keys. Nothing on the node's login policy changes; enforcer stays
 CANNOT be tested in sandbox/Expo Go (needs native root shell + real nodes + SSH).
 Verification here = lint + shellcheck-style + base64 correctness + .deb build.
 Requires on-device build test by the operator.
+
+### Follow-up fixes (bearer persistence, roster-authoritative restore, adopt-node revive)
+- **Bearer never expires:** `rotateBearer` writes `enforcer:bearer:current` with
+  NO TTL (was 30-min `EX`). Redis expiry deletes the whole key, which is why the
+  key "vanished" — not an installer wipe. Confirmed nothing in app/scripts DELs
+  the bearer/roster keys (only `enforcer-cloud-restore --wipe` touches
+  `enforcer:mcp:*`, a different namespace, opt-in).
+- **RESTORE FROM CLOUD is roster-authoritative:** iterates the Redis roster and
+  restores exactly those nodes; tailnet discovery is used ONLY to refresh a known
+  member's live IP, never to mass-add `enforcer-node`-named peers. Empty roster →
+  errors instead of tailnet fallback.
+- **Adopt-an-old-node revive:** per-node `ssh_user`/`ssh_port` (schema v13);
+  Edit Node now has SSH user/port fields + "INSTALL KEY" (one-time password
+  bootstrap of the cockpit revive key) + "REVIVE NOW". reviveNode/auto-revive use
+  per-node SSH details. `installReviveKey()` added to nodeProvision.ts.
+
+### Windows (win64) node — Phase 1 (`/app/enforcer-node-win/`)
+Go binary that speaks the SAME contract as the Python nodes so the cockpit
+drives it with zero special-casing. Hand-rolled MCP on the Go **stdlib**
+(`net/http`) — no MCP SDK, no cgo (`CGO_ENABLED=0`).
+- Endpoints: public `GET /health` (reports tools + `capabilities` + node/version),
+  `POST /mcp` MCP 2025 Streamable-HTTP (initialize→Mcp-Session-Id header→
+  notifications/initialized→tools/list/tools/call, DELETE teardown), aux
+  `GET /tools`; bearer middleware (skips /health), all mirroring server.py.
+- Tools: `exec_command` ({cmd}, cmd /C) + `hashcat` ({args}). `capabilities`
+  config-driven; auto-appends "cuda" if nvidia-smi present.
+- Windows service via `golang.org/x/sys/windows/svc` + `mgr` (auto-start +
+  SetRecoveryActions restart-on-failure = Windows analogue of systemd Restart=)
+  + eventlog. Self-installing: `enforcer-node.exe install|uninstall|start|stop|run`.
+- Cross-platform core: same binary runs on Linux (`run`) for MCP smoke-testing
+  without a Windows box (service code is build-tagged windows-only + Linux stubs).
+- Files: go.mod, main.go, config.go, server.go, tools.go, service_windows.go,
+  service_other.go, config.example.yaml, build.sh/build.ps1, install.ps1, README.md.
+- NOT tested here (no Go toolchain in sandbox). Verify: `./build.sh` then run the
+  Linux binary + curl the MCP handshake (README has the exact commands), then
+  build .exe + install.ps1 on the Windows box.
+- Deferred: Phase 2 tray helper (session-0 service can't own a tray → separate
+  per-user autostart helper polling localhost/health); Phase 3 cockpit reads
+  capabilities + hashcat job dispatch (replaces synchronous tools/call).

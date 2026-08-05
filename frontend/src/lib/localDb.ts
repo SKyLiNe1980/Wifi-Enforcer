@@ -22,7 +22,7 @@ let _db: SQLite.SQLiteDatabase | null = null;
 // pre-migration → re-run the seed → insert 9 attack + 5 AI profiles AGAIN.
 // With 8 concurrent callers that produced 72 attack profiles. Fun.
 let _dbPromise: Promise<SQLite.SQLiteDatabase> | null = null;
-const TARGET_VERSION = 12;
+const TARGET_VERSION = 13;
 
 export async function openLocalDb(): Promise<SQLite.SQLiteDatabase> {
   if (_db) return _db;
@@ -376,6 +376,16 @@ async function runMigrations(db: SQLite.SQLiteDatabase) {
         // default so nobody's surprised by background SSH.
         await db.execAsync(`
           ALTER TABLE mcp_config ADD COLUMN remote_revive_enabled INTEGER DEFAULT 0;
+        `);
+        break;
+      case 13:
+        // Per-node SSH connection details so the cockpit can revive / manage
+        // ANY node (not just wizard-provisioned ones). Older/hand-installed
+        // nodes can now be given revive capability via Edit Node → Install
+        // Revive Key. Defaults match the wizard (root@host:22).
+        await db.execAsync(`
+          ALTER TABLE mcp_nodes ADD COLUMN ssh_user TEXT DEFAULT 'root';
+          ALTER TABLE mcp_nodes ADD COLUMN ssh_port INTEGER DEFAULT 22;
         `);
         break;
       default:
@@ -1322,6 +1332,8 @@ export type MCPNode = {
   is_primary: boolean;
   tags: string[];
   description: string;
+  ssh_user: string;
+  ssh_port: number;
   last_seen_at: string | null;
   last_health_status: string | null;
   last_health_info: Record<string, unknown> | null;
@@ -1336,6 +1348,7 @@ type NodeRow = {
   bearer_token: string; transport: string;
   enabled: number; is_primary: number;
   tags_json: string; description: string;
+  ssh_user: string | null; ssh_port: number | null;
   last_seen_at: string | null;
   last_health_status: string | null;
   last_health_info_json: string | null;
@@ -1365,6 +1378,8 @@ function rowToNode(row: NodeRow, bearerFromSecure?: string | null): MCPNode {
     is_primary: !!row.is_primary,
     tags,
     description: row.description || "",
+    ssh_user: row.ssh_user || "root",
+    ssh_port: row.ssh_port ?? 22,
     last_seen_at: row.last_seen_at,
     last_health_status: row.last_health_status,
     last_health_info: healthInfo,
@@ -1404,6 +1419,7 @@ export const nodesLocal = {
     bearer_token?: string; transport?: "http_sse" | "stdio";
     enabled?: boolean; is_primary?: boolean;
     tags?: string[]; description?: string;
+    ssh_user?: string; ssh_port?: number;
   }): Promise<MCPNode> {
     const db = await openLocalDb();
     const id = uuid();
@@ -1418,6 +1434,8 @@ export const nodesLocal = {
       is_primary: input.is_primary ?? false,
       tags: input.tags || [],
       description: input.description || "",
+      ssh_user: input.ssh_user || "root",
+      ssh_port: input.ssh_port ?? 22,
       last_seen_at: null,
       last_health_status: null,
       last_health_info: null,
@@ -1434,11 +1452,12 @@ export const nodesLocal = {
     await db.runAsync(
       `INSERT INTO mcp_nodes
         (id, name, host, port, bearer_token, transport, enabled, is_primary,
-         tags_json, description, created_at, updated_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+         tags_json, description, ssh_user, ssh_port, created_at, updated_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       [node.id, node.name, node.host, node.port, node.bearer_token,
        node.transport, node.enabled ? 1 : 0, node.is_primary ? 1 : 0,
        JSON.stringify(node.tags), node.description,
+       node.ssh_user, node.ssh_port,
        node.created_at, node.updated_at],
     );
     await writeNodeBearerSecure(id, node.bearer_token);
@@ -1457,11 +1476,12 @@ export const nodesLocal = {
     await db.runAsync(
       `UPDATE mcp_nodes SET
          name=?, host=?, port=?, bearer_token=?, transport=?, enabled=?,
-         tags_json=?, description=?, updated_at=?
+         tags_json=?, description=?, ssh_user=?, ssh_port=?, updated_at=?
        WHERE id=?`,
       [merged.name, merged.host, merged.port, merged.bearer_token,
        merged.transport, merged.enabled ? 1 : 0,
        JSON.stringify(merged.tags), merged.description,
+       merged.ssh_user, merged.ssh_port,
        merged.updated_at, id],
     );
     // is_primary is managed via setPrimary() (atomic) — patch.is_primary
@@ -1542,6 +1562,7 @@ export const nodesLocal = {
     bearer_token?: string; transport?: "http_sse" | "stdio";
     enabled?: boolean; is_primary?: boolean;
     tags?: string[]; description?: string;
+    ssh_user?: string; ssh_port?: number;
   }): Promise<MCPNode> {
     const db = await openLocalDb();
     const port = input.port ?? 8765;
@@ -1557,6 +1578,8 @@ export const nodesLocal = {
         enabled: input.enabled ?? true,
         tags: input.tags ?? [],
         description: input.description ?? existing.description ?? "",
+        ...(input.ssh_user ? { ssh_user: input.ssh_user } : {}),
+        ...(input.ssh_port ? { ssh_port: input.ssh_port } : {}),
       });
     }
     return this.create({ ...input, port });

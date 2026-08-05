@@ -45,7 +45,7 @@ import {
 import NodesMap from "./NodesMap";
 import { callMcpTool } from "../lib/mcpClient";
 import ProvisionNodeModal, { type NodeDraft } from "./ProvisionNodeModal";
-import { reviveNode } from "../lib/nodeProvision";
+import { reviveNode, installReviveKey } from "../lib/nodeProvision";
 
 // Keep palette identical to the rest of the cockpit so the tab feels native.
 const C = {
@@ -90,6 +90,9 @@ export default function MCPTab() {
   const [nodeToolCount, setNodeToolCount] = useState<Record<string, number>>({});
   const [editingNode, setEditingNode] = useState<Partial<MCPNode> | null>(null);
   const [provisionOpen, setProvisionOpen] = useState(false);
+  const [editSshPass, setEditSshPass] = useState("");
+  const [sshActionBusy, setSshActionBusy] = useState(false);
+  const [sshActionStatus, setSshActionStatus] = useState("");
   // Node-map tap sheets (// status pane radial map)
   const [mapSheetNode, setMapSheetNode] = useState<MCPNode | null>(null);
   const [showLocalSheet, setShowLocalSheet] = useState(false);
@@ -741,6 +744,17 @@ export default function MCPTab() {
       }));
       await pushRoster(url, tok, roster);
       console.log(`[cloudSync] mirrored ${roster.length} node(s) to Upstash`);
+      // Keep the cloud bearer alive alongside the roster: if any local node
+      // carries a token and Redis has none (expired / never seeded), push it
+      // so reinstall recovery always finds BOTH roster and bearer. Uses the
+      // long roster-matched TTL now, so it survives to the next reinstall.
+      const localBearer = rows.find((n) => n.bearer_token)?.bearer_token;
+      if (localBearer) {
+        try {
+          const existing = await fetchCurrentBearer(url, tok);
+          if (!existing?.token) await rotateBearer(url, tok, localBearer);
+        } catch (e) { console.warn("[cloudSync] bearer seed skipped:", e); }
+      }
     } catch (e) {
       console.warn("[cloudSync] mirrorRosterToCloud failed:", e);
     }
@@ -762,6 +776,8 @@ export default function MCPTab() {
           tags: editingNode.tags || [],
           description: editingNode.description || "",
           enabled: editingNode.enabled ?? true,
+          ssh_user: (editingNode.ssh_user || "root").trim(),
+          ssh_port: editingNode.ssh_port ?? 22,
         });
       } else {
         await nodesLocal.create({
@@ -770,6 +786,8 @@ export default function MCPTab() {
           tags: editingNode.tags || [],
           description: editingNode.description || "",
           enabled: editingNode.enabled ?? true,
+          ssh_user: (editingNode.ssh_user || "root").trim(),
+          ssh_port: editingNode.ssh_port ?? 22,
         });
       }
       setEditingNode(null);
@@ -801,6 +819,50 @@ export default function MCPTab() {
           "\n\nA node with this host:port already exists." : ""));
     }
   }, [editingNode, refreshLists, mirrorRosterToCloud]);
+
+  // Reset the one-time SSH password + status whenever the edit target changes.
+  useEffect(() => {
+    setEditSshPass("");
+    setSshActionStatus("");
+  }, [editingNode?.id]);
+
+  // Adopt an already-installed node: push the cockpit revive key using the
+  // node's SSH password ONCE. After this, revive works for that node.
+  const handleInstallReviveKey = useCallback(async () => {
+    if (!editingNode) return;
+    if (!HAS_NATIVE_ROOT) { setSshActionStatus("✗ root shell unavailable (needs deployed APK)"); return; }
+    const host = (editingNode.host || "").trim();
+    if (!host) { setSshActionStatus("✗ set host first"); return; }
+    if (!editSshPass) { setSshActionStatus("✗ enter the node's SSH password (used once)"); return; }
+    setSshActionBusy(true); setSshActionStatus("↻ installing revive key…");
+    const r = await installReviveKey(
+      {
+        host,
+        sshUser: (editingNode.ssh_user || "root").trim(),
+        sshPass: editSshPass,
+        sshPort: editingNode.ssh_port ?? 22,
+      },
+      execChroot,
+    );
+    setSshActionStatus((r.ok ? "✓ " : "✗ ") + r.detail);
+    if (r.ok) setEditSshPass("");
+    setSshActionBusy(false);
+  }, [editingNode, editSshPass, execChroot]);
+
+  // Manual one-shot revive from the edit sheet (key-based).
+  const handleManualRevive = useCallback(async () => {
+    if (!editingNode) return;
+    const host = (editingNode.host || "").trim();
+    if (!host) { setSshActionStatus("✗ set host first"); return; }
+    if (!HAS_NATIVE_ROOT) { setSshActionStatus("✗ root shell unavailable (needs deployed APK)"); return; }
+    setSshActionBusy(true); setSshActionStatus("↻ sending revive…");
+    const r = await reviveNode(
+      host, execChroot, editingNode.ssh_port ?? 22, (editingNode.ssh_user || "root").trim(),
+    );
+    setSshActionStatus((r.ok ? "✓ " : "✗ ") + r.detail +
+      (r.ok ? "" : " — if auth failed, tap INSTALL REVIVE KEY first"));
+    setSshActionBusy(false);
+  }, [editingNode, execChroot]);
 
   const handleDeleteNode = useCallback((node: MCPNode) => {
     Alert.alert(
@@ -959,7 +1021,7 @@ export default function MCPTab() {
       return;
     }
     reviveAtRef.current[node.id] = Date.now();
-    const r = await reviveNode(node.host, execChroot);
+    const r = await reviveNode(node.host, execChroot, node.ssh_port ?? 22, node.ssh_user || "root");
     if (opts.manual) {
       Alert.alert(r.ok ? "Revive sent" : "Revive failed", `${node.name}: ${r.detail}`);
     } else {
@@ -1177,64 +1239,42 @@ export default function MCPTab() {
       ]);
       const peers = discovered.peers;
 
-      if (peers.length === 0 && roster.length === 0) {
-        // Surface the first failed probe's diagnostic — huge time-saver
-        // vs opening logcat. Ex: "socket unreachable inside chroot".
-        const diag = discovered.tried[0]?.note || "unknown";
+      if (roster.length === 0) {
+        // Roster is authoritative for what belongs in the swarm. If it's
+        // empty there's nothing to restore — we deliberately do NOT fall
+        // back to "add every enforcer-named tailnet peer", which would
+        // mass-add machines that were never part of the roster.
         throw new Error(
-          `nothing to restore. tailnet=0 peers (${diag}) AND redis roster is empty. ` +
-          `either fix chroot tailscale visibility, or add one node manually first.`,
+          "redis roster is empty — nothing to restore. Add a node (or provision one) so the roster gets populated first.",
         );
       }
       if (!rec?.token) {
         throw new Error("no bearer in upstash yet — add one node manually first so the bearer gets pushed, or paste one via [+ ADD NODE]");
       }
 
-      // Build a lookup from roster by name/host so we can enrich the
-      // tailnet-discovered entries (which only have hostname + IP).
-      const rosterByHost = new Map<string, RosterEntry>();
-      const rosterByName = new Map<string, RosterEntry>();
-      for (const r of roster) {
-        rosterByHost.set(r.host, r);
-        rosterByName.set(r.name.toLowerCase(), r);
-      }
-
-      let added = 0;
-      const seenHosts = new Set<string>();
-
-      // Tailnet-first: peers that ARE reachable right now win the IP.
+      // Index the live tailnet peers so we can refresh a roster member's
+      // current IP. Tailnet is used ONLY to enrich known roster entries —
+      // never to introduce new nodes.
+      const peerByName = new Map<string, typeof peers[number]>();
+      const peerByIp = new Map<string, typeof peers[number]>();
       for (const p of peers) {
-        seenHosts.add(p.tailIp);
-        const enriched = rosterByName.get(p.hostname.toLowerCase())
-          ?? rosterByHost.get(p.tailIp);
-        try {
-          await nodesLocal.upsert({
-            name: enriched?.name || p.hostname,
-            host: p.tailIp,
-            port: enriched?.port ?? 8765,
-            bearer_token: rec.token,
-            transport: enriched?.transport || "http_sse",
-            enabled: true,
-            is_primary: !!enriched?.is_primary,
-            tags: enriched?.tags?.length ? enriched.tags : [p.dnsName],
-            description: enriched?.description ||
-              `restored from tailnet ${new Date().toISOString().slice(0, 16)}`,
-          } as any);
-          added++;
-        } catch (e) { console.warn("[cloudSync] upsert failed for", p.hostname, e); }
+        peerByName.set(p.hostname.toLowerCase(), p);
+        peerByIp.set(p.tailIp, p);
       }
 
-      // Roster-only fallback: entries in Redis but NOT visible on tailnet
-      // right now. Still restore them — the node may be offline / user
-      // may be on a different network. They'll auto-verify when tailscale
-      // reconnects.
-      let rosterOnly = 0;
+      // Roster-authoritative restore: iterate the roster, and if a matching
+      // peer is live right now, prefer its current tailnet IP (handles IP
+      // churn); otherwise fall back to the roster's stored host.
+      let added = 0;
+      let liveMatched = 0;
       for (const r of roster) {
-        if (seenHosts.has(r.host)) continue; // already added via tailnet
+        const live = peerByName.get(r.name.toLowerCase()) ?? peerByIp.get(r.host);
+        const host = live?.tailIp || r.host;
+        if (live) liveMatched++;
         try {
           await nodesLocal.upsert({
             name: r.name,
-            host: r.host,
+            host,
             port: r.port,
             bearer_token: rec.token,
             transport: r.transport || "http_sse",
@@ -1242,16 +1282,15 @@ export default function MCPTab() {
             is_primary: !!r.is_primary,
             tags: r.tags || [],
             description: r.description ||
-              `restored from redis roster ${new Date().toISOString().slice(0, 16)}`,
+              `restored from roster ${new Date().toISOString().slice(0, 16)}`,
           } as any);
-          rosterOnly++;
           added++;
         } catch (e) { console.warn("[cloudSync] roster upsert failed for", r.name, e); }
       }
       await refreshLists();
       setCloudSyncStatus(
-        `ok: restored ${added} node(s) ` +
-        `(${peers.length} live on tailnet, ${rosterOnly} from redis roster only)`,
+        `ok: restored ${added} roster node(s) ` +
+        `(${liveMatched} IP-refreshed from tailnet, ${peers.length} peer(s) seen)`,
       );
     } catch (e: any) {
       setCloudSyncStatus(`err: ${e?.message || e}`);
@@ -2901,6 +2940,74 @@ export default function MCPTab() {
                 placeholderTextColor={C.textDim}
                 multiline
               />
+
+              {/* SSH + SELF-HEAL ─────────────────────────────────────── */}
+              <View style={{ marginTop: 18, borderTopColor: C.border, borderTopWidth: 1, paddingTop: 14 }}>
+                <Text style={[s.sectionTitle, { marginBottom: 6 }]}>{"// ssh + self-heal"}</Text>
+                <Text style={s.helperFine}>
+                  Lets the cockpit SSH-revive this node when it goes down. Wizard-provisioned
+                  nodes already have the key — adopt an older node by installing it once below.
+                </Text>
+                <View style={[s.row, { marginTop: 10 }]}>
+                  <View style={{ flex: 1, marginRight: 6 }}>
+                    <Text style={s.kvLabel}>ssh user</Text>
+                    <TextInput
+                      style={[s.input, { fontFamily: MONO }]}
+                      value={editingNode.ssh_user ?? "root"}
+                      onChangeText={(v) => setEditingNode((p) => p ? { ...p, ssh_user: v.trim() } : p)}
+                      autoCapitalize="none" autoCorrect={false}
+                      placeholder="root" placeholderTextColor={C.textDim}
+                    />
+                  </View>
+                  <View style={{ width: 90 }}>
+                    <Text style={s.kvLabel}>ssh port</Text>
+                    <TextInput
+                      style={[s.input, { fontFamily: MONO }]}
+                      value={String(editingNode.ssh_port ?? 22)}
+                      onChangeText={(v) => {
+                        const n = parseInt(v.replace(/[^\d]/g, ""), 10);
+                        setEditingNode((p) => p ? { ...p, ssh_port: isNaN(n) ? 22 : Math.min(65535, Math.max(1, n)) } : p);
+                      }}
+                      keyboardType="number-pad" placeholder="22" placeholderTextColor={C.textDim}
+                    />
+                  </View>
+                </View>
+                <Text style={[s.kvLabel, { marginTop: 12 }]}>ssh password (used once to install revive key)</Text>
+                <View style={s.row}>
+                  <TextInput
+                    style={[s.input, { flex: 1, fontFamily: MONO }]}
+                    value={editSshPass}
+                    onChangeText={setEditSshPass}
+                    placeholder="node SSH password" placeholderTextColor={C.textDim}
+                    secureTextEntry autoCapitalize="none" autoCorrect={false}
+                    editable={!sshActionBusy}
+                  />
+                  <TouchableOpacity
+                    style={[s.smallBtn, { marginLeft: 6, borderColor: C.green }]}
+                    disabled={sshActionBusy}
+                    onPress={handleInstallReviveKey}
+                  >
+                    <Text style={[s.smallBtnText, { color: C.green }]}>INSTALL KEY</Text>
+                  </TouchableOpacity>
+                </View>
+                <TouchableOpacity
+                  style={[s.btn, { backgroundColor: C.panel2, borderColor: C.cyan, marginTop: 10 }]}
+                  disabled={sshActionBusy}
+                  onPress={handleManualRevive}
+                >
+                  <MaterialCommunityIcons name="restart" size={14} color={C.cyan} />
+                  <Text style={[s.btnText, { color: C.cyan }]}>REVIVE NOW</Text>
+                </TouchableOpacity>
+                {sshActionStatus ? (
+                  <Text style={[s.helperFine, {
+                    marginTop: 8,
+                    color: sshActionStatus.startsWith("✓") ? C.green
+                      : sshActionStatus.startsWith("✗") ? C.red : C.yellow,
+                  }]}>
+                    {sshActionStatus}
+                  </Text>
+                ) : null}
+              </View>
 
               <View style={[s.row, { marginTop: 16, justifyContent: "space-between" }]}>
                 <TouchableOpacity
