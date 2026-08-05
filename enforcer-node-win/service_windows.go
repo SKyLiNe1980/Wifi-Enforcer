@@ -131,7 +131,10 @@ func uninstallService() error {
 
 	s, err := m.OpenService(serviceName)
 	if err != nil {
-		return fmt.Errorf("service %q is not installed", serviceName)
+		// Not installed → nothing to do. Idempotent so a pre-install
+		// `uninstall` on a fresh box is a clean no-op, not a fatal error.
+		fmt.Printf("service %q is not installed — nothing to uninstall\n", serviceName)
+		return nil
 	}
 	defer s.Close()
 
