@@ -50,8 +50,8 @@ export function defaultConfig(): ToolbarConfig {
       { id: "s1", label: "PMKID", icon: "wifi", led: LED.amber, kind: "mcp_tool",
         tool: "exec_command", args: { cmd: "wifite --pmkid --kill" } },
       { id: "s2", label: "SNAP", icon: "cloud-upload", led: LED.cyan, kind: "app", appAction: "snapshot" },
-      { id: "s3", label: "REVIVE", icon: "restart", led: LED.green, kind: "app", appAction: "revive" },
-      { id: "s4", label: "LIVE", icon: "pulse", led: LED.green, kind: "navigate", route: "/(tabs)/live" },
+      { id: "s3", label: "PULL", icon: "cloud-download", led: LED.cyan, kind: "app", appAction: "restore" },
+      { id: "s4", label: "REVIVE", icon: "restart", led: LED.green, kind: "app", appAction: "revive" },
     ],
   };
 }
@@ -63,7 +63,18 @@ const listeners = new Set<Listener>();
 export async function loadToolbarConfig(): Promise<ToolbarConfig> {
   if (cache) return cache;
   const stored = await kvGet<ToolbarConfig>(KEY);
-  cache = stored && Array.isArray(stored.slots) ? { ...defaultConfig(), ...stored } : defaultConfig();
+  const base = stored && Array.isArray(stored.slots) ? { ...defaultConfig(), ...stored } : defaultConfig();
+  // Migration: earlier builds shipped a "LIVE" slot that navigated to
+  // "/(tabs)/live" — a route that doesn't exist in this single-screen app,
+  // so tapping it triggered expo-router's back/not-found behavior (looked
+  // like the app "back-swiped" out). Convert any such legacy navigate slot
+  // into a harmless cloud "restore" action.
+  base.slots = base.slots.map((s) =>
+    s.kind === "navigate" && typeof s.route === "string" && s.route.startsWith("/(tabs)")
+      ? { ...s, kind: "app" as const, appAction: "restore" as const, route: undefined, label: "PULL", icon: "cloud-download" }
+      : s,
+  );
+  cache = base;
   return cache;
 }
 

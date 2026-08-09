@@ -33,8 +33,12 @@ export async function executeSlot(slot: ToolbarSlot): Promise<ActionResult> {
     switch (slot.kind) {
       case "navigate": {
         if (!slot.route) return { ok: false, detail: "no route set" };
-        router.push(slot.route as any);
-        return { ok: true, detail: `→ ${slot.route}` };
+        try {
+          router.push(slot.route as any);
+          return { ok: true, detail: `→ ${slot.route}` };
+        } catch {
+          return { ok: false, detail: `bad route: ${slot.route}` };
+        }
       }
       case "mcp_tool": {
         if (!slot.nodeId) return { ok: false, detail: "no node assigned" };
