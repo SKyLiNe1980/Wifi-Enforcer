@@ -1,0 +1,102 @@
+{
+  "app_name": "Mesh Controller Cockpit",
+  "personality": "7 Dark-First Utility (Rugged SDR/Military-Radio variant)",
+  "personality_one_liner": "A tactical, hardware-inspired command overlay featuring gunmetal gradients, glowing LED indicators, and industrial functional density.",
+  "color": {
+    "surface": "#04070a",
+    "onSurface": "#cfeadb",
+    "surfaceSecondary": "#0a1116",
+    "onSurfaceSecondary": "#cfeadb",
+    "surfaceTertiary": "#0e1820",
+    "onSurfaceTertiary": "#cfeadb",
+    "surfaceInverse": "#cfeadb",
+    "onSurfaceInverse": "#04070a",
+    "brand": "#00ff66",
+    "brandPrimary": "#00ff66",
+    "onBrandPrimary": "#04070a",
+    "brandSecondary": "#ffd400",
+    "onBrandSecondary": "#04070a",
+    "brandTertiary": "#3ad7ff",
+    "onBrandTertiary": "#04070a",
+    "success": "#00ff66",
+    "onSuccess": "#04070a",
+    "warning": "#ffd400",
+    "onWarning": "#04070a",
+    "error": "#ff3860",
+    "onError": "#04070a",
+    "info": "#7df9ff",
+    "onInfo": "#04070a",
+    "border": "#163041",
+    "borderStrong": "#cfeadb"
+  },
+  "typography": {
+    "displayFontFamily": "monospace",
+    "textFontFamily": "monospace",
+    "scale": { "sm": 10, "base": 12, "lg": 14, "xl": 16, "2xl": 20 }
+  },
+  "spacing": { 
+    "rule": "Dense and deliberate padding to simulate a hardware panel. Safe-area handled dynamically on the floating wrapper.",
+    "xs": 4, "sm": 8, "md": 12, "lg": 16, "xl": 24, "2xl": 32, "3xl": 48 
+  },
+  "radius_tokens": { "sm": 2, "md": 6, "lg": 12, "pill": 999 },
+  "shadow_tier": "3",
+  "navigation": "none (Global Overlay)",
+  "icon_set": "MaterialCommunityIcons",
+  "glassmorphism": {
+    "enabled": "false",
+    "do's": [],
+    "dont's": ["Do not use blur/glass on the SDR panel. It must feel like an opaque metal physical device blocking the UI beneath."]
+  },
+  "platform_libraries": {
+    "glass": {
+      "ios": "none",
+      "android": "none",
+      "low_end_android_fallback": "solid surfaceSecondary"
+    },
+    "image": "expo-image",
+    "blur": "expo-blur",
+    "bottom_sheet": "@gorhom/bottom-sheet",
+    "animation": "react-native-reanimated",
+    "gesture": "react-native-gesture-handler"
+  },
+  "screens": [
+    {
+      "name": "Global Floating Command Toolbar",
+      "purpose": "A draggable, collapsible overlay providing immediate access to pentest/mesh operations.",
+      "states": {
+        "collapsed": "A draggable 56x56 circular 'bubble' showing the app enforcer mark (e.g., radar or crosshair). Snaps to left/right screen edges.",
+        "expanded": "A rugged horizontal metal bar (approx 80-90px height) docked to the bottom or snapped to an edge.",
+        "error": "LED strip on the offending button flashes #ff3860; haptic error feedback."
+      },
+      "layout": "Use Reanimated and PanGestureHandler for the root wrapper. When collapsed: width=56, height=56, borderRadius=28. When expanded: width='90%', height=90, borderRadius=md. Layout structure inside expanded bar: `row` -> [Left spacer 60px for Phase 2 TX PWR Dial] | [ScrollView(horizontal) for 60x60 tactical buttons] | [Right spacer 60px for Phase 2 CH Dial]. Top-center absolute positioned container holds 3 pill toggles (MODE/SCAN/EXEC)."
+    },
+    {
+      "name": "Config Bottom Sheet",
+      "purpose": "Configure slots for the command toolbar.",
+      "states": {
+        "loading": "Spinner over #0a1116 surface.",
+        "empty": "No assigned actions. Text: '// NO ACTIONS ASSIGNED' with a primary 'ADD' button.",
+        "error": "Error message in monospace red #ff3860."
+      },
+      "layout": "Standard bottom sheet (dark theme: #0a1116) with a draggable handle. Internal layout is a Vertical ScrollView showing assigned tool slots as draggable list items. Each item lets the user pick Action Type, Icon, Label, and LED target color."
+    }
+  ],
+  "images": {
+    "bubble_enforcer_mark": { 
+      "url": "https://images.unsplash.com/photo-1526304640581-d334cdbbf45e?ixlib=rb-4.0.3&auto=format&fit=crop&w=400&q=80",
+      "dark": "https://images.unsplash.com/photo-1526304640581-d334cdbbf45e?ixlib=rb-4.0.3&auto=format&fit=crop&w=400&q=80",
+      "alt": "Fallback abstract dark texture for the bubble, but prefer a vector icon (MaterialCommunityIcons 'radar' or 'shield-half-full')"
+    }
+  },
+  "instructions_to_main_agent": [
+    "REANIMATED DRAG & SNAP: Wrap the entire toolbar in a PanGestureHandler from react-native-gesture-handler. Use `useAnimatedGestureHandler` to track x/y offsets. Use `withSpring` to snap to nearest screen edges (left or right, keeping within safe-area insets).",
+    "BUBBLE VS EXPANDED TRANSITION: Use `useAnimatedStyle`. Interpolate width (56 -> screenWidth - 32), height (56 -> 90), and borderRadius (28 -> 6) based on an `isExpanded` shared value boolean. The transition must feel mechanical and snappy.",
+    "GUNMETAL GRADIENT SPEC: The main expanded body uses `expo-linear-gradient`. colors={['#1c2833', '#0e1820', '#060a0f']} (top to bottom). Bevel edges using border layout: borderWidth: 1.5, borderTopColor: '#2b4052', borderBottomColor: '#000000', borderLeftColor: '#163041', borderRightColor: '#163041'.",
+    "CORNER SCREWS: Create an absolute-positioned 4px circle view in each corner of the expanded bar. Color: #04070a, border: #163041, with a tiny inner cross (or just a dark dot) to sell the industrial 'hex screw' hardware feel.",
+    "TACTICAL BUTTON CELL SPEC: Size 60x60, padding sm, center content. Background: #0a1116. Border: 1px #163041. Text: Monospace 10px #6c8a82 (engraved look). Icon: size 24. Press State: change background to #163041 or add inset shadow.",
+    "LED INDICATOR: Inside the button cell, place a View at the absolute bottom (or below the icon). height: 4, width: '60%', alignSelf: 'center', borderRadius: 2. Idle color: #163041. Firing color: #ffd400 with box-shadow (shadowColor: '#ffd400', shadowOpacity: 0.8, shadowRadius: 6). Success color: #00ff66. Error color: #ff3860.",
+    "PHASE 2 RESERVATION: In the flex-row that holds the expanded bar contents, place an empty `<View style={{ width: 60, justifyContent: 'center' }}>` on the far left, and one on the far right. Place the horizontal `<ScrollView>` of buttons between them. This leaves physical room for the future Knurled Dials.",
+    "PILL TOGGLES: Absolute position a small row at the top edge of the expanded bar (top: -12, alignSelf: 'center'). 3 tiny pills: MODE, SCAN, EXEC. Unselected bg: #0a1116, text #6c8a82. Selected bg: #163041, text #ffd400, border #ffd400.",
+    "HAPTICS: Must wire `Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Rigid)` on every button press, config gear tap, and bubble expand/collapse. The interface must feel heavy."
+  ]
+}

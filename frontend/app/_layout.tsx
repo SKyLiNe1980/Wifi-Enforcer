@@ -1,7 +1,10 @@
+/* eslint-disable react/jsx-no-comment-textnodes */
 import React from "react";
 import { Stack } from "expo-router";
 import { SafeAreaProvider } from "react-native-safe-area-context";
+import { GestureHandlerRootView } from "react-native-gesture-handler";
 import { View, Text, StyleSheet, ScrollView, TouchableOpacity, Platform } from "react-native";
+import FloatingToolbar from "../src/components/FloatingToolbar";
 
 const MONO = Platform.select({ ios: "Menlo", android: "monospace", default: "monospace" });
 
@@ -41,11 +44,14 @@ class ErrorBoundary extends React.Component<{ children: React.ReactNode }, EBSta
 
 export default function RootLayout() {
   return (
-    <SafeAreaProvider>
-      <ErrorBoundary>
-        <Stack screenOptions={{ headerShown: false, contentStyle: { backgroundColor: "#04070a" } }} />
-      </ErrorBoundary>
-    </SafeAreaProvider>
+    <GestureHandlerRootView style={{ flex: 1 }}>
+      <SafeAreaProvider>
+        <ErrorBoundary>
+          <Stack screenOptions={{ headerShown: false, contentStyle: { backgroundColor: "#04070a" } }} />
+          <FloatingToolbar />
+        </ErrorBoundary>
+      </SafeAreaProvider>
+    </GestureHandlerRootView>
   );
 }
 

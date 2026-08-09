@@ -106,3 +106,45 @@ drives it with zero special-casing. Hand-rolled MCP on the Go **stdlib**
 - Deferred: Phase 2 tray helper (session-0 service can't own a tray → separate
   per-user autostart helper polling localhost/health); Phase 3 cockpit reads
   capabilities + hashcat job dispatch (replaces synchronous tools/call).
+
+### Provision wizard: crash fix + dual auth modes
+- **Crash fix (JNI weak-ref overflow):** the deploy crash was
+  `NativeAnimatedModule` weak global-ref table overflow (~50k refs). Root cause:
+  `ProvisionNodeModal` used `<Modal animationType="slide">` + an
+  `ActivityIndicator`, and stayed open for the whole multi-minute deploy while
+  MCPTab's background timers re-rendered it — bleeding Animated weak-refs until
+  the JNI table overflowed. Fixed by `animationType="none"` + removing the
+  ActivityIndicator (there is zero JS Animated usage elsewhere). Frontend-only.
+- **Dual auth modes:** wizard now has "Password (public IP)" vs "Tailscale SSH
+  (tailnet)". Tailscale mode uses `tailscale ssh <user>@<host>` (no password/key
+  bootstrap — tailnet identity is the auth) and no longer blocks on empty
+  user/pass. Password mode unchanged (sshpass one-time key bootstrap). Added
+  `authMode` to ProvisionOpts + `tailscaleSSHExec()`; password field is hidden
+  in tailscale mode. Note: tailscale-ssh first use may need a one-time manual
+  `tailscale ssh` to clear device auth (documented in the wizard hint).
+
+### Floating Command Toolbar — Phase 1 (DONE)
+- Global, draggable SDR/military-radio HUD, mounted in `app/_layout.tsx` (wrapped
+  in `GestureHandlerRootView`, rendered after the `<Stack>` so it floats over all
+  screens). Defaults to ON.
+- Files:
+  - `src/components/FloatingToolbar.tsx` — collapsed 56px bubble ↔ expanded
+    gunmetal bar (expo-linear-gradient + Reanimated). Pan drag + edge snap +
+    vertical clamp to safe area. Rigid haptics on press/expand. LED feedback per
+    slot (idle/firing/ok/err). Left/right 60px bays reserved for Phase-2 dials.
+  - `src/components/ToolbarConfigModal.tsx` — "Config Bottom Sheet" (plain Modal,
+    `animationType="fade"` to avoid the JNI Animated crash). Master enable toggle,
+    add/edit/reorder/delete slots, pick action type (MCP tool / app action /
+    navigate), icon, label, LED colour swatch, target node, tool + args
+    (`key=value` per line).
+  - `src/lib/toolbarStore.ts` — kv-backed config (slots + position + enabled),
+    tiny pub/sub. `src/lib/toolbarActions.ts` — executes slot (MCP call / app
+    action snapshot·restore·revive / route nav) → uniform {ok, detail}.
+- Settings → General → `// command overlay` has an ARM/OFF toggle (mirrors
+  `toolbarStore.enabled` via subscribe).
+- Validation: lint clean, tsc clean for toolbar files. Web preview CANNOT render
+  this app (pre-existing: expo-sqlite web worker imports `.wasm`, not in
+  metro assetExts which must not be modified) → drag/haptics/LEDs to be verified
+  on the APK build.
+- Deferred Phase 2: TX-power/CH knurled dials + MODE/SCAN/EXEC pill wiring
+  (bays + pills already laid out as placeholders).
