@@ -36,6 +36,7 @@ import {
   pcapEndpointsLocal,
   commandLogsLocal,
 } from "../src/lib/localDb";
+import { loadToolbarConfig, saveToolbarConfig, subscribeToolbar } from "../src/lib/toolbarStore";
 
 const API = `${process.env.EXPO_PUBLIC_BACKEND_URL}/api`;
 
@@ -302,6 +303,22 @@ export default function App() {
   const [dataState, setDataState] = useState<DataLoadState>(INITIAL_DATA_STATE);
   const setResource = useCallback(<K extends keyof DataLoadState>(k: K, st: ResourceStatus) => {
     setDataState((prev) => ({ ...prev, [k]: st }));
+  }, []);
+
+  // ─── Floating command toolbar enable/disable ─────────────────────────────
+  // The toolbar's own config (slots + position) lives in the kv store via
+  // toolbarStore; here we only mirror the `enabled` flag so Settings can
+  // arm/disarm the global overlay. Default is ON (see defaultConfig()).
+  const [toolbarEnabled, setToolbarEnabled] = useState(true);
+  useEffect(() => {
+    let alive = true;
+    loadToolbarConfig().then((c) => alive && setToolbarEnabled(c.enabled));
+    const unsub = subscribeToolbar((c) => alive && setToolbarEnabled(c.enabled));
+    return () => { alive = false; unsub(); };
+  }, []);
+  const toggleToolbar = useCallback(async () => {
+    const cur = await loadToolbarConfig();
+    await saveToolbarConfig({ ...cur, enabled: !cur.enabled });
   }, []);
 
   const ctx: Ctx = { iface, country };
@@ -1139,6 +1156,32 @@ export default function App() {
         <KV k="active iface" v={activeIface === "ALL" ? `ALL (${activeIfaces.join(", ")})` : `${activeIface} · ${primaryIface}`} vColor={C.cyan} />
         <KV k="api" v={API} vColor={C.textDim} />
       </View>
+
+      {/* ─── Floating command toolbar arm/disarm. The global SDR-style
+          overlay defaults ON; operators who don't want the HUD can stow
+          it here. Tapping opens no editor — just flips enabled; per-slot
+          config lives in the toolbar's own CONFIG gear. ─── */}
+      <Text style={[s.sectionTitle, { marginTop: 18 }]}>{"// command overlay"}</Text>
+      <TouchableOpacity
+        testID="btn-toolbar-toggle"
+        onPress={toggleToolbar}
+        style={s.row}
+        activeOpacity={0.7}
+      >
+        <MaterialCommunityIcons
+          name={toolbarEnabled ? "toggle-switch" : "toggle-switch-off-outline"}
+          size={22}
+          color={toolbarEnabled ? C.green : C.textDim}
+        />
+        <Text style={[s.rowText, { color: toolbarEnabled ? C.green : C.textDim }]}>
+          floating toolbar {toolbarEnabled ? "ARMED" : "OFF"}
+        </Text>
+        <MaterialCommunityIcons name="radar" size={16} color={toolbarEnabled ? C.green : C.textDim} />
+      </TouchableOpacity>
+      <Text style={s.helper}>
+        a draggable, edge-snapping HUD for quick MCP/app actions. drag to reposition,
+        tap the gear inside to add or edit tactical buttons.
+      </Text>
 
       {/* ─── Diagnostics — read-only wlan queries relocated from the
           Quick tab when the toggle-based redesign landed. These don't
