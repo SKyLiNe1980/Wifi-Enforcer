@@ -7,7 +7,7 @@
  * persists. Left/right 60px bays are reserved for the Phase-2 knurled dials.
  */
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import { View, Text, StyleSheet, Pressable, ScrollView, Dimensions, Platform } from "react-native";
+import { View, Text, StyleSheet, Pressable, ScrollView, Dimensions, Platform, ToastAndroid } from "react-native";
 import Animated, {
   useSharedValue, useAnimatedStyle, withSpring, withTiming, runOnJS,
 } from "react-native-reanimated";
@@ -48,6 +48,9 @@ export default function FloatingToolbar() {
 
   const barW = SCREEN_W - 24;
   const dockedX = useRef(SCREEN_W - BUBBLE - 12);
+  // Remembers where the collapsed bubble was, so collapsing restores it
+  // instead of leaving the widget stuck at the docked-bar position.
+  const bubblePos = useRef({ x: SCREEN_W - BUBBLE - 12, y: 0 });
 
   const tx = useSharedValue(SCREEN_W - BUBBLE - 12);
   const ty = useSharedValue(0);
@@ -69,6 +72,7 @@ export default function FloatingToolbar() {
       dockedX.current = x;
       tx.value = x;
       ty.value = y;
+      bubblePos.current = { x, y };
     });
     const unsub = subscribeToolbar((c) => alive && setCfg(c));
     return () => { alive = false; unsub(); };
@@ -83,17 +87,23 @@ export default function FloatingToolbar() {
     expSV.value = next ? 1 : 0;
     if (next) {
       tap();
+      // Remember bubble spot, then dock the bar to a fully on-screen slot near
+      // the bottom so it can never fall half off the edge.
+      bubblePos.current = { x: dockedX.current, y: ty.value };
+      const dockY = Math.max(insets.top + 8, SCREEN_H - BAR_H - insets.bottom - 16);
       w.value = withTiming(barW, { duration: 220 });
       h.value = withTiming(BAR_H, { duration: 220 });
       r.value = withTiming(6, { duration: 220 });
       tx.value = withSpring(12, { damping: 18, stiffness: 180 });
+      ty.value = withSpring(dockY, { damping: 18, stiffness: 180 });
     } else {
       w.value = withTiming(BUBBLE, { duration: 200 });
       h.value = withTiming(BUBBLE, { duration: 200 });
       r.value = withTiming(BUBBLE / 2, { duration: 200 });
-      tx.value = withSpring(dockedX.current, { damping: 18, stiffness: 180 });
+      tx.value = withSpring(bubblePos.current.x, { damping: 18, stiffness: 180 });
+      ty.value = withSpring(bubblePos.current.y, { damping: 18, stiffness: 180 });
     }
-  }, [barW, expSV, h, r, tx, w]);
+  }, [barW, expSV, h, r, tx, ty, w, insets.top, insets.bottom]);
 
   const snapEdge = useCallback((endX: number) => {
     const goRight = endX + BUBBLE / 2 > SCREEN_W / 2;
@@ -104,6 +114,7 @@ export default function FloatingToolbar() {
   }, [insets.left, persist, tx, ty]);
 
   const pan = Gesture.Pan()
+    .enabled(!expanded)
     .minDistance(10)
     .onStart(() => { start.value = { x: tx.value, y: ty.value }; })
     .onUpdate((e) => {
@@ -138,6 +149,9 @@ export default function FloatingToolbar() {
     setFb((p) => ({ ...p, [slot.id]: "firing" }));
     const res = await executeSlot(slot);
     setFb((p) => ({ ...p, [slot.id]: res.ok ? "ok" : "err" }));
+    if (Platform.OS === "android") {
+      ToastAndroid.show(res.detail || (res.ok ? "ok" : "failed"), ToastAndroid.SHORT);
+    }
     if (!res.ok) Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error).catch(() => {});
     setTimeout(() => setFb((p) => ({ ...p, [slot.id]: "idle" })), 1300);
   }, []);

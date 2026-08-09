@@ -186,7 +186,7 @@ class OverlayService : Service() {
                 }
                 MotionEvent.ACTION_UP -> {
                     if (!moved) toggleExpanded()
-                    else savePosition()
+                    else { savePosition(); clampToScreen() }
                     true
                 }
                 else -> false
@@ -197,6 +197,30 @@ class OverlayService : Service() {
     private fun toggleExpanded() {
         expanded = !expanded
         buttons?.visibility = if (expanded) View.VISIBLE else View.GONE
+        // After the width changes, re-clamp so the (now wider) bar can't hang
+        // off the screen edge and leave the drag-handle bubble unreachable.
+        root?.post { clampToScreen() }
+    }
+
+    /** Keep the whole overlay within screen bounds (post-layout). */
+    private fun clampToScreen() {
+        val r = root ?: return
+        val w = r.width
+        val h = r.height
+        if (w == 0 || h == 0) return
+        val dm = resources.displayMetrics
+        var x = params.x
+        var y = params.y
+        if (x + w > dm.widthPixels) x = dm.widthPixels - w
+        if (x < 0) x = 0
+        if (y + h > dm.heightPixels) y = dm.heightPixels - h
+        if (y < 0) y = 0
+        if (x != params.x || y != params.y) {
+            params.x = x
+            params.y = y
+            try { wm.updateViewLayout(r, params) } catch (_: Exception) {}
+            savePosition()
+        }
     }
 
     private fun savePosition() {
@@ -221,6 +245,8 @@ class OverlayService : Service() {
             val cell = makeButton(label, led) { fire(s, it) }
             b.addView(cell)
         }
+        // widths just changed — keep everything on-screen if currently expanded.
+        root?.post { clampToScreen() }
     }
 
     private fun makeButton(label: String, led: Int, onTap: ((TextView) -> Unit)?): View {

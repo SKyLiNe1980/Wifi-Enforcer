@@ -23,7 +23,7 @@ import {
   DEPLOY_DEB_NAME,
 } from "../lib/deployServer";
 import { provisionNode, type ProvisionResult } from "../lib/nodeProvision";
-import { loadUpstashUrl } from "../lib/tokenStash";
+import { loadUpstashUrl, loadUpstashToken } from "../lib/tokenStash";
 
 const C = {
   bg: "#04070a", panel: "#0a1116", panel2: "#0e1820", border: "#163041",
@@ -73,8 +73,11 @@ export default function ProvisionNodeModal(props: {
     setLog("");
     (async () => {
       if (!bearer) setBearer(await genBearer());
-      const u = await loadUpstashUrl();
+      // Prefill cloud sync creds from the running config as suggestions so the
+      // operator doesn't have to paste the Upstash URL/token by hand.
+      const [u, t] = await Promise.all([loadUpstashUrl(), loadUpstashToken()]);
       if (u && !cloudUrl) setCloudUrl(u);
+      if (t && !cloudToken) setCloudToken(t);
     })().catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [visible]);
@@ -241,9 +244,11 @@ export default function ProvisionNodeModal(props: {
             </Text>
 
             <View style={s.row}>
-              <View style={{ flex: 1, marginRight: 8 }}>{field("SSH user", sshUser, setSshUser, { placeholder: "root" })}</View>
               {authMode === "password" ? (
-                <View style={{ width: 90 }}>{field("SSH port", sshPort, setSshPort, { keyboard: "numeric" })}</View>
+                <>
+                  <View style={{ flex: 1, marginRight: 8 }}>{field("SSH user", sshUser, setSshUser, { placeholder: "root" })}</View>
+                  <View style={{ width: 90 }}>{field("SSH port", sshPort, setSshPort, { keyboard: "numeric" })}</View>
+                </>
               ) : null}
             </View>
             {authMode === "password"

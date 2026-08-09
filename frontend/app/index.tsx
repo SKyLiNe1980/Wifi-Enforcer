@@ -18,6 +18,7 @@ import {
   ActivityIndicator,
   RefreshControl,
   AppState,
+  ToastAndroid,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { StatusBar } from "expo-status-bar";
@@ -379,7 +380,12 @@ export default function App() {
         if (id) {
           const cfg = await loadToolbarConfig();
           const slot = cfg.slots.find((sl) => sl.id === id);
-          if (slot) await executeSlot(slot);
+          if (slot) {
+            const res = await executeSlot(slot);
+            if (Platform.OS === "android") {
+              ToastAndroid.show(res.detail || (res.ok ? "ok" : "failed"), ToastAndroid.SHORT);
+            }
+          }
         }
         if (HAS_OVERLAY) setOverlayPerm(await overlayHasPermission());
       } catch { /* non-fatal */ }
