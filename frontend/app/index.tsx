@@ -37,6 +37,11 @@ import {
   commandLogsLocal,
 } from "../src/lib/localDb";
 import { loadToolbarConfig, saveToolbarConfig, subscribeToolbar } from "../src/lib/toolbarStore";
+import { executeSlot } from "../src/lib/toolbarActions";
+import {
+  HAS_OVERLAY, syncOverlayConfig, overlayHasPermission, overlayRequestPermission,
+  overlayShow, overlayHide, overlayConsumePendingSlot,
+} from "../src/lib/overlayControl";
 
 const API = `${process.env.EXPO_PUBLIC_BACKEND_URL}/api`;
 
@@ -310,16 +315,82 @@ export default function App() {
   // toolbarStore; here we only mirror the `enabled` flag so Settings can
   // arm/disarm the global overlay. Default is ON (see defaultConfig()).
   const [toolbarEnabled, setToolbarEnabled] = useState(true);
+  const [systemOverlayOn, setSystemOverlayOn] = useState(false);
+  const [overlayPerm, setOverlayPerm] = useState(false);
   useEffect(() => {
     let alive = true;
-    loadToolbarConfig().then((c) => alive && setToolbarEnabled(c.enabled));
-    const unsub = subscribeToolbar((c) => alive && setToolbarEnabled(c.enabled));
+    loadToolbarConfig().then((c) => {
+      if (!alive) return;
+      setToolbarEnabled(c.enabled);
+      setSystemOverlayOn(!!c.systemOverlay);
+      syncOverlayConfig(c);
+    });
+    const unsub = subscribeToolbar((c) => {
+      if (!alive) return;
+      setToolbarEnabled(c.enabled);
+      setSystemOverlayOn(!!c.systemOverlay);
+      syncOverlayConfig(c);
+    });
+    if (HAS_OVERLAY) overlayHasPermission().then((ok) => alive && setOverlayPerm(ok));
     return () => { alive = false; unsub(); };
   }, []);
   const toggleToolbar = useCallback(async () => {
     const cur = await loadToolbarConfig();
     await saveToolbarConfig({ ...cur, enabled: !cur.enabled });
   }, []);
+
+  // Arm/disarm the native over-other-apps overlay. Requests the "Display over
+  // other apps" permission on first enable; starts/stops the foreground
+  // service and pushes the resolved slot config to it.
+  const toggleSystemOverlay = useCallback(async () => {
+    if (!HAS_OVERLAY) {
+      Alert.alert("Native build required", "The over-other-apps overlay only works in the installed APK, not Expo Go or the web preview.");
+      return;
+    }
+    const cur = await loadToolbarConfig();
+    const next = !cur.systemOverlay;
+    if (next) {
+      let ok = await overlayHasPermission();
+      if (!ok) {
+        await overlayRequestPermission();
+        // User is now on the system settings screen; they'll come back and
+        // re-tap. Persist intent so the AppState 'active' handler can arm it.
+        Alert.alert("Grant permission", "Enable “Display over other apps” for Enforcer, then return and tap ARM again.");
+        setOverlayPerm(await overlayHasPermission());
+        return;
+      }
+      await saveToolbarConfig({ ...cur, systemOverlay: true });
+      await syncOverlayConfig({ ...cur, systemOverlay: true });
+      try { await overlayShow(); } catch (e: any) { Alert.alert("Overlay failed", e?.message || "could not start overlay"); }
+    } else {
+      await saveToolbarConfig({ ...cur, systemOverlay: false });
+      await overlayHide();
+    }
+  }, []);
+
+  // When a native-overlay button for an app/navigate action is tapped, the
+  // service launches the app and stashes the slot id. Consume + run it here
+  // (on mount and every foreground) so those actions execute in RN with full
+  // DB/root context.
+  useEffect(() => {
+    const runPending = async () => {
+      try {
+        const id = await overlayConsumePendingSlot();
+        if (id) {
+          const cfg = await loadToolbarConfig();
+          const slot = cfg.slots.find((sl) => sl.id === id);
+          if (slot) await executeSlot(slot);
+        }
+        if (HAS_OVERLAY) setOverlayPerm(await overlayHasPermission());
+      } catch { /* non-fatal */ }
+    };
+    runPending();
+    const sub = AppState.addEventListener("change", (state) => {
+      if (state === "active") runPending();
+    });
+    return () => sub.remove();
+  }, []);
+
 
   const ctx: Ctx = { iface, country };
 
@@ -1182,6 +1253,42 @@ export default function App() {
         a draggable, edge-snapping HUD for quick MCP/app actions. drag to reposition,
         tap the gear inside to add or edit tactical buttons.
       </Text>
+
+      {/* ─── Over-other-apps system overlay. This is the *native* floating
+          bubble that stays visible on top of OTHER apps (foreground service +
+          "Display over other apps" permission). MCP-tool buttons fire silently
+          over HTTP; app actions bring Enforcer forward. Only works in the
+          installed APK. ─── */}
+      <TouchableOpacity
+        testID="btn-system-overlay-toggle"
+        onPress={toggleSystemOverlay}
+        style={[s.row, { marginTop: 8, borderColor: systemOverlayOn ? C.green : C.border }]}
+        activeOpacity={0.7}
+      >
+        <MaterialCommunityIcons
+          name={systemOverlayOn ? "toggle-switch" : "toggle-switch-off-outline"}
+          size={22}
+          color={systemOverlayOn ? C.green : C.textDim}
+        />
+        <Text style={[s.rowText, { color: systemOverlayOn ? C.green : C.textDim }]}>
+          over other apps {systemOverlayOn ? "ARMED" : "OFF"}
+        </Text>
+        <MaterialCommunityIcons name="picture-in-picture-bottom-right" size={16} color={systemOverlayOn ? C.green : C.textDim} />
+      </TouchableOpacity>
+      {!HAS_OVERLAY ? (
+        <Text style={[s.helper, { color: C.yellow }]}>
+          ⚠ available only in the installed APK — not Expo Go or the web preview.
+        </Text>
+      ) : (
+        <Text style={s.helper}>
+          floats over every app. permission:{" "}
+          <Text style={{ color: overlayPerm ? C.green : C.red }}>
+            {overlayPerm ? "granted" : "not granted"}
+          </Text>
+          . MCP buttons fire silently; SNAP/PULL/REVIVE bring Enforcer forward.
+        </Text>
+      )}
+
 
       {/* ─── Diagnostics — read-only wlan queries relocated from the
           Quick tab when the toggle-based redesign landed. These don't

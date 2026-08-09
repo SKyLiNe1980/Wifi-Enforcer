@@ -33,6 +33,7 @@ export type ToolbarSlot = {
 export type ToolbarConfig = {
   enabled: boolean;
   collapsed: boolean;
+  systemOverlay?: boolean;  // when true, the native over-other-apps overlay is armed
   x: number;
   y: number;
   slots: ToolbarSlot[];
@@ -44,6 +45,7 @@ export function defaultConfig(): ToolbarConfig {
   return {
     enabled: true,
     collapsed: true,
+    systemOverlay: false,
     x: -1, // -1 => compute from screen on first mount (dock right)
     y: -1,
     slots: [

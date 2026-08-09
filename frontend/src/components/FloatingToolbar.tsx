@@ -142,7 +142,7 @@ export default function FloatingToolbar() {
     setTimeout(() => setFb((p) => ({ ...p, [slot.id]: "idle" })), 1300);
   }, []);
 
-  if (!cfg || !cfg.enabled) return null;
+  if (!cfg || !cfg.enabled || cfg.systemOverlay) return null;
 
   const ledColor = (slot: ToolbarSlot): string => {
     const st = fb[slot.id] || "idle";
