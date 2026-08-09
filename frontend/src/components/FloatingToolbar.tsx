@@ -31,7 +31,7 @@ const C = {
 const MONO = Platform.select({ ios: "Menlo", android: "monospace", default: "monospace" });
 const BUBBLE = 56;
 const BAR_H = 90;
-const { width: SCREEN_W } = Dimensions.get("window");
+const { width: SCREEN_W, height: SCREEN_H } = Dimensions.get("window");
 
 type Fb = "idle" | "firing" | "ok" | "err";
 
@@ -111,8 +111,11 @@ export default function FloatingToolbar() {
       ty.value = start.value.y + e.translationY;
     })
     .onEnd(() => {
-      // clamp vertically within safe area
-      const maxY = Dimensions.get("window").height - h.value - insets.bottom - 8;
+      // clamp vertically within safe area. NOTE: use the captured SCREEN_H
+      // primitive here — `Dimensions.get()` is NOT worklet-safe and calling
+      // it on the UI thread throws "undefined is not a function", which was
+      // force-closing the app on every drag-release.
+      const maxY = SCREEN_H - h.value - insets.bottom - 8;
       const minY = insets.top + 8;
       if (ty.value < minY) ty.value = withSpring(minY);
       if (ty.value > maxY) ty.value = withSpring(maxY);
@@ -139,7 +142,7 @@ export default function FloatingToolbar() {
     setTimeout(() => setFb((p) => ({ ...p, [slot.id]: "idle" })), 1300);
   }, []);
 
-  if (!cfg || !cfg.enabled) return null;
+  if (!cfg || !cfg.enabled || cfg.systemOverlay) return null;
 
   const ledColor = (slot: ToolbarSlot): string => {
     const st = fb[slot.id] || "idle";

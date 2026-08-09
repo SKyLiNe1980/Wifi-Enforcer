@@ -148,3 +148,43 @@ drives it with zero special-casing. Hand-rolled MCP on the Go **stdlib**
   on the APK build.
 - Deferred Phase 2: TX-power/CH knurled dials + MODE/SCAN/EXEC pill wiring
   (bays + pills already laid out as placeholders).
+
+### Floating toolbar — crash fixes + native system overlay
+- **Crash fix (force-close on drag):** the Pan gesture `onEnd` worklet called
+  `Dimensions.get("window")` on the UI thread → "undefined is not a function"
+  (worklet runtime has no Dimensions) → FATAL. Fixed by capturing `SCREEN_H`
+  as a module constant and using it in the worklet. (FloatingToolbar.tsx)
+- **Fix (back-swipe/exit):** default "LIVE" slot navigated to "/(tabs)/live",
+  a route that doesn't exist in this single-screen app. Replaced default with a
+  "PULL" (cloud restore) app action + `loadToolbarConfig` migrates any persisted
+  legacy `/(tabs)/*` navigate slot; navigate action now try/catch-guarded.
+
+### Native over-other-apps overlay (Android) — NEW
+- Purpose: the in-app RN toolbar only floats over Enforcer's own screens; the
+  operator wanted a bubble that stays on top of OTHER apps. That requires a
+  native Android overlay (foreground service + SYSTEM_ALERT_WINDOW +
+  WindowManager) — impossible from pure RN.
+- Native (in plugins/android, wired by plugins/withOverlay.js at prebuild):
+  - `OverlayModule.kt` (NativeModules.OverlayControl): hasPermission,
+    requestPermission, syncConfig(json), show, hide, isRunning,
+    consumePendingSlot.
+  - `OverlayService.kt`: foreground service (specialUse) drawing a draggable
+    bubble that expands to tactical buttons via WindowManager
+    TYPE_APPLICATION_OVERLAY. MCP-tool buttons fire the MCP tools/call directly
+    over HTTP in-service (mirrors mcpClient.ts) — works over other apps, no app
+    focus. app/navigate buttons stash the slot id + launch the app (allowed:
+    SYSTEM_ALERT_WINDOW grants background-activity-launch exemption).
+  - `OverlayPackage.kt`; `withOverlay.js` copies sources, registers the package
+    in MainApplication, adds SYSTEM_ALERT_WINDOW/FOREGROUND_SERVICE(_SPECIAL_USE)
+    perms + <service android:foregroundServiceType="specialUse">, proguard keeps.
+- RN: `src/lib/overlayControl.ts` (graceful no-op when native absent). index.tsx
+  syncs resolved slot config (node host/port/token inlined for MCP slots) on
+  load/subscribe/foreground, consumes pending overlay taps (runs executeSlot),
+  and Settings → General → "over other apps" arms/disarms + requests permission.
+  Config field `systemOverlay` added to toolbarStore; when armed the in-app RN
+  toolbar hides (native one supersedes).
+- Validation: lint + tsc clean; `expo config --type introspect` confirms manifest
+  perms/service; Metro resolved all 1502 modules for android (Hermes bytecode
+  step only fails in-sandbox due to hermesc arch — runs fine on EAS). ONLY
+  testable on the installed APK (`eas build -p android --profile preview`), not
+  Expo Go / web preview.
