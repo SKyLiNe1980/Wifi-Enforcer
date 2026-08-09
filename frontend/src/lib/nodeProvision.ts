@@ -123,16 +123,18 @@ function sshPassExec(
 
 /**
  * Build a `tailscale ssh` command that runs a base64'd remote script. The
- * tailnet identity is the auth — no password, no key bootstrap. Requires the
- * target to have Tailscale SSH enabled (`tailscale up --ssh`) + an ACL grant.
- * NOTE: the FIRST tailscale-ssh to a host may require a one-time check
- * (device auth) that can't be automated; if a run hangs/fails on first use,
- * `tailscale ssh <user>@<host>` once manually to clear it, then retry.
+ * tailnet identity is the auth — no password, no key bootstrap, and NO
+ * `user@` prefix: Tailscale SSH maps the connection to whatever user its ACL
+ * grants (mirrors a bare `tailscale ssh <host>`). Passing `root@` here was
+ * getting rejected ("connection closed by UNKNOWN port 65535") when the ACL
+ * didn't grant root. Requires the target to have `tailscale up --ssh` + an
+ * ACL grant. First use to a host may need a one-time manual `tailscale ssh
+ * <host>` to clear device auth.
  */
-function tailscaleSSHExec(user: string, host: string, remoteScript: string): string {
+function tailscaleSSHExec(host: string, remoteScript: string): string {
   const b64 = toBase64(remoteScript);
   return (
-    `tailscale ssh ${sq(user)}@${host} ` +
+    `tailscale ssh ${host} ` +
     `"echo ${b64} | base64 -d | sh"`
   );
 }
@@ -187,16 +189,16 @@ export async function provisionNode(
 
   try {
     if (authMode === "tailscale") {
-      onLog(`• tailnet mode — using \`tailscale ssh ${user}@${opts.host}\` (no password/key)`);
-      runRemote = (script) => execChroot(tailscaleSSHExec(user, opts.host, script));
+      onLog(`• tailnet mode — using \`tailscale ssh ${opts.host}\` (no user/password/key)`);
+      runRemote = (script) => execChroot(tailscaleSSHExec(opts.host, script));
       // Quick reachability check so we fail fast with a clear message.
       const ping = await runRemote("echo TS_OK\n");
       if (!(ping.output || "").includes("TS_OK")) {
         return {
           ok: false, stage: "connect", isSystemd,
-          detail: `tailscale ssh could not reach ${user}@${opts.host}. ` +
+          detail: `tailscale ssh could not reach ${opts.host}. ` +
             `Ensure the target has \`tailscale up --ssh\` + an ACL grant, and ` +
-            `run \`tailscale ssh ${user}@${opts.host}\` once manually if it needs first-use auth. ` +
+            `run \`tailscale ssh ${opts.host}\` once manually if it needs first-use auth. ` +
             `Raw: ${(ping.output || "").slice(-160)}`,
         };
       }

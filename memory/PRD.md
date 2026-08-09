@@ -188,3 +188,20 @@ drives it with zero special-casing. Hand-rolled MCP on the Go **stdlib**
   step only fails in-sandbox due to hermesc arch — runs fine on EAS). ONLY
   testable on the installed APK (`eas build -p android --profile preview`), not
   Expo Go / web preview.
+
+### Round 2 fixes (user feedback on APK build)
+- **Toolbar expand bug (in-app + native):** expanding lost drag + fell half off
+  screen. RN FloatingToolbar: on expand it now docks the bar to a fully
+  on-screen bottom slot and disables free-drag while expanded (the horizontal
+  ScrollView was fighting the pan); collapsing restores the bubble to its saved
+  spot. Native OverlayService: added clampToScreen() (post-layout) called on
+  expand/drag-end/rebuild so the wider bar can't hang off the edge and strand
+  the drag-handle bubble.
+- **Tailscale SSH:** dropped the `user@` prefix — `tailscale ssh <host>` now
+  (was `root@<ip>` → "connection closed by UNKNOWN port 65535" when ACL didn't
+  grant root; matches the operator's working manual `tailscale ssh <host>`).
+  ProvisionNodeModal hides the SSH user + port fields entirely in Tailscale mode.
+- **Deploy prefill:** modal now prefills BOTH cloud URL and cloud token from the
+  running config (loadUpstashUrl + loadUpstashToken) as suggestions.
+- **SNAP/action feedback:** in-app toolbar and overlay-launched app actions now
+  show an Android toast with the result detail (SNAP was succeeding silently).
