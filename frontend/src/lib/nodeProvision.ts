@@ -35,10 +35,18 @@ export const COCKPIT_KEY = "/root/.ssh/enforcer_cockpit";
 export type ExecResult = { output: string; exit_code: number };
 export type ExecChroot = (inner: string) => Promise<ExecResult>;
 
+// How the cockpit reaches the target to run install commands:
+//   "password" — normal SSH over a routable IP; password used once (sshpass)
+//                to install the cockpit key, key-based thereafter.
+//   "tailscale" — over the tailnet via `tailscale ssh`; the tailnet identity
+//                IS the auth, so no user/password/key bootstrap is needed.
+export type AuthMode = "password" | "tailscale";
+
 export type ProvisionOpts = {
   host: string;              // node address the cockpit will talk to (tailnet IP or DNS)
-  sshUser: string;           // bootstrap login user (root by default)
-  sshPass: string;           // used ONCE for the pubkey bootstrap
+  authMode?: AuthMode;       // default "password"
+  sshUser: string;           // login user (root by default)
+  sshPass: string;           // used ONCE for the pubkey bootstrap (password mode only)
   sshPort?: number;          // default 22
   bearerToken: string;       // written into config.yaml (must match cockpit roster)
   bindHost?: string;         // server.host to bind (default 0.0.0.0)
@@ -108,7 +116,23 @@ function sshPassExec(
   const b64 = toBase64(remoteScript);
   return (
     `sshpass -p ${sq(pass)} ssh -o StrictHostKeyChecking=accept-new ` +
-    `-o ConnectTimeout=12 -p ${port} ${sq(user)}@${host} ` +
+    `-o ConnectTimeout=12 -o NumberOfPasswordPrompts=1 -p ${port} ${sq(user)}@${host} ` +
+    `"echo ${b64} | base64 -d | sh"`
+  );
+}
+
+/**
+ * Build a `tailscale ssh` command that runs a base64'd remote script. The
+ * tailnet identity is the auth — no password, no key bootstrap. Requires the
+ * target to have Tailscale SSH enabled (`tailscale up --ssh`) + an ACL grant.
+ * NOTE: the FIRST tailscale-ssh to a host may require a one-time check
+ * (device auth) that can't be automated; if a run hangs/fails on first use,
+ * `tailscale ssh <user>@<host>` once manually to clear it, then retry.
+ */
+function tailscaleSSHExec(user: string, host: string, remoteScript: string): string {
+  const b64 = toBase64(remoteScript);
+  return (
+    `tailscale ssh ${sq(user)}@${host} ` +
     `"echo ${b64} | base64 -d | sh"`
   );
 }
@@ -154,36 +178,58 @@ export async function provisionNode(
   const user = (opts.sshUser || "root").trim();
   const mcpPort = opts.mcpPort ?? 8765;
   const bindHost = (opts.bindHost || "0.0.0.0").trim();
+  const authMode: AuthMode = opts.authMode || "password";
   let isSystemd: boolean | null = null;
 
+  // runRemote is the transport used for all post-bootstrap commands. In
+  // tailscale mode it's tailscale ssh from the start (no bootstrap needed).
+  let runRemote: (script: string) => Promise<ExecResult>;
+
   try {
-    // ── Prereqs ──
-    onLog("• checking sshpass in chroot…");
-    const sp = await ensureSshpass(execChroot);
-    onLog(`  ${sp.ok ? "✓" : "✗"} ${sp.detail}`);
-    if (!sp.ok) return { ok: false, stage: "prereq", isSystemd, detail: sp.detail };
+    if (authMode === "tailscale") {
+      onLog(`• tailnet mode — using \`tailscale ssh ${user}@${opts.host}\` (no password/key)`);
+      runRemote = (script) => execChroot(tailscaleSSHExec(user, opts.host, script));
+      // Quick reachability check so we fail fast with a clear message.
+      const ping = await runRemote("echo TS_OK\n");
+      if (!(ping.output || "").includes("TS_OK")) {
+        return {
+          ok: false, stage: "connect", isSystemd,
+          detail: `tailscale ssh could not reach ${user}@${opts.host}. ` +
+            `Ensure the target has \`tailscale up --ssh\` + an ACL grant, and ` +
+            `run \`tailscale ssh ${user}@${opts.host}\` once manually if it needs first-use auth. ` +
+            `Raw: ${(ping.output || "").slice(-160)}`,
+        };
+      }
+      onLog("  ✓ tailnet SSH reachable");
+    } else {
+      // ── Prereqs (password mode) ──
+      onLog("• checking sshpass in chroot…");
+      const sp = await ensureSshpass(execChroot);
+      onLog(`  ${sp.ok ? "✓" : "✗"} ${sp.detail}`);
+      if (!sp.ok) return { ok: false, stage: "prereq", isSystemd, detail: sp.detail };
 
-    onLog("• ensuring cockpit keypair…");
-    const pub = await ensureCockpitKeypair(execChroot);
-    onLog(`  ✓ ${pub.slice(0, 32)}…${pub.slice(-16)}`);
+      onLog("• ensuring cockpit keypair…");
+      const pub = await ensureCockpitKeypair(execChroot);
+      onLog(`  ✓ ${pub.slice(0, 32)}…${pub.slice(-16)}`);
 
-    // ── Stage 1: bootstrap key via password (used exactly once) ──
-    onLog(`• stage 1 — installing cockpit key on ${opts.sshUser}@${opts.host} (password used once)…`);
-    const bootstrap =
-      "set -e\n" +
-      "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys\n" +
-      `grep -qxF ${sq(pub)} ~/.ssh/authorized_keys || echo ${sq(pub)} >> ~/.ssh/authorized_keys\n` +
-      "chmod 600 ~/.ssh/authorized_keys\n" +
-      "echo KEY_INSTALLED\n";
-    const b = await execChroot(sshPassExec(opts.sshUser, opts.sshPass, opts.host, port, bootstrap));
-    if (!(b.output || "").includes("KEY_INSTALLED")) {
-      return { ok: false, stage: "bootstrap", isSystemd, detail: `key install failed: ${(b.output || "").slice(0, 200)}` };
+      // ── Stage 1: bootstrap key via password (used exactly once) ──
+      onLog(`• stage 1 — installing cockpit key on ${user}@${opts.host} (password used once)…`);
+      const bootstrap =
+        "set -e\n" +
+        "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys\n" +
+        `grep -qxF ${sq(pub)} ~/.ssh/authorized_keys || echo ${sq(pub)} >> ~/.ssh/authorized_keys\n` +
+        "chmod 600 ~/.ssh/authorized_keys\n" +
+        "echo KEY_INSTALLED\n";
+      const b = await execChroot(sshPassExec(user, opts.sshPass, opts.host, port, bootstrap));
+      if (!(b.output || "").includes("KEY_INSTALLED")) {
+        return { ok: false, stage: "bootstrap", isSystemd, detail: `key install failed: ${(b.output || "").slice(0, 200)}` };
+      }
+      onLog("  ✓ key installed — switching to key auth");
+      runRemote = (script) => execChroot(sshKeyExec(user, opts.host, port, script));
     }
-    onLog("  ✓ key installed — switching to key auth");
 
-    // ── Detect init system (key auth) ──
-    const det = await execChroot(sshKeyExec(user, opts.host, port,
-      "[ -d /run/systemd/system ] && echo systemd || echo sysv\n"));
+    // ── Detect init system ──
+    const det = await runRemote("[ -d /run/systemd/system ] && echo systemd || echo sysv\n");
     isSystemd = (det.output || "").includes("systemd");
     onLog(`  ✓ init system: ${isSystemd ? "systemd" : "sysv/init.d"}`);
 
@@ -194,7 +240,7 @@ export async function provisionNode(
       `curl -fsSL ${sq(opts.debUrl)} -o /tmp/enforcer-mcp.deb\n` +
       "dpkg -i /tmp/enforcer-mcp.deb || apt-get install -fy\n" +
       "echo INSTALL_DONE\n";
-    const ins = await execChroot(sshKeyExec(user, opts.host, port, install));
+    const ins = await runRemote(install);
     if (!(ins.output || "").includes("INSTALL_DONE")) {
       return { ok: false, stage: "install", isSystemd, detail: `dpkg install failed: ${(ins.output || "").slice(-300)}` };
     }
@@ -220,7 +266,7 @@ export async function provisionNode(
       `${startCmd} || true\n` +
       "sleep 2\n" +
       `curl -fsS -m 6 http://127.0.0.1:${mcpPort}/health >/dev/null 2>&1 && echo HEALTH_OK || echo HEALTH_FAIL\n`;
-    const fin = await execChroot(sshKeyExec(user, opts.host, port, finalize));
+    const fin = await runRemote(finalize);
     const healthy = (fin.output || "").includes("HEALTH_OK");
     onLog(healthy ? "  ✓ service up and answering /health" : "  ⚠ started but /health did not answer yet");
 

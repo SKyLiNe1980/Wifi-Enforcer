@@ -106,3 +106,19 @@ drives it with zero special-casing. Hand-rolled MCP on the Go **stdlib**
 - Deferred: Phase 2 tray helper (session-0 service can't own a tray → separate
   per-user autostart helper polling localhost/health); Phase 3 cockpit reads
   capabilities + hashcat job dispatch (replaces synchronous tools/call).
+
+### Provision wizard: crash fix + dual auth modes
+- **Crash fix (JNI weak-ref overflow):** the deploy crash was
+  `NativeAnimatedModule` weak global-ref table overflow (~50k refs). Root cause:
+  `ProvisionNodeModal` used `<Modal animationType="slide">` + an
+  `ActivityIndicator`, and stayed open for the whole multi-minute deploy while
+  MCPTab's background timers re-rendered it — bleeding Animated weak-refs until
+  the JNI table overflowed. Fixed by `animationType="none"` + removing the
+  ActivityIndicator (there is zero JS Animated usage elsewhere). Frontend-only.
+- **Dual auth modes:** wizard now has "Password (public IP)" vs "Tailscale SSH
+  (tailnet)". Tailscale mode uses `tailscale ssh <user>@<host>` (no password/key
+  bootstrap — tailnet identity is the auth) and no longer blocks on empty
+  user/pass. Password mode unchanged (sshpass one-time key bootstrap). Added
+  `authMode` to ProvisionOpts + `tailscaleSSHExec()`; password field is hidden
+  in tailscale mode. Note: tailscale-ssh first use may need a one-time manual
+  `tailscale ssh` to clear device auth (documented in the wizard hint).

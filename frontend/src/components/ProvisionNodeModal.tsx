@@ -13,7 +13,7 @@
 import React, { useCallback, useEffect, useState } from "react";
 import {
   View, Text, StyleSheet, ScrollView, TouchableOpacity, TextInput,
-  Modal, Platform, Switch, KeyboardAvoidingView, ActivityIndicator,
+  Modal, Platform, Switch, KeyboardAvoidingView,
 } from "react-native";
 import * as Crypto from "expo-crypto";
 import { execReal, HAS_NATIVE_ROOT } from "../lib/rootShell";
@@ -51,6 +51,7 @@ export default function ProvisionNodeModal(props: {
 
   const [name, setName] = useState("");
   const [host, setHost] = useState("");
+  const [authMode, setAuthMode] = useState<"password" | "tailscale">("password");
   const [sshUser, setSshUser] = useState("root");
   const [sshPass, setSshPass] = useState("");
   const [sshPort, setSshPort] = useState("22");
@@ -100,8 +101,12 @@ export default function ProvisionNodeModal(props: {
       appendLog("✗ root shell unavailable — provisioning needs the deployed APK (not Expo Go / web).");
       return;
     }
-    if (!host.trim() || !sshPass) {
-      appendLog("✗ host and SSH password are required.");
+    if (!host.trim()) {
+      appendLog("✗ host is required.");
+      return;
+    }
+    if (authMode === "password" && !sshPass) {
+      appendLog("✗ SSH password is required for password mode (or switch to Tailscale SSH).");
       return;
     }
     if (!bearer) { appendLog("✗ bearer token empty — tap REGEN."); return; }
@@ -128,6 +133,7 @@ export default function ProvisionNodeModal(props: {
       const res = await provisionNode(
         {
           host: host.trim(),
+          authMode,
           sshUser: sshUser.trim() || "root",
           sshPass,
           sshPort: parseInt(sshPort, 10) || 22,
@@ -151,7 +157,7 @@ export default function ProvisionNodeModal(props: {
       if (debHandleId) await stopHttpServer(debHandleId).catch(() => {});
       setRunning(false);
     }
-  }, [host, sshUser, sshPass, sshPort, mcpPort, bindHost, bearer, cloudUrl, cloudToken, installCron, execChroot, appendLog]);
+  }, [host, sshUser, sshPass, sshPort, mcpPort, bindHost, bearer, cloudUrl, cloudToken, installCron, authMode, execChroot, appendLog]);
 
   const handleSaveToRoster = useCallback(() => {
     onProvisioned({
@@ -187,7 +193,7 @@ export default function ProvisionNodeModal(props: {
   );
 
   return (
-    <Modal visible={visible} animationType="slide" transparent onRequestClose={onClose}>
+    <Modal visible={visible} animationType="none" transparent onRequestClose={onClose}>
       <View style={s.backdrop}>
         <KeyboardAvoidingView
           behavior={Platform.OS === "ios" ? "padding" : undefined}
@@ -207,11 +213,42 @@ export default function ProvisionNodeModal(props: {
 
             {field("Node name", name, setName, { placeholder: "e.g. vps-fra-01" })}
             {field("Host (tailnet IP / DNS)", host, setHost, { placeholder: "100.x.y.z" })}
+
+            {/* Auth mode selector */}
+            <Text style={s.label}>Connect via</Text>
+            <View style={[s.row, { marginBottom: 12 }]}>
+              {([
+                ["password", "Password (public IP)"],
+                ["tailscale", "Tailscale SSH (tailnet)"],
+              ] as const).map(([mode, lbl]) => {
+                const active = authMode === mode;
+                return (
+                  <TouchableOpacity
+                    key={mode}
+                    style={[s.modeBtn, active && s.modeBtnActive, mode === "password" && { marginRight: 8 }]}
+                    disabled={running}
+                    onPress={() => setAuthMode(mode)}
+                  >
+                    <Text style={[s.modeBtnTxt, active && s.modeBtnTxtActive]}>{lbl}</Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+            <Text style={s.hintFine}>
+              {authMode === "tailscale"
+                ? "Uses `tailscale ssh` — tailnet identity is the auth, no password. Target needs `tailscale up --ssh` + an ACL grant. First use may need a one-time manual `tailscale ssh` to clear device auth."
+                : "Normal SSH over a routable IP. The password is used ONCE to install the cockpit key; key-based thereafter."}
+            </Text>
+
             <View style={s.row}>
               <View style={{ flex: 1, marginRight: 8 }}>{field("SSH user", sshUser, setSshUser, { placeholder: "root" })}</View>
-              <View style={{ width: 90 }}>{field("SSH port", sshPort, setSshPort, { keyboard: "numeric" })}</View>
+              {authMode === "password" ? (
+                <View style={{ width: 90 }}>{field("SSH port", sshPort, setSshPort, { keyboard: "numeric" })}</View>
+              ) : null}
             </View>
-            {field("SSH password (used once)", sshPass, setSshPass, { secure: true, placeholder: "root password" })}
+            {authMode === "password"
+              ? field("SSH password (used once)", sshPass, setSshPass, { secure: true, placeholder: "root password" })
+              : null}
 
             <View style={s.row}>
               <View style={{ flex: 1, marginRight: 8 }}>{field("MCP port", mcpPort, setMcpPort, { keyboard: "numeric" })}</View>
@@ -266,18 +303,11 @@ export default function ProvisionNodeModal(props: {
               </TouchableOpacity>
             ) : (
               <TouchableOpacity
-                style={[s.actionBtn, running && { opacity: 0.5 }]}
+                style={[s.actionBtn, running && { opacity: 0.6 }]}
                 disabled={running}
                 onPress={handleProvision}
               >
-                {running ? (
-                  <View style={{ flexDirection: "row", alignItems: "center" }}>
-                    <ActivityIndicator size="small" color={C.mcpAccent} />
-                    <Text style={[s.actionTxt, { marginLeft: 8 }]}>PROVISIONING…</Text>
-                  </View>
-                ) : (
-                  <Text style={s.actionTxt}>PROVISION</Text>
-                )}
+                <Text style={s.actionTxt}>{running ? "PROVISIONING…  (watch the log)" : "PROVISION"}</Text>
               </TouchableOpacity>
             )}
           </View>
@@ -300,6 +330,14 @@ const s = StyleSheet.create({
   title: { color: C.mcpAccent, fontFamily: MONO, fontSize: 16, fontWeight: "700" },
   headerBtn: { color: C.textDim, fontFamily: MONO, fontSize: 13 },
   hint: { color: C.textDim, fontFamily: MONO, fontSize: 11, lineHeight: 16, marginBottom: 14 },
+  hintFine: { color: C.textDim, fontFamily: MONO, fontSize: 10, lineHeight: 15, marginBottom: 12 },
+  modeBtn: {
+    flex: 1, backgroundColor: C.panel2, borderColor: C.border, borderWidth: 1,
+    borderRadius: 8, paddingVertical: 10, alignItems: "center",
+  },
+  modeBtnActive: { borderColor: C.mcpAccent, backgroundColor: C.panel },
+  modeBtnTxt: { color: C.textDim, fontFamily: MONO, fontSize: 11, fontWeight: "700" },
+  modeBtnTxtActive: { color: C.mcpAccent },
   label: { color: C.text, fontFamily: MONO, fontSize: 12, marginBottom: 5 },
   input: {
     backgroundColor: C.panel2, borderColor: C.border, borderWidth: 1, borderRadius: 8,
