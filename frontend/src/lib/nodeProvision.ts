@@ -133,7 +133,14 @@ function sshPassExec(
  */
 function tailscaleSSHExec(host: string, remoteScript: string): string {
   const b64 = toBase64(remoteScript);
+  // IMPORTANT: our chroot helper uses `sudo -E`, which leaks the Android
+  // launcher's env into Kali — notably SHELL=/system/bin/sh. `tailscale ssh`
+  // falls back to $SHELL and tries to exec /system/bin/sh (absent in the
+  // chroot) → "/system/bin/sh: No such file or directory" → "connection
+  // closed by UNKNOWN port 65535". Pin a real Kali shell + HOME/TERM so the
+  // client behaves exactly like the operator's working manual invocation.
   return (
+    `SHELL=/bin/bash HOME=/root TERM=xterm ` +
     `tailscale ssh ${host} ` +
     `"echo ${b64} | base64 -d | sh"`
   );
