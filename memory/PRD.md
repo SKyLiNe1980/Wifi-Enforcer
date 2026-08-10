@@ -236,3 +236,21 @@ drives it with zero special-casing. Hand-rolled MCP on the Go **stdlib**
 - Manual instant confirm (no rebuild): `SHELL=/system/bin/sh tailscale ssh
   100.99.68.115 echo TS_OK` should REPRODUCE the error; adding
   `SHELL=/bin/bash` should fix it.
+
+### Tailscale deploy — SHELL fix WORKED; new hang + crash (round 5)
+- Target log now shows SSH connects + "Session complete" (SHELL pin fixed the
+  auth). But app hangs on "probing" then crashes.
+- Root cause of hang: `tailscale ssh --has-tty=false` forwards stdin and waits
+  for EOF; our `su` exec pipe keeps stdin open → client never exits even after
+  remote finishes → app stuck ~6 min → JNI weak-ref table overflow
+  (NativeAnimatedModule, 50857 refs) SIGABRT crash.
+- Fix: tailscaleSSHExec now `timeout 180 tailscale ssh … "<script>" </dev/null`
+  (ssh -n style stdin EOF + hard cap). DIAG probe: `timeout 30 … </dev/null`.
+- Defensive: set ToolbarConfigModal + LiveTab endpoint modal animationType
+  "none" (this device's known NativeAnimatedModule weak-ref leak; prior crash
+  was fixed the same way for ProvisionNodeModal).
+- STILL TO ROOT-CAUSE NEXT TIME: the underlying NativeAnimatedModule weak-ref
+  leak on this LineageOS/new-arch device (accumulates ~132/s the whole session;
+  no continuous Animated/withRepeat found in our code — likely RN new-arch
+  TurboModule weak-ref leak or a Modal/dependency driver). The timeout fix
+  prevents the long hang that lets it overflow, but the slow leak remains.

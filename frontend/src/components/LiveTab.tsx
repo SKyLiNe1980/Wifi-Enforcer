@@ -610,7 +610,7 @@ export default function LiveTab(props: Props) {
       {/* ─── Endpoint picker modal (for needs_endpoint profiles) ───────── */}
       <Modal
         visible={endpointPickerOpen}
-        animationType="fade"
+        animationType="none"
         transparent
         onRequestClose={() => { setEndpointPickerOpen(false); setPendingProfile(null); }}
       >

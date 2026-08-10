@@ -140,7 +140,7 @@ export default function ToolbarConfigModal({
   if (!draft) return null;
 
   return (
-    <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
+    <Modal visible={visible} transparent animationType="none" onRequestClose={onClose}>
       <View style={styles.backdrop}>
         <Pressable style={styles.backdropTap} onPress={onClose} />
         <LinearGradient
