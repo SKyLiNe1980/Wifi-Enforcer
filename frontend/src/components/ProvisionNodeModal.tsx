@@ -162,6 +162,34 @@ export default function ProvisionNodeModal(props: {
     }
   }, [host, sshUser, sshPass, sshPort, mcpPort, bindHost, bearer, cloudUrl, cloudToken, installCron, authMode, execChroot, appendLog]);
 
+  // Tailscale SSH diagnostic — runs inside the Kali chroot (same path as the
+  // real deploy) and dumps raw output so we can see: is `tailscale` even on the
+  // chroot PATH? what does `tailscale status` see? and what EXACTLY happens when
+  // we `tailscale ssh <host> echo TS_OK`. A "/system/bin/sh" error here means
+  // the host is resolving to an ANDROID node (e.g. the phone), not the target.
+  const handleDiag = useCallback(async () => {
+    if (!HAS_NATIVE_ROOT) { appendLog("✗ TS DIAG needs the deployed APK (not Expo Go / web)."); return; }
+    const h = host.trim();
+    if (!h) { appendLog("✗ enter a host first."); return; }
+    setRunning(true);
+    try {
+      appendLog(`\n• TS DIAG → ${h} (running in chroot)…`);
+      const script =
+        `echo "PATH=$PATH"; echo "SHELL=$SHELL HOME=$HOME TERM=$TERM"; ` +
+        `command -v tailscale >/dev/null 2>&1 && echo "tailscale bin: $(command -v tailscale)" || echo "tailscale bin: NOT FOUND IN CHROOT"; ` +
+        `echo "--- tailscale status (whoami/peers) ---"; tailscale status 2>&1 | head -8; ` +
+        `echo "--- probe: tailscale ssh ${h} echo TS_OK ---"; ` +
+        `SHELL=/bin/bash HOME=/root TERM=xterm tailscale ssh ${h} echo TS_OK 2>&1; echo "PROBE_EXIT=$?"`;
+      const r = await execChroot(script);
+      appendLog(r.output || "(no output)");
+      appendLog("• TS DIAG done. If PROBE_EXIT=0 and you see TS_OK, the host is good.");
+    } catch (e: any) {
+      appendLog(`✗ TS DIAG error: ${e?.message || e}`);
+    } finally {
+      setRunning(false);
+    }
+  }, [host, execChroot, appendLog]);
+
   const handleSaveToRoster = useCallback(() => {
     onProvisioned({
       name: name.trim() || host.trim(),
@@ -215,7 +243,14 @@ export default function ProvisionNodeModal(props: {
             </Text>
 
             {field("Node name", name, setName, { placeholder: "e.g. vps-fra-01" })}
-            {field("Host (tailnet IP / DNS)", host, setHost, { placeholder: "100.x.y.z" })}
+            {field("Host (tailnet IP / DNS)", host, setHost, { placeholder: "codespaces-xxxx  or  100.x.y.z" })}
+            {authMode === "tailscale" ? (
+              <Text style={[s.hint, { marginTop: 4, color: C.yellow }]}>
+                Tip: use the exact MagicDNS name that works with your manual{" "}
+                <Text style={{ fontWeight: "700" }}>tailscale ssh &lt;host&gt;</Text> (e.g. codespaces-xxxx),
+                not necessarily the 100.x IP.
+              </Text>
+            ) : null}
 
             {/* Auth mode selector */}
             <Text style={s.label}>Connect via</Text>
@@ -307,13 +342,24 @@ export default function ProvisionNodeModal(props: {
                 <Text style={[s.actionTxt, { color: "#04120a" }]}>SAVE TO ROSTER →</Text>
               </TouchableOpacity>
             ) : (
-              <TouchableOpacity
-                style={[s.actionBtn, running && { opacity: 0.6 }]}
-                disabled={running}
-                onPress={handleProvision}
-              >
-                <Text style={s.actionTxt}>{running ? "PROVISIONING…  (watch the log)" : "PROVISION"}</Text>
-              </TouchableOpacity>
+              <>
+                {authMode === "tailscale" ? (
+                  <TouchableOpacity
+                    style={[s.actionBtn, { backgroundColor: "transparent", borderWidth: 1, borderColor: C.yellow, marginBottom: 8 }, running && { opacity: 0.6 }]}
+                    disabled={running}
+                    onPress={handleDiag}
+                  >
+                    <Text style={[s.actionTxt, { color: C.yellow }]}>{running ? "PROBING…" : "TS DIAG — probe host"}</Text>
+                  </TouchableOpacity>
+                ) : null}
+                <TouchableOpacity
+                  style={[s.actionBtn, running && { opacity: 0.6 }]}
+                  disabled={running}
+                  onPress={handleProvision}
+                >
+                  <Text style={s.actionTxt}>{running ? "PROVISIONING…  (watch the log)" : "PROVISION"}</Text>
+                </TouchableOpacity>
+              </>
             )}
           </View>
         </KeyboardAvoidingView>

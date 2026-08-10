@@ -205,3 +205,34 @@ drives it with zero special-casing. Hand-rolled MCP on the Go **stdlib**
   running config (loadUpstashUrl + loadUpstashToken) as suggestions.
 - **SNAP/action feedback:** in-app toolbar and overlay-launched app actions now
   show an Android toast with the result detail (SNAP was succeeding silently).
+
+### Tailscale deploy still failing — diagnosis + DIAG tool (round 3)
+- Symptom persists after dropping user@: "Connection closed by UNKNOWN port
+  65535" + RAW "/system/bin/sh: No such file or directory".
+- Analysis: execReal runs `su` → command → Android's /system/bin/sh, then the
+  chroot prefix drops into Kali. The remote target of `tailscale ssh` would use
+  ITS OWN /bin/sh; a /system/bin/sh error therefore means the SSH is landing on
+  an ANDROID node (the phone / another android peer), NOT the codespace. User's
+  working manual cmd used MagicDNS name `codespaces-f91bc7`; app used IP
+  100.99.68.115 → likely the wrong/an-android host.
+- Added: ProvisionNodeModal "TS DIAG — probe host" button (tailscale mode) that
+  runs `command -v tailscale; tailscale status; tailscale ssh <host> echo TS_OK`
+  inside the chroot and dumps raw output+exit. Also a UI tip to use the MagicDNS
+  name, and host placeholder now shows `codespaces-xxxx`.
+- Immediate (no rebuild) repro for user: run in app Terminal (KALI mode):
+  `tailscale ssh codespaces-f91bc7 echo TS_OK; echo EXIT=$?`  vs the IP.
+
+### Tailscale deploy ROOT CAUSE FOUND (round 4)
+- Manual Test A + B both returned TS_OK EXIT=0 → host + wrapper fine.
+- Root cause: chroot helper uses `sudo -E` (preserves env). App exec path is
+  Android `Runtime.exec("su")` (SHELL=/system/bin/sh) → sudo -E leaks that
+  SHELL into Kali → `tailscale ssh` falls back to $SHELL=/system/bin/sh (absent
+  in chroot) → "/system/bin/sh: No such file or directory" → "connection closed
+  by UNKNOWN port 65535". Manual works because interactive Kali shell has
+  SHELL=/bin/bash. Python/wifite unaffected (don't use $SHELL).
+- Fix: tailscaleSSHExec now prepends `SHELL=/bin/bash HOME=/root TERM=xterm`
+  before `tailscale ssh`. DIAG probe also echoes SHELL/HOME/TERM + uses the same
+  env pin. (nodeProvision.ts, ProvisionNodeModal.tsx)
+- Manual instant confirm (no rebuild): `SHELL=/system/bin/sh tailscale ssh
+  100.99.68.115 echo TS_OK` should REPRODUCE the error; adding
+  `SHELL=/bin/bash` should fix it.
