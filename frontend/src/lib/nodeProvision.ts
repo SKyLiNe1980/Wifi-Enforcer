@@ -133,16 +133,19 @@ function sshPassExec(
  */
 function tailscaleSSHExec(host: string, remoteScript: string): string {
   const b64 = toBase64(remoteScript);
-  // IMPORTANT: our chroot helper uses `sudo -E`, which leaks the Android
-  // launcher's env into Kali — notably SHELL=/system/bin/sh. `tailscale ssh`
-  // falls back to $SHELL and tries to exec /system/bin/sh (absent in the
-  // chroot) → "/system/bin/sh: No such file or directory" → "connection
-  // closed by UNKNOWN port 65535". Pin a real Kali shell + HOME/TERM so the
-  // client behaves exactly like the operator's working manual invocation.
+  // IMPORTANT #1 — SHELL pin: our chroot helper uses `sudo -E`, which leaks the
+  // Android launcher's SHELL=/system/bin/sh into Kali; `tailscale ssh` then
+  // execs it → "/system/bin/sh: No such file or directory" → session closed.
+  // IMPORTANT #2 — `</dev/null`: with `--has-tty=false` the client forwards
+  // stdin to the remote and waits for EOF. Our `su` exec pipe keeps stdin open,
+  // so even after the remote prints "Session complete" the CLIENT hangs
+  // forever (app stuck "probing", then a JNI weak-ref table overflow crash).
+  // Redirecting stdin from /dev/null (like `ssh -n`) makes it return cleanly.
+  // `timeout` is a belt-and-suspenders cap so a bad host can never hang the app.
   return (
-    `SHELL=/bin/bash HOME=/root TERM=xterm ` +
+    `SHELL=/bin/bash HOME=/root TERM=xterm timeout 180 ` +
     `tailscale ssh ${host} ` +
-    `"echo ${b64} | base64 -d | sh"`
+    `"echo ${b64} | base64 -d | sh" </dev/null`
   );
 }
 

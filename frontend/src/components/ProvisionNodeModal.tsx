@@ -179,7 +179,7 @@ export default function ProvisionNodeModal(props: {
         `command -v tailscale >/dev/null 2>&1 && echo "tailscale bin: $(command -v tailscale)" || echo "tailscale bin: NOT FOUND IN CHROOT"; ` +
         `echo "--- tailscale status (whoami/peers) ---"; tailscale status 2>&1 | head -8; ` +
         `echo "--- probe: tailscale ssh ${h} echo TS_OK ---"; ` +
-        `SHELL=/bin/bash HOME=/root TERM=xterm tailscale ssh ${h} echo TS_OK 2>&1; echo "PROBE_EXIT=$?"`;
+        `SHELL=/bin/bash HOME=/root TERM=xterm timeout 30 tailscale ssh ${h} echo TS_OK </dev/null 2>&1; echo "PROBE_EXIT=$?"`;
       const r = await execChroot(script);
       appendLog(r.output || "(no output)");
       appendLog("• TS DIAG done. If PROBE_EXIT=0 and you see TS_OK, the host is good.");
