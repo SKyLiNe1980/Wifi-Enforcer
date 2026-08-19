@@ -59,6 +59,8 @@ export default function FloatingToolbar() {
   const r = useSharedValue(BUBBLE / 2);
   const start = useSharedValue({ x: 0, y: 0 });
   const expSV = useSharedValue(0);
+  // Tracks the system-overlay flag so we can detect the moment it's disarmed.
+  const prevOverlay = useRef(false);
 
   // Load persisted config + position.
   useEffect(() => {
@@ -77,6 +79,27 @@ export default function FloatingToolbar() {
     const unsub = subscribeToolbar((c) => alive && setCfg(c));
     return () => { alive = false; unsub(); };
   }, [tx, ty]);
+
+  // Switcheroo fix: this component is always mounted in the root layout and
+  // merely `return null`s while the native over-other-apps overlay is armed —
+  // so its animated state (expanded / size / position) stays frozen, not
+  // unmounted. When the overlay is disarmed and the in-app bar returns, it
+  // would otherwise reappear in that stale (often expanded, drag-disabled,
+  // half-off-screen) state. Detect the true→false overlay transition and reset
+  // to a clean collapsed bubble at its last known spot.
+  useEffect(() => {
+    const so = !!cfg?.systemOverlay;
+    if (prevOverlay.current && !so) {
+      setExpanded(false);
+      expSV.value = 0;
+      w.value = BUBBLE;
+      h.value = BUBBLE;
+      r.value = BUBBLE / 2;
+      tx.value = bubblePos.current.x;
+      ty.value = bubblePos.current.y;
+    }
+    prevOverlay.current = so;
+  }, [cfg?.systemOverlay, expSV, h, r, tx, ty, w]);
 
   const persist = useCallback((x: number, y: number) => {
     saveToolbarPosition(x, y, !expanded).catch(() => {});

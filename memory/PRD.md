@@ -254,3 +254,30 @@ drives it with zero special-casing. Hand-rolled MCP on the Go **stdlib**
   no continuous Animated/withRepeat found in our code — likely RN new-arch
   TurboModule weak-ref leak or a Modal/dependency driver). The timeout fix
   prevents the long hang that lets it overflow, but the slow leak remains.
+
+### Toolbar switcheroo fix (round 6)
+- Report: native over-other-apps drag is fixed, but the IN-APP toolbar now
+  breaks (static/half-off/undraggable) AFTER using the overlay.
+- Cause: FloatingToolbar is always mounted in root layout; while systemOverlay
+  is armed it `return null`s but the component instance persists, so `expanded`
+  + animated shared values (w/h/tx/ty/expSV) stay frozen. On disarm it returns
+  in that stale (often expanded → pan disabled) state; the one-shot load effect
+  doesn't re-run.
+- Fix: added effect detecting systemOverlay true→false transition (prevOverlay
+  ref) that resets expanded=false, expSV=0, w/h/r to bubble geometry, and
+  tx/ty to bubblePos.current (last known bubble spot). (FloatingToolbar.tsx)
+- Open (cosmetic): in-app RN toolbar (expo-linear-gradient HUD: gradients,
+  screws, LED strips, MODE/SCAN/EXEC pills, TX/CH bays) vs native overlay
+  (OverlayService.kt basic Kotlin Views, flat colors) look different by design.
+  Aligning requires drawing gradients/LED/screws natively — deferred.
+
+### BACKLOG — provisioning robustness (user note, defer)
+- Provisioning currently assumes preconditions exist; a missing dependency for a
+  selected option (e.g. cron watcher chosen but cron/crontab not installed) has
+  no recovery → step fails or hangs. "Fine for now" per user.
+- Future hardening: preflight capability-probe each selected feature and adapt:
+    * `command -v crontab` → else systemd timer → else init.d → else skip+warn
+    * detect `systemctl` vs `service`; verify .deb actually installed (dpkg -l)
+    * wrap every remote step in `timeout` (already done for the ping) so nothing
+      can hang the app
+    * surface a clear per-step "OK / skipped (reason) / failed" summary in the log
