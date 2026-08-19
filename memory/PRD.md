@@ -303,3 +303,22 @@ drives it with zero special-casing. Hand-rolled MCP on the Go **stdlib**
 - Deferred per user: UEF (lives in Live/term, needs compact+full dual UI) and
   Orchestration (own tab; backend = Ergo IRC API+WS + A2A/MCP + eggdrop taskers +
   heartbeats/goals/contracts, not finalized). Build rich UI once contracts exist.
+
+### NEXT SESSION — PRIORITY: bearer-token auth may be broken (SECURITY)
+- User observation: the `pwn-` node runs on a DIFFERENT bearer token than the
+  cockpit has stored, yet calls succeed with no auth failures → bearer auth is
+  likely NOT being enforced.
+- Suspects to check first:
+  * enforcer-mcp BearerAuthMiddleware — is it actually comparing tokens, or
+    only gating on presence? Timing-safe compare? (server.py ~L134-144)
+  * `require_token` resolution — config.yaml vs env vs default; if it reads
+    false/missing, middleware may allow all. Confirm /health vs /mcp gating.
+  * enforcer-node-win auth path (Go) — same check: does it reject wrong/absent
+    Bearer on /mcp (everything except /health)?
+  * Token desync from the /etc vs ~/.enforcer-cloud.env precedence (see prior
+    note) — node may be loading a token the cockpit no longer uses, but that
+    still shouldn't ACCEPT a wrong token.
+- Repro to build: call a node's /mcp with (a) correct, (b) wrong, (c) no bearer;
+  expect 200 / 401 / 401. If all 200 → confirmed broken.
+- Treat as security bug; also consider surfacing an auth-status indicator per
+  node in the cockpit once fixed.
