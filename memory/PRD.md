@@ -254,3 +254,71 @@ drives it with zero special-casing. Hand-rolled MCP on the Go **stdlib**
   no continuous Animated/withRepeat found in our code — likely RN new-arch
   TurboModule weak-ref leak or a Modal/dependency driver). The timeout fix
   prevents the long hang that lets it overflow, but the slow leak remains.
+
+### Toolbar switcheroo fix (round 6)
+- Report: native over-other-apps drag is fixed, but the IN-APP toolbar now
+  breaks (static/half-off/undraggable) AFTER using the overlay.
+- Cause: FloatingToolbar is always mounted in root layout; while systemOverlay
+  is armed it `return null`s but the component instance persists, so `expanded`
+  + animated shared values (w/h/tx/ty/expSV) stay frozen. On disarm it returns
+  in that stale (often expanded → pan disabled) state; the one-shot load effect
+  doesn't re-run.
+- Fix: added effect detecting systemOverlay true→false transition (prevOverlay
+  ref) that resets expanded=false, expSV=0, w/h/r to bubble geometry, and
+  tx/ty to bubblePos.current (last known bubble spot). (FloatingToolbar.tsx)
+- Open (cosmetic): in-app RN toolbar (expo-linear-gradient HUD: gradients,
+  screws, LED strips, MODE/SCAN/EXEC pills, TX/CH bays) vs native overlay
+  (OverlayService.kt basic Kotlin Views, flat colors) look different by design.
+  Aligning requires drawing gradients/LED/screws natively — deferred.
+
+### BACKLOG — provisioning robustness (user note, defer)
+- Provisioning currently assumes preconditions exist; a missing dependency for a
+  selected option (e.g. cron watcher chosen but cron/crontab not installed) has
+  no recovery → step fails or hangs. "Fine for now" per user.
+- Future hardening: preflight capability-probe each selected feature and adapt:
+    * `command -v crontab` → else systemd timer → else init.d → else skip+warn
+    * detect `systemctl` vs `service`; verify .deb actually installed (dpkg -l)
+    * wrap every remote step in `timeout` (already done for the ping) so nothing
+      can hang the app
+    * surface a clear per-step "OK / skipped (reason) / failed" summary in the log
+
+### Windows Node Phase 3 — Hashcat dispatch + GPU badge + version (DONE, needs on-device test)
+- Node version visibility (user's realization): /health already returns `version`
+  and it's stored in node.last_health_info — was just never shown. Now the // node
+  list card shows `· v<version>`. No new plumbing.
+- Capabilities-aware: reads `capabilities` from last_health_info. If it includes
+  hashcat/cuda/gpu → shows a GPU badge + per-cap tags on the node card AND a small
+  amber GPU chip badge on the node marker in NodesMap.
+- Hashcat dispatch: GPU-capable node cards get a ⚡CRACK button → modal composes a
+  raw hashcat arg string (quick chips: WPA 22000 / NTLM 1000 / MD5 0 / sha512crypt
+  1800) and fires the node's `hashcat` MCP tool ({args}) via callMcpTool; result
+  text dumped in-modal. Synchronous (120s client timeout) — Phase-3 streaming TODO.
+- Contracts: enforcer-node-win /health → {version,capabilities,tools}; `hashcat`
+  tool takes {args:"<cli string>"} → runs `<hashcat_path> <args>`. enforcer-mcp
+  (Linux) /health returns version but NOT capabilities yet — to light up the Linux
+  GPU rigs (H200/3090), enforcer-mcp needs a capabilities field + hashcat tool
+  (server-side change → node redeploy). Frontend is already capability-agnostic.
+- Files: MCPTab.tsx (state crackNode/crackArgs/crackOut, runCrack, card version+
+  badge+CRACK btn, dispatch modal), NodesMap.tsx (gpu chip badge + style).
+- Deferred per user: UEF (lives in Live/term, needs compact+full dual UI) and
+  Orchestration (own tab; backend = Ergo IRC API+WS + A2A/MCP + eggdrop taskers +
+  heartbeats/goals/contracts, not finalized). Build rich UI once contracts exist.
+
+### NEXT SESSION — PRIORITY: bearer-token auth may be broken (SECURITY)
+- User observation: the `pwn-` node runs on a DIFFERENT bearer token than the
+  cockpit has stored, yet calls succeed with no auth failures → bearer auth is
+  likely NOT being enforced.
+- Suspects to check first:
+  * enforcer-mcp BearerAuthMiddleware — is it actually comparing tokens, or
+    only gating on presence? Timing-safe compare? (server.py ~L134-144)
+  * `require_token` resolution — config.yaml vs env vs default; if it reads
+    false/missing, middleware may allow all. Confirm /health vs /mcp gating.
+  * enforcer-node-win auth path (Go) — same check: does it reject wrong/absent
+    Bearer on /mcp (everything except /health)?
+  * Token desync from the /etc vs ~/.enforcer-cloud.env precedence (see prior
+    note) — node may be loading a token the cockpit no longer uses, but that
+    still shouldn't ACCEPT a wrong token.
+- Repro to build: call a node's /mcp with (a) correct, (b) wrong, (c) no bearer;
+  expect 200 / 401 / 401. If all 200 → confirmed broken.
+- Treat as security bug; also consider surfacing an auth-status indicator per
+  node in the cockpit once fixed.

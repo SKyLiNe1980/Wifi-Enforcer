@@ -96,6 +96,12 @@ export default function MCPTab() {
   // Node-map tap sheets (// status pane radial map)
   const [mapSheetNode, setMapSheetNode] = useState<MCPNode | null>(null);
   const [showLocalSheet, setShowLocalSheet] = useState(false);
+  // Hashcat dispatch (GPU nodes). crackNode = target; crackArgs = raw hashcat
+  // CLI string sent as the `hashcat` tool's {args}; crackOut = streamed result.
+  const [crackNode, setCrackNode] = useState<MCPNode | null>(null);
+  const [crackArgs, setCrackArgs] = useState("");
+  const [crackRunning, setCrackRunning] = useState(false);
+  const [crackOut, setCrackOut] = useState("");
   const [busy, setBusy] = useState(false);
   const [tokenVisible, setTokenVisible] = useState(false);
 
@@ -902,6 +908,36 @@ export default function MCPTab() {
       refreshLists();
     }
   }, [syncToolsNow, refreshLists]);
+
+  // ─── Hashcat dispatch over MCP ───────────────────────────────────────
+  // Fires the GPU node's `hashcat` tool with the raw arg string. The tool is
+  // synchronous today (Phase-3 will stream), so we allow a long timeout and
+  // dump whatever text comes back into the modal's output pane.
+  const runCrack = useCallback(async () => {
+    if (!crackNode || !crackArgs.trim()) return;
+    setCrackRunning(true);
+    setCrackOut(`// dispatching to ${crackNode.name} …\n$ hashcat ${crackArgs.trim()}\n`);
+    try {
+      const r = await callMcpTool({
+        host: crackNode.host,
+        port: crackNode.port,
+        token: crackNode.bearer_token || undefined,
+        name: "hashcat",
+        arguments: { args: crackArgs.trim() },
+        timeoutMs: 120000,
+      });
+      if (!r.ok) {
+        setCrackOut((o) => `${o}\n✗ ${r.error || "failed"}${r.raw ? `\n${r.raw}` : ""}`);
+      } else {
+        const txt = r.result?.content?.[0]?.text ?? r.result?.output ?? JSON.stringify(r.result);
+        setCrackOut((o) => `${o}\n${typeof txt === "string" ? txt : JSON.stringify(txt, null, 2)}`);
+      }
+    } catch (e: any) {
+      setCrackOut((o) => `${o}\n✗ ${e?.message || String(e)}`);
+    } finally {
+      setCrackRunning(false);
+    }
+  }, [crackNode, crackArgs]);
 
   // ─── Remote self-update over MCP ─────────────────────────────────────
   // Invokes the node's `self_update` tool over the MCP Streamable-HTTP
@@ -2427,6 +2463,10 @@ export default function MCPTab() {
             nodes.map((n) => {
               const health = nodeHealth[n.id] || n.last_health_status || "unknown";
               const toolCount = nodeToolCount[n.id] ?? n.last_tool_count;
+              const hi = n.last_health_info as any;
+              const nodeVer = typeof hi?.version === "string" ? hi.version : null;
+              const caps: string[] = Array.isArray(hi?.capabilities) ? hi.capabilities.map(String) : [];
+              const gpu = caps.some((c) => /hashcat|cuda|gpu/i.test(c));
               const dotColor =
                 health === "running" ? C.green :
                 health === "probing" ? C.yellow :
@@ -2470,7 +2510,24 @@ export default function MCPTab() {
                     {toolCount !== null && toolCount !== undefined ? (
                       <Text style={{ color: C.textDim }}>{`  ·  ${toolCount} tools`}</Text>
                     ) : null}
+                    {nodeVer ? (
+                      <Text style={{ color: C.textDim }}>{`  ·  v${nodeVer}`}</Text>
+                    ) : null}
                   </Text>
+
+                  {gpu ? (
+                    <View style={[s.row, { marginTop: 6, flexWrap: "wrap", gap: 4 }]}>
+                      <View style={[s.tag, { borderColor: C.yellow, flexDirection: "row", alignItems: "center", gap: 4 }]}>
+                        <MaterialCommunityIcons name="expansion-card" size={10} color={C.yellow} />
+                        <Text style={[s.tagText, { color: C.yellow }]}>GPU</Text>
+                      </View>
+                      {caps.map((c) => (
+                        <View key={c} style={[s.tag, { borderColor: C.greenDim }]}>
+                          <Text style={[s.tagText, { color: C.green }]}>{c.toUpperCase()}</Text>
+                        </View>
+                      ))}
+                    </View>
+                  ) : null}
 
                   {n.description ? (
                     <Text style={[s.helperFine, { marginTop: 4, color: C.textDim }]}>
@@ -2520,6 +2577,21 @@ export default function MCPTab() {
                         color: (!n.bearer_token || health !== "running") ? C.textDim : C.cyan,
                       }]}>SYNC TOOLS</Text>
                     </TouchableOpacity>
+                    {gpu ? (
+                      <TouchableOpacity
+                        style={[s.smallBtn, { borderColor: C.yellow }]}
+                        onPress={() => {
+                          setCrackNode(n);
+                          setCrackOut("");
+                          setCrackArgs("-m 22000 -a 0 <hash_file> /usr/share/wordlists/rockyou.txt --status --status-timer=5");
+                        }}
+                        disabled={!n.bearer_token || health !== "running"}
+                      >
+                        <Text style={[s.smallBtnText, {
+                          color: (!n.bearer_token || health !== "running") ? C.textDim : C.yellow,
+                        }]}>⚡ CRACK</Text>
+                      </TouchableOpacity>
+                    ) : null}
                     <TouchableOpacity
                       style={[s.smallBtn, { borderColor: C.mcpAccent }]}
                       onPress={() => setEditingNode({ ...n })}
@@ -2589,6 +2661,70 @@ export default function MCPTab() {
             ))
           )}
         </ScrollView>
+      )}
+
+      {/* HASHCAT DISPATCH MODAL (overlay) */}
+      {crackNode && (
+        <View style={s.overlay} pointerEvents="auto">
+          <View style={s.sheet}>
+            <View style={s.sheetHeader}>
+              <Text style={s.sheetTitle}>{`// hashcat → ${crackNode.name}`}</Text>
+              <TouchableOpacity onPress={() => { if (!crackRunning) setCrackNode(null); }}>
+                <MaterialCommunityIcons name="close" size={20} color={C.textDim} />
+              </TouchableOpacity>
+            </View>
+
+            <Text style={s.helperFine}>
+              Fires the node&apos;s <Text style={{ color: C.cyan }}>hashcat</Text> tool with this arg
+              string. Point <Text style={{ color: C.yellow }}>{"<hash_file>"}</Text> at a hash file
+              already on the node; set the wordlist to a path on the node.
+            </Text>
+
+            <View style={[s.row, { flexWrap: "wrap", gap: 6, marginTop: 8 }]}>
+              {[["WPA/WPA2", "22000"], ["NTLM", "1000"], ["MD5", "0"], ["sha512crypt", "1800"]].map(([lbl, m]) => (
+                <TouchableOpacity
+                  key={m}
+                  style={[s.smallBtn, { borderColor: C.cyan }]}
+                  onPress={() => setCrackArgs((a) => /-m\s+\d+/.test(a) ? a.replace(/-m\s+\d+/, `-m ${m}`) : `-m ${m} ${a}`)}
+                >
+                  <Text style={[s.smallBtnText, { color: C.cyan }]}>{lbl} ({m})</Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+
+            <TextInput
+              style={[s.input, { minHeight: 70, fontFamily: MONO, fontSize: 11, marginTop: 8 }]}
+              value={crackArgs}
+              onChangeText={setCrackArgs}
+              multiline
+              autoCapitalize="none"
+              autoCorrect={false}
+              placeholder="-m 22000 -a 0 <hash_file> <wordlist>"
+              placeholderTextColor={C.textDim}
+              editable={!crackRunning}
+            />
+
+            <TouchableOpacity
+              style={[s.btn, { backgroundColor: C.panel2, borderColor: C.yellow, marginTop: 10 }, crackRunning && { opacity: 0.6 }]}
+              onPress={runCrack}
+              disabled={crackRunning || !crackArgs.trim()}
+            >
+              <MaterialCommunityIcons name="flash" size={14} color={C.yellow} />
+              <Text style={[s.btnText, { color: C.yellow }]}>{crackRunning ? "CRACKING…" : "DISPATCH"}</Text>
+            </TouchableOpacity>
+
+            {!!crackOut && (
+              <ScrollView style={{ marginTop: 10, maxHeight: 240, backgroundColor: "#02050a", borderRadius: 6, borderWidth: 1, borderColor: C.border }}>
+                <Text style={{ color: C.text, fontFamily: MONO, fontSize: 10, padding: 8 }} selectable>{crackOut}</Text>
+              </ScrollView>
+            )}
+
+            <Text style={[s.helperFine, { marginTop: 8, color: C.textDim }]}>
+              Note: runs synchronously (Phase-3 will stream). Long cracks may hit the 120s client
+              timeout — start with a fast wordlist to validate the pipe.
+            </Text>
+          </View>
+        </View>
       )}
 
       {/* TOOL EDITOR MODAL (overlay) */}
