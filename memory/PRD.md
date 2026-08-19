@@ -281,3 +281,25 @@ drives it with zero special-casing. Hand-rolled MCP on the Go **stdlib**
     * wrap every remote step in `timeout` (already done for the ping) so nothing
       can hang the app
     * surface a clear per-step "OK / skipped (reason) / failed" summary in the log
+
+### Windows Node Phase 3 — Hashcat dispatch + GPU badge + version (DONE, needs on-device test)
+- Node version visibility (user's realization): /health already returns `version`
+  and it's stored in node.last_health_info — was just never shown. Now the // node
+  list card shows `· v<version>`. No new plumbing.
+- Capabilities-aware: reads `capabilities` from last_health_info. If it includes
+  hashcat/cuda/gpu → shows a GPU badge + per-cap tags on the node card AND a small
+  amber GPU chip badge on the node marker in NodesMap.
+- Hashcat dispatch: GPU-capable node cards get a ⚡CRACK button → modal composes a
+  raw hashcat arg string (quick chips: WPA 22000 / NTLM 1000 / MD5 0 / sha512crypt
+  1800) and fires the node's `hashcat` MCP tool ({args}) via callMcpTool; result
+  text dumped in-modal. Synchronous (120s client timeout) — Phase-3 streaming TODO.
+- Contracts: enforcer-node-win /health → {version,capabilities,tools}; `hashcat`
+  tool takes {args:"<cli string>"} → runs `<hashcat_path> <args>`. enforcer-mcp
+  (Linux) /health returns version but NOT capabilities yet — to light up the Linux
+  GPU rigs (H200/3090), enforcer-mcp needs a capabilities field + hashcat tool
+  (server-side change → node redeploy). Frontend is already capability-agnostic.
+- Files: MCPTab.tsx (state crackNode/crackArgs/crackOut, runCrack, card version+
+  badge+CRACK btn, dispatch modal), NodesMap.tsx (gpu chip badge + style).
+- Deferred per user: UEF (lives in Live/term, needs compact+full dual UI) and
+  Orchestration (own tab; backend = Ergo IRC API+WS + A2A/MCP + eggdrop taskers +
+  heartbeats/goals/contracts, not finalized). Build rich UI once contracts exist.

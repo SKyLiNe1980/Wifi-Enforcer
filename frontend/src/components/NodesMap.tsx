@@ -169,6 +169,8 @@ export default function NodesMap({
           {positioned.map(({ n, x, y }) => {
             const h = nodeHealth[n.id] || n.last_health_status || "unknown";
             const col = !n.enabled ? C.textDim : healthColor(h);
+            const hi = n.last_health_info as any;
+            const gpu = Array.isArray(hi?.capabilities) && hi.capabilities.some((c: any) => /hashcat|cuda|gpu/i.test(String(c)));
             return (
               <TouchableOpacity
                 key={n.id}
@@ -183,6 +185,11 @@ export default function NodesMap({
                     color={col}
                   />
                   <NodeDot color={col} />
+                  {gpu ? (
+                    <View style={styles.gpuBadge}>
+                      <MaterialCommunityIcons name="expansion-card" size={9} color="#04070a" />
+                    </View>
+                  ) : null}
                 </View>
                 <Text numberOfLines={1} style={[styles.nodeLabel, { color: n.enabled ? C.text : C.textDim, maxWidth: NODE + 44 }]}>
                   {n.name || n.host}
@@ -227,6 +234,17 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
     position: "relative",
+  },
+  gpuBadge: {
+    position: "absolute",
+    bottom: -4,
+    left: -4,
+    width: 14,
+    height: 14,
+    borderRadius: 3,
+    backgroundColor: C.yellow,
+    alignItems: "center",
+    justifyContent: "center",
   },
   dotWrap: {
     position: "absolute",
