@@ -28,6 +28,7 @@ import { sessionManager } from "../src/lib/sessionManager";
 import LiveTab from "../src/components/LiveTab";
 import AITab from "../src/components/AITab";
 import MCPTab from "../src/components/MCPTab";
+import SwatTab from "../src/components/SwatTab";
 import TerminalShell from "../src/components/TerminalShell";
 import WlanControl from "../src/components/WlanControl";
 import {
@@ -245,7 +246,7 @@ function HighlightedCmd({ cmd }: { cmd: string }) {
 
 // ============================================================
 export default function App() {
-  const [tab, setTab] = useState<"quick" | "terminal" | "live" | "ai" | "mcp" | "profiles" | "settings">("quick");
+  const [tab, setTab] = useState<"quick" | "terminal" | "live" | "ai" | "mcp" | "swat" | "profiles" | "settings">("quick");
   const [iface, setIface] = useState("wlan2");
   const [ifaceB, setIfaceB] = useState("");
   const [ifaceC, setIfaceC] = useState("");
@@ -1698,6 +1699,7 @@ export default function App() {
             />
           )}
           {tab === "mcp" && <MCPTab />}
+          {tab === "swat" && <SwatTab />}
           {tab === "profiles" && (() => {
             // Backwards-compat: an older app launch may have persisted
             // tab="profiles" before we removed it as a top-level tab. Punt
@@ -1724,6 +1726,7 @@ export default function App() {
           <TabBtn t="live" cur={tab} icon="satellite-uplink" label="live" onPress={setTab} />
           <TabBtn t="ai" cur={tab} icon="robot-outline" label="ai" onPress={setTab} />
           <TabBtn t="mcp" cur={tab} icon="hub" label="mcp" onPress={setTab} />
+          <TabBtn t="swat" cur={tab} icon="shield-account" label="swat" onPress={setTab} />
           <TabBtn t="settings" cur={tab} icon="cog" label="set" onPress={setTab} />
         </View>
 
