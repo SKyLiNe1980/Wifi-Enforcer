@@ -8,6 +8,24 @@ is expected and unrelated to feature work.
 
 ## Recent fixes
 
+### Cockpit probe host resets to 127.0.0.1 on reinstall (FIXED)
+- Bug: after a fresh APK reinstall, `cockpit_probe_host` reverted to the
+  loopback default `127.0.0.1` even though `bind_host` correctly restored to
+  the node's tailnet IP. Cockpit then probed localhost → node listed UNREACH.
+- Root cause: reinstall wipes SQLite (probe host re-seeds to 127.0.0.1). The
+  chroot auto-sync (`applyChrootYaml`) restored `bind_host` from the server's
+  `config.yaml` `server.host` but never mirrored it into `cockpit_probe_host`.
+  Live `detectTailnetIp()` also no-ops on userspace-networking chroots.
+- Fix:
+  - `frontend/src/lib/localDb.ts` → `applyChrootYaml`: when importing `host`,
+    also set `cockpit_probe_host = host` IF current probe host is still the
+    loopback default AND host is routable (not 127.0.0.1 / 0.0.0.0). Operator
+    overrides are preserved.
+  - `frontend/src/components/MCPTab.tsx` → tailnet auto-detect effect: if
+    `detectTailnetIp()` returns null, fall back to the routable `bind_host`.
+- Validation: frontend-only; tsc/lint clean. Native SQLite path can only be
+  verified on a real APK build (not web preview / testing_agent).
+
 ### Upstash cloud roster wipe on fresh reinstall (FIXED)
 - Bug: saving Upstash creds on a fresh install pushed the EMPTY local roster
   to the cloud (`pushRoster(url, tok, [])`), wiping the cloud database before
