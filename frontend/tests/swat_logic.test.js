@@ -106,6 +106,25 @@ function isSwatOp(nick) {
   return SWAT_OPS.some((o) => o.toLowerCase() === n);
 }
 
+// OPS echo parser (swatIrc.ts parseOpsEcho)
+function parseOpsEcho(rawText) {
+  const text = stripIrc(rawText || "").trim();
+  const m = text.match(/^(?:ops|commanders?)\b[\s:=\-]*(.+)$/i);
+  if (!m) return null;
+  const nicks = m[1]
+    .split(/[\s,]+/)
+    .map((n) => n.replace(/^[@+%~&]+/, "").trim())
+    .filter(Boolean);
+  return nicks.length ? nicks : null;
+}
+
+// mention detection (swatIrc.ts maybeAlert)
+function escapeRe(s) { return s.replace(/[.*+?^${}()|[\]\\-]/g, "\\$&"); }
+function isMention(me, text) {
+  const m = (me || "").toLowerCase();
+  return !!m && new RegExp(`(^|[^\\w])@?${escapeRe(m)}([^\\w]|$)`, "i").test(text);
+}
+
 // ── tests ────────────────────────────────────────────────────────────────
 let pass = 0, fail = 0;
 const t = (name, fn) => {
@@ -196,6 +215,20 @@ t("known op (exact)", () => assert.strictEqual(isSwatOp("Maarten"), true));
 t("known op (case-insensitive)", () => assert.strictEqual(isSwatOp("enforcer-operator"), true));
 t("unknown nick → not a commander", () => assert.strictEqual(isSwatOp("randouser"), false));
 t("empty/whitespace → false", () => { assert.strictEqual(isSwatOp(""), false); assert.strictEqual(isSwatOp("   "), false); });
+
+console.log("OPS echo parser:");
+t("OPS: space list", () => assert.deepStrictEqual(parseOpsEcho("OPS: Maarten Enforcer-Operator"), ["Maarten", "Enforcer-Operator"]));
+t("commanders = comma list", () => assert.deepStrictEqual(parseOpsEcho("commanders = a, b, c"), ["a", "b", "c"]));
+t("strips @+ prefixes", () => assert.deepStrictEqual(parseOpsEcho("ops @Maarten +bob"), ["Maarten", "bob"]));
+t("non-ops line → null", () => assert.strictEqual(parseOpsEcho("STATUS all nodes green"), null));
+t("mIRC colors stripped before parse", () => assert.deepStrictEqual(parseOpsEcho("\x0303OPS:\x0f Maarten"), ["Maarten"]));
+
+console.log("mention detection:");
+t("plain @nick", () => assert.strictEqual(isMention("Enforcer-Operator", "hey @Enforcer-Operator ping"), true));
+t("bare nick word boundary", () => assert.strictEqual(isMention("bob", "bob check this"), true));
+t("case-insensitive", () => assert.strictEqual(isMention("Bob", "BOB!"), true));
+t("substring is NOT a mention", () => assert.strictEqual(isMention("bob", "bobcat prowls"), false));
+t("empty me → false", () => assert.strictEqual(isMention("", "anything"), false));
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

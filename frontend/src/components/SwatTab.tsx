@@ -14,9 +14,10 @@ import { busEnableKeepAlive, HAS_SWAT_BUS } from "../lib/swatBus";
 import {
   subscribeSwat, getSwatState, connectSwat, disconnectSwat, swatSend,
   loadSwatConfig, saveSwatConfig, isCommander, parseIrcColored,
-  readSaslPassword, writeSaslPassword,
+  readSaslPassword, writeSaslPassword, clearOpsEcho,
   type SwatConfig, type EventColor,
 } from "../lib/swatIrc";
+import { SWAT_OPS, isSwatOp } from "../lib/swatOps";
 
 const C = {
   surface: "#04070a", panel: "#0a1116", panel2: "#0e1820", border: "#163041",
@@ -220,6 +221,11 @@ export default function SwatTab() {
               <Text style={styles.saveTxt}>SAVE &amp; RECONNECT</Text>
             </TouchableOpacity>
           </View>
+          <View style={[styles.row, { alignItems: "center", marginTop: 8 }]}>
+            <Switch value={cfg.alertsEnabled} onValueChange={(v) => patch({ alertsEnabled: v })}
+              trackColor={{ false: C.border, true: "#1a3a2a" }} thumbColor={cfg.alertsEnabled ? C.green : C.dim} />
+            <Text style={styles.lbl}>  alert on @mention · MISSION · HALT (background)</Text>
+          </View>
           {HAS_SWAT_BUS ? (
             <TouchableOpacity onPress={busEnableKeepAlive} style={[styles.row, { alignItems: "center", marginTop: 10 }]}>
               <MaterialCommunityIcons name="shield-sync" size={16} color={C.cyan} />
@@ -246,6 +252,51 @@ export default function SwatTab() {
           )}
         </ScrollView>
       </View>
+
+      {/* OPS ECHO DRIFT PANEL — conductor's echoed swat_ops vs app's shipped list */}
+      {st.opsEcho ? (
+        <View style={styles.opsPanel}>
+          <View style={styles.opsHeader}>
+            <MaterialCommunityIcons name="shield-star" size={13} color={C.amber} />
+            <Text style={styles.opsTitle}>OPS ECHO · conductor</Text>
+            <Text style={styles.opsTs}>{ts(st.opsEcho.at)}</Text>
+            <View style={{ flex: 1 }} />
+            <TouchableOpacity onPress={clearOpsEcho} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+              <MaterialCommunityIcons name="close" size={16} color={C.dim} />
+            </TouchableOpacity>
+          </View>
+          <View style={styles.opsChips}>
+            {st.opsEcho.nicks.map((n) => {
+              const known = isSwatOp(n); // in the app's shipped list too
+              const col = known ? C.green : C.amber;
+              return (
+                <View key={`c-${n}`} style={[styles.opsChip, { borderColor: col }]}>
+                  <Text style={[styles.opsChipTxt, { color: col }]}>{n}</Text>
+                  {!known ? <Text style={styles.opsChipTxt}> ⚠</Text> : null}
+                </View>
+              );
+            })}
+          </View>
+          {(() => {
+            const echoLc = st.opsEcho!.nicks.map((n) => n.toLowerCase());
+            const missing = SWAT_OPS.filter((o) => !echoLc.includes(o.toLowerCase()));
+            const extra = st.opsEcho!.nicks.filter((n) => !isSwatOp(n));
+            if (!missing.length && !extra.length) {
+              return <Text style={styles.opsOk}>✓ in sync with shipped list</Text>;
+            }
+            return (
+              <View style={{ marginTop: 4 }}>
+                {extra.length ? (
+                  <Text style={styles.opsDrift}>⚠ conductor-only (app missing): {extra.join(", ")}</Text>
+                ) : null}
+                {missing.length ? (
+                  <Text style={styles.opsDrift}>⚠ app-only (conductor missing): {missing.join(", ")}</Text>
+                ) : null}
+              </View>
+            );
+          })()}
+        </View>
+      ) : null}
 
       {/* EVENT FEED */}
       <ScrollView
@@ -398,6 +449,21 @@ const styles = StyleSheet.create({
     marginRight: 5, backgroundColor: C.panel2,
   },
   chipTxt: { color: C.text, fontFamily: MONO, fontSize: 10 },
+  opsPanel: {
+    backgroundColor: C.panel2, borderBottomWidth: 1, borderBottomColor: C.border,
+    paddingHorizontal: 10, paddingVertical: 8,
+  },
+  opsHeader: { flexDirection: "row", alignItems: "center" },
+  opsTitle: { color: C.amber, fontFamily: MONO, fontSize: 10, fontWeight: "800", letterSpacing: 1, marginLeft: 6 },
+  opsTs: { color: "#3a5560", fontFamily: MONO, fontSize: 9, marginLeft: 8 },
+  opsChips: { flexDirection: "row", flexWrap: "wrap", marginTop: 6 },
+  opsChip: {
+    flexDirection: "row", alignItems: "center", borderWidth: 1, borderRadius: 4,
+    paddingHorizontal: 8, paddingVertical: 3, marginRight: 5, marginBottom: 5, backgroundColor: C.panel,
+  },
+  opsChipTxt: { color: C.amber, fontFamily: MONO, fontSize: 10 },
+  opsOk: { color: C.green, fontFamily: MONO, fontSize: 9, marginTop: 4 },
+  opsDrift: { color: C.amber, fontFamily: MONO, fontSize: 9, marginBottom: 2 },
   feed: { flex: 1, backgroundColor: C.surface },
   feedEmpty: { color: C.dim, fontFamily: MONO, fontSize: 11, textAlign: "center", marginTop: 24 },
   line: { flexDirection: "row", marginBottom: 3, flexWrap: "wrap" },

@@ -427,3 +427,23 @@ Scope this pass (push notifs = Phase C part 2, deferred — needs Firebase):
 - Verified: `tests/swat_logic.test.js` 30/30 (added SASL base64 cross-checked
   vs Node Buffer, failover ring, static-ops auth). WS connect / CAP-SASL
   handshake / gear UI = APK + live Ergo only (web preview can't bundle SQLite).
+
+### SWAT tab — Phase C (part 2): OPS-echo panel + mention/mission alerts
+- **OPS-echo drift panel** (`SwatTab.tsx` + `swatIrc.ts` `parseOpsEcho`):
+  conductor's reply to the `OPS` verb (PRIVMSG/NOTICE like `OPS: a b` or
+  `commanders = a, b`) is parsed into `state.opsEcho` and rendered as a
+  dismissible panel above the feed. Chips are green when the nick is also in
+  the app's shipped `SWAT_OPS`, amber+⚠ when conductor-only; a drift line
+  lists app-only / conductor-only mismatches. Display/eyeball only — NEVER an
+  authorization input.
+- **@mention / MISSION / HALT alerts = LOCAL notifications** (no Firebase):
+  * Native `SwatBus.notify(title, body, color)` (`SwatBusModule.kt`) posts a
+    high-importance heads-up on a new `swat_alerts` channel, colour-accented
+    (cyan mention / amber mission / red halt). Reuses existing POST_NOTIFICATIONS
+    perm; no FCM / remote push — the live WS (kept alive by the FGS) feeds it.
+  * `swatIrc.maybeAlert()` fires only while backgrounded (`AppState !=
+    "active"`) and skips our own echoes. Mention = word-boundary/@nick regex;
+    MISSION/HALT/ABORT by verb. Gated by new `alertsEnabled` config (default on,
+    gear toggle).
+- Verified: `tests/swat_logic.test.js` 40/40 (added OPS-echo parser + mention
+  detection). Native notify + panel render = APK + live Ergo only.

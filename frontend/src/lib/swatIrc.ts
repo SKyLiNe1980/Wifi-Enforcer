@@ -11,8 +11,9 @@
  * live without prop drilling. Config persists in the localDb kv store.
  */
 import * as SecureStore from "expo-secure-store";
+import { AppState } from "react-native";
 import { kvGet, kvSet } from "./localDb";
-import { busStart, busStop, busUpdate } from "./swatBus";
+import { busStart, busStop, busUpdate, busNotify } from "./swatBus";
 import { isSwatOp } from "./swatOps";
 
 const KEY = "swat_config";
@@ -32,6 +33,7 @@ export type SwatConfig = {
   channel: string;
   realname: string;
   autoconnect: boolean;
+  alertsEnabled: boolean; // heads-up notif on @mention / MISSION / HALT (bg)
 };
 
 export function defaultSwatConfig(): SwatConfig {
@@ -46,6 +48,7 @@ export function defaultSwatConfig(): SwatConfig {
     channel: "#SWAT",
     realname: "Enforcer Operator",
     autoconnect: true,
+    alertsEnabled: true,
   };
 }
 
@@ -60,6 +63,7 @@ export type SwatEvent = {
   system?: boolean;
 };
 
+export type OpsEcho = { nicks: string[]; at: number };
 type State = {
   status: SwatStatus;
   roster: string[];
@@ -67,6 +71,7 @@ type State = {
   nick: string;
   host: string;
   error: string | null;
+  opsEcho: OpsEcho | null; // conductor's echoed ops list (display / drift only)
 };
 
 const MAX_EVENTS = 500;
@@ -87,6 +92,7 @@ let state: State = {
   nick: "",
   host: "",
   error: null,
+  opsEcho: null,
 };
 
 const listeners = new Set<() => void>();
@@ -195,6 +201,50 @@ function endpoints(): Endpoint[] {
 /** Strip mIRC control codes (colour \x03[n[,n]], bold, italic, underline, reset). */
 export function stripIrc(s: string): string {
   return s.replace(/\x03\d{0,2}(,\d{1,2})?|[\x02\x0f\x1d\x1f\x16\x11]/g, "");
+}
+
+/** Public: let the UI dismiss the OPS-echo drift panel. */
+export function clearOpsEcho() {
+  set({ opsEcho: null });
+}
+
+// ── OPS echo (display / drift only — NEVER an authorization input) ──────────
+// The conductor may ECHO its copy of the swat_ops file in reply to the `OPS`
+// verb. We detect a line like "OPS: nickA nickB" or "commanders: a, b" and
+// surface it so the operator can eyeball drift vs the app's shipped SWAT_OPS.
+function parseOpsEcho(rawText: string): string[] | null {
+  const text = stripIrc(rawText || "").trim();
+  const m = text.match(/^(?:ops|commanders?)\b[\s:=\-]*(.+)$/i);
+  if (!m) return null;
+  const nicks = m[1]
+    .split(/[\s,]+/)
+    .map((n) => n.replace(/^[@+%~&]+/, "").trim())
+    .filter(Boolean);
+  return nicks.length ? nicks : null;
+}
+
+function escapeRe(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\-]/g, "\\$&");
+}
+
+// Fire a heads-up notification for a #SWAT event — ONLY while backgrounded
+// (no point buzzing while the operator is staring at the live feed) and only
+// for other people's traffic (skip our own echoes).
+function maybeAlert(from: string, rawText: string) {
+  if (!cfg?.alertsEnabled) return;
+  if (!from || from === "*" || from === state.nick) return;
+  if (AppState.currentState === "active") return; // foreground → feed is enough
+  const text = stripIrc(rawText || "").trim();
+  const me = (state.nick || cfg?.nick || "").toLowerCase();
+  const verb = text.split(/\s+/)[0]?.toUpperCase() || "";
+  const mentioned = !!me && new RegExp(`(^|[^\\w])@?${escapeRe(me)}([^\\w]|$)`, "i").test(text);
+  if (mentioned) {
+    busNotify(`@${from}`, text, "#3ad7ff");
+  } else if (verb === "MISSION") {
+    busNotify(`MISSION · ${from}`, text, "#ffd400");
+  } else if (verb === "HALT" || verb === "ABORT") {
+    busNotify(`${verb} · ${from}`, text, "#ff3860");
+  }
 }
 
 // mIRC 16-colour palette (indices 0-15). Dark entries are nudged lighter so
@@ -396,9 +446,31 @@ function handleLine(line: string) {
       break;
     case "PRIVMSG": {
       const target = p.params[0];
-      if (target === chan || target?.toLowerCase() === chan.toLowerCase()) {
-        pushEvent(p.nick || "?", p.trailing);
+      const toChan = target === chan || target?.toLowerCase() === chan.toLowerCase();
+      const toMe = target?.toLowerCase() === (state.nick || "").toLowerCase();
+      // OPS echo (from the conductor / another op) → drift panel, any target.
+      if (p.nick && p.nick !== state.nick) {
+        const ops = parseOpsEcho(p.trailing);
+        if (ops) set({ opsEcho: { nicks: ops, at: Date.now() } });
       }
+      if (toChan) {
+        pushEvent(p.nick || "?", p.trailing);
+        maybeAlert(p.nick || "?", p.trailing);
+      } else if (toMe) {
+        // surface direct messages (e.g. conductor replies) in the feed too
+        pushEvent(p.nick || "?", p.trailing);
+        maybeAlert(p.nick || "?", p.trailing);
+      }
+      break;
+    }
+    case "NOTICE": {
+      const target = p.params[0];
+      const toChan = target === chan || target?.toLowerCase() === chan.toLowerCase();
+      if (p.nick && p.nick !== state.nick) {
+        const ops = parseOpsEcho(p.trailing);
+        if (ops) set({ opsEcho: { nicks: ops, at: Date.now() } });
+      }
+      if (toChan && p.trailing) pushEvent(p.nick || "*", p.trailing);
       break;
     }
     case "PONG":

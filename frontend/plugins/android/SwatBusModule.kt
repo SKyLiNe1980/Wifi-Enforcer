@@ -1,8 +1,13 @@
 package com.wifienforcer.swatbus
 
 import android.annotation.SuppressLint
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.graphics.Color
 import android.net.Uri
 import android.os.Build
 import android.os.PowerManager
@@ -101,6 +106,51 @@ class SwatBusModule(private val ctx: ReactApplicationContext) :
 
     @ReactMethod
     fun isIgnoringBattery(promise: Promise) { promise.resolve(isIgnoring()) }
+
+    /**
+     * Fire a one-shot, high-importance HEADS-UP notification for a #SWAT event
+     * (@mention / MISSION / HALT). Purely LOCAL — the live WebSocket (kept
+     * alive by the FGS) hands us the line; no FCM / remote push involved. Uses
+     * a separate high-importance channel so it pops over the low-importance
+     * persistent connection notification.
+     */
+    @ReactMethod
+    fun notify(title: String, body: String, color: String, promise: Promise) {
+        try {
+            val chId = "swat_alerts"
+            val mgr = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
+                mgr.getNotificationChannel(chId) == null) {
+                val ch = NotificationChannel(chId, "SWAT alerts", NotificationManager.IMPORTANCE_HIGH)
+                ch.description = "@mentions and mission events from #SWAT."
+                ch.enableVibration(true)
+                mgr.createNotificationChannel(ch)
+            }
+            val open = ctx.packageManager.getLaunchIntentForPackage(ctx.packageName)
+            val openPI = if (open != null) PendingIntent.getActivity(
+                ctx, 3, open, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+            ) else null
+            val accent = try { Color.parseColor(color) } catch (e: Exception) { 0xFF00FF66.toInt() }
+            val b = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+                Notification.Builder(ctx, chId) else @Suppress("DEPRECATION") Notification.Builder(ctx)
+            b.setContentTitle(title)
+                .setContentText(body)
+                .setStyle(Notification.BigTextStyle().bigText(body))
+                .setSmallIcon(ctx.applicationInfo.icon)
+                .setColor(accent)
+                .setColorized(true)
+                .setAutoCancel(true)
+            // Pre-O heads-up relies on priority; O+ uses the channel importance.
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+                @Suppress("DEPRECATION")
+                b.setPriority(Notification.PRIORITY_HIGH)
+            }
+            if (openPI != null) b.setContentIntent(openPI)
+            val id = (System.currentTimeMillis() % 100000L).toInt()
+            mgr.notify(id, b.build())
+            promise.resolve(true)
+        } catch (e: Exception) { promise.reject("E_SWAT_NOTIFY", e.message, e) }
+    }
 
     @ReactMethod fun addListener(eventName: String) { /* no-op */ }
     @ReactMethod fun removeListeners(count: Int?) { /* no-op */ }

@@ -28,6 +28,13 @@ export async function busUpdate(status: string, nick: string, channel: string, i
   try { await N.update(status, nick || "", channel || "", info || ""); } catch { /* noop */ }
 }
 
+/** Fire a one-shot heads-up alert for a #SWAT event (@mention / MISSION /
+ *  HALT). Local only — no FCM. No-op off-Android / in Expo Go. */
+export async function busNotify(title: string, body: string, color: string): Promise<void> {
+  if (!HAS_SWAT_BUS) return;
+  try { await N.notify(title || "SWAT", body || "", color || "#00ff66"); } catch { /* noop */ }
+}
+
 /** One-time keep-alive opt-in: notification permission + battery-opt exemption. */
 export async function busEnableKeepAlive(): Promise<void> {
   if (!HAS_SWAT_BUS) return;
