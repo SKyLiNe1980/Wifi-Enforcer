@@ -6,10 +6,11 @@
  */
 import React, { useEffect, useRef, useState, useSyncExternalStore, useCallback } from "react";
 import {
-  View, Text, StyleSheet, ScrollView, TextInput, TouchableOpacity, Platform, Switch,
+  View, Text, StyleSheet, ScrollView, TextInput, TouchableOpacity, Platform, Switch, AppState,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
+import { busEnableKeepAlive, HAS_SWAT_BUS } from "../lib/swatBus";
 import {
   subscribeSwat, getSwatState, connectSwat, disconnectSwat, swatSend,
   loadSwatConfig, saveSwatConfig, isCommander, parseIrcColored,
@@ -53,6 +54,15 @@ export default function SwatTab() {
   useEffect(() => {
     if (autoScroll) requestAnimationFrame(() => feedRef.current?.scrollToEnd({ animated: true }));
   }, [st.events, autoScroll]);
+
+  // On resume, if we intended to be connected but dropped while backgrounded,
+  // kick a reconnect immediately (don't wait for the backoff timer).
+  useEffect(() => {
+    const sub = AppState.addEventListener("change", (s) => {
+      if (s === "active" && cfg?.autoconnect && getSwatState().status === "down") connectSwat();
+    });
+    return () => sub.remove();
+  }, [cfg?.autoconnect]);
 
   const ledColor = st.status === "connected" ? C.green : st.status === "connecting" ? C.amber : C.red;
   const commander = isCommander(st.nick || cfg?.nick || "");
@@ -164,6 +174,14 @@ export default function SwatTab() {
               <Text style={styles.saveTxt}>SAVE &amp; RECONNECT</Text>
             </TouchableOpacity>
           </View>
+          {HAS_SWAT_BUS ? (
+            <TouchableOpacity onPress={busEnableKeepAlive} style={[styles.row, { alignItems: "center", marginTop: 10 }]}>
+              <MaterialCommunityIcons name="shield-sync" size={16} color={C.cyan} />
+              <Text style={[styles.lbl, { color: C.cyan, marginLeft: 6, flex: 1 }]}>
+                keep alive in background — grant notification + disable battery optimisation
+              </Text>
+            </TouchableOpacity>
+          ) : null}
         </View>
       ) : null}
 

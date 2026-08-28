@@ -365,3 +365,19 @@ drives it with zero special-casing. Hand-rolled MCP on the Go **stdlib**
 - Exact wire formats from spec §4. Colours still TCL-driven (parseIrcColored).
 - Phase C (future): push notifs on @mention/mission events, fallback host (orc
   100.104.200.124), SASL PLAIN, wss:7779, conductor AUTH/WHO commander listing.
+
+### SWAT background-resilience DONE (Hermes Background-resilience.md)
+- Bug: backgrounding app → JS suspended → WebSocket dies → Enforcer-Operator quits.
+- Fix: (1) exponential-backoff reconnect 1s→60s (reset on IRC 001) + stale-socket
+  onclose guard (no reconnect storm); (2) SwatTab AppState 'active' → immediate
+  reconnect if intended-connected & down; (3) NATIVE Android foreground service
+  + PARTIAL_WAKE_LOCK + persistent notification (LED-coloured, Disconnect action)
+  keeps process/JS/WS alive in bg — plugins/withSwatBus.js + SwatBus{Module,
+  Service,Package}.kt; perms FOREGROUND_SERVICE(+DATA_SYNC)/POST_NOTIFICATIONS/
+  WAKE_LOCK/REQUEST_IGNORE_BATTERY_OPTIMIZATIONS. (4) 'keep alive in background'
+  opt-in in SwatTab config → notif perm + battery-opt exemption.
+- swatBus.ts = graceful no-op off-native. connect→busStart, disconnect→busStop,
+  status change→busUpdate(notification).
+- Verified: testing_agent 18/18 logic/regression pass (iteration_1.json); native
+  FGS/wakelock = APK-only, on-device verify (bg 5min → still in roster).
+- Fixed tester notes: emit() no longer rewinds state; stale onclose guarded.

@@ -11,6 +11,7 @@
  * live without prop drilling. Config persists in the localDb kv store.
  */
 import { kvGet, kvSet } from "./localDb";
+import { busStart, busStop, busUpdate } from "./swatBus";
 
 const KEY = "swat_config";
 
@@ -60,6 +61,7 @@ const COMMANDERS = ["Maarten", "Enforcer-Operator"]; // phase-A hardcoded (spec 
 let ws: WebSocket | null = null;
 let wantConnected = false;
 let reconnectTimer: any = null;
+let attempts = 0; // exponential-backoff counter (reset on successful register)
 let cfg: SwatConfig | null = null;
 let uidN = 0;
 
@@ -74,11 +76,7 @@ let state: State = {
 
 const listeners = new Set<() => void>();
 function emit() {
-  const snap = state;
-  listeners.forEach((l) => {
-    state = snap;
-    l();
-  });
+  listeners.forEach((l) => l());
 }
 export function subscribeSwat(fn: () => void): () => void {
   listeners.add(fn);
@@ -90,6 +88,9 @@ export function getSwatState(): State {
 function set(patch: Partial<State>) {
   state = { ...state, ...patch };
   emit();
+  if (patch.status !== undefined) {
+    busUpdate(state.status, state.nick, cfg?.channel || "#SWAT", `${state.roster.length} online`);
+  }
 }
 
 export function isCommander(nick: string): boolean {
@@ -239,6 +240,7 @@ function handleLine(line: string) {
     case "001": // welcome → join
       rawSend(`JOIN ${chan}`);
       pushEvent("*", `connected to ${state.host} — joining ${chan}`, { system: true, color: "grey" });
+      attempts = 0; // successful registration → reset backoff
       set({ status: "connected", error: null });
       break;
     case "353": { // NAMES
@@ -303,6 +305,8 @@ export async function connectSwat() {
   wantConnected = true;
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
   if (ws) { try { ws.close(); } catch { /* noop */ } ws = null; }
+  // Start the Android foreground service (keeps process + WS alive in bg).
+  busStart(c.nick, c.channel);
   set({ status: "connecting", host: `${c.host}:${c.port}`, nick: c.nick, roster: [], error: null });
   try {
     const sock = new WebSocket(`ws://${c.host}:${c.port}`);
@@ -319,10 +323,19 @@ export async function connectSwat() {
       set({ error: "websocket error" });
     };
     sock.onclose = () => {
-      if (ws === sock) ws = null;
-      set({ status: "down", roster: [] });
+      // Ignore closes from a stale socket (a newer connectSwat() already
+      // replaced it) so we can't double-schedule reconnects → storm.
+      if (ws !== sock) return;
+      ws = null;
       if (wantConnected) {
-        reconnectTimer = setTimeout(() => { if (wantConnected) connectSwat(); }, 4000);
+        // exponential backoff 1s → 60s cap; keep status "connecting" so the
+        // LED/notification reads yellow while we retry.
+        const delay = Math.min(60000, 1000 * 2 ** attempts);
+        attempts += 1;
+        set({ status: "connecting", roster: [] });
+        reconnectTimer = setTimeout(() => { if (wantConnected) connectSwat(); }, delay);
+      } else {
+        set({ status: "down", roster: [] });
       }
     };
   } catch (e: any) {
@@ -332,7 +345,9 @@ export async function connectSwat() {
 
 export function disconnectSwat() {
   wantConnected = false;
+  attempts = 0;
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
   if (ws) { try { ws.close(); } catch { /* noop */ } ws = null; }
+  busStop();
   set({ status: "down", roster: [] });
 }

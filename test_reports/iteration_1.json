@@ -1,0 +1,31 @@
+{
+  "summary": "SWAT background-resilience patch — source-level verification (no web preview possible: expo-sqlite wasm-worker bundling failure is a known/documented limitation; SwatBus native foreground service is APK-only). Verified: (a) swatIrc.ts reconnect logic — onclose while wantConnected schedules Math.min(60000, 1000*2**attempts), increments attempts, sets status 'connecting'; onclose while !wantConnected sets 'down'; IRC 001 resets attempts=0 and sets 'connected'; disconnectSwat cancels reconnectTimer, resets attempts=0, calls busStop, sets 'down'. (b) swatBus.ts wrapper — HAS_SWAT_BUS = Platform.OS==='android' && !!NativeModules.SwatBus (false on web/expo-go); busStart/busStop/busUpdate/busEnableKeepAlive all guard on HAS_SWAT_BUS and wrap N.* in try/catch → safe no-ops when NativeModule absent. (c) SwatTab.tsx AppState 'active' handler kicks connectSwat if intended-connected & status is 'down' — matches spec. (d) parseIrcColored/stripIrc unchanged and pass all 9 palette/segmentation tests; backoff formula verified across 9 attempt values (0→1s, 6+→60s cap). (e) TypeScript compile of swatIrc.ts + swatBus.ts is clean (tsc --noEmit); project-wide tsc has only 2 pre-existing errors in MCPTab.tsx unrelated to this patch. (f) app.json registers withSwatBus config plugin; Kotlin module/package/service files present.",
+  "backend_issues": { "critical": [], "minor": [] },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [],
+    "react_native_issues": []
+  },
+  "test_report_links": [
+    "/app/frontend/tests/swat_logic.test.js"
+  ],
+  "action_items": [
+    "None for the SWAT background-resilience patch — logic, types, and no-op safety all check out at source level.",
+    "Live/runtime verification (foreground service, wakelock, actual reconnect timing, notification permission dialog, battery-opt exemption) requires a real APK build on Android; cannot be validated here.",
+    "Unrelated pre-existing tsc errors in src/components/MCPTab.tsx:856,871 ('execChroot' used before declaration) — NOT introduced by this patch, but worth cleaning up in a future pass."
+  ],
+  "critical_code_review_comments": [
+    "swatIrc.ts:78-84 — emit() reassigns `state = snap` inside listeners.forEach. Since snap is captured before the loop and each listener may call set() (which mutates state), this pattern effectively rewinds state to the pre-listener snapshot between listeners. Pre-existing, not from this patch, but worth flagging.",
+    "swatIrc.ts:329-341 — sock.onclose does not guard the reconnect scheduling with `if (ws === sock)`. If connectSwat() is called again before an old socket's onclose fires, the stale close handler will still schedule another reconnect and stomp status back to 'connecting'. Low-impact because the very-next connectSwat clears reconnectTimer, but a strict identity check would be more defensive.",
+    "swatIrc.ts:334 — attempts is a module-level counter; after a manual disconnectSwat() → connectSwat() cycle it's reset to 0 (good). But a rapid succession of connect() calls without a full disconnect could leak attempts across sessions. Minor.",
+    "swatBus.ts — try/catch swallows all errors silently. Acceptable for a bridge wrapper, but at least a __DEV__ console.warn would help debug native bridge misconfigurations."
+  ],
+  "updated_files": [],
+  "success_rate": { "backend": "N/A (frontend-only)", "frontend": "100% (18/18 pure-logic tests pass; TS compile clean for changed files)" },
+  "seed_data_creation": "None",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "Web preview cannot bundle this app (expo-sqlite wasm-worker; documented in /app/test_result.md line 1171) — metro.config.js is locked, do NOT touch. SwatBus native module + foreground service are APK-only. Static/logic verification is the only path in this environment. Reusable pure-logic tests live at /app/frontend/tests/swat_logic.test.js — run with `node`.",
+  "rca_of_issue": "Original bug: backgrounding the app killed the SWAT IRC WebSocket because JS timers/sockets are suspended when the Android host process is backgrounded and there was no reconnect path when it resumed. Fix implemented: (1) exponential-backoff auto-reconnect (1s→60s) in sock.onclose while wantConnected=true (swatIrc.ts:329-341); (2) attempts=0 reset on IRC 001 (swatIrc.ts:247); (3) AppState 'active' listener in SwatTab.tsx kicks connectSwat immediately if status==='down' & autoconnect (SwatTab.tsx:60-65); (4) native SwatBusService (Android foreground service + PARTIAL_WAKE_LOCK + persistent notification) to keep the JS runtime alive in background (APK-only, no-op elsewhere); (5) opt-in busEnableKeepAlive() requests POST_NOTIFICATIONS + battery-optimisation exemption. Reproduction requires a real device backgrounded for >30s; cannot be reproduced or fully validated in this container."
+}
