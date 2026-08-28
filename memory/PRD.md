@@ -322,3 +322,26 @@ drives it with zero special-casing. Hand-rolled MCP on the Go **stdlib**
   expect 200 / 401 / 401. If all 200 → confirmed broken.
 - Treat as security bug; also consider surfacing an auth-status indicator per
   node in the cockpit once fixed.
+
+### SWAT / Orchestration tab — Phase A DONE (per Hermes swat-app-tab-spec.md)
+- Transport: IRC-over-WebSocket to Ergo (ws://<host>:<port>, default
+  100.83.194.121:7778, #SWAT). Plain RN WebSocket, no new deps.
+- New files:
+  * src/lib/swatIrc.ts — singleton IRC client + store: connect → NICK/USER →
+    (001) JOIN → PING/PONG keepalive → parse PRIVMSG/353 NAMES/JOIN/PART/QUIT/
+    NICK → roster tracking → event feed (cap 500) → 4s auto-reconnect. Config in
+    localDb kv ("swat_config"). Exports connect/disconnect/swatSend/subscribe/
+    getState/loadConfig/saveConfig/isCommander/stripIrc/parseIrcColored.
+  * src/components/SwatTab.tsx — connection LED + host/nick strip (★ for
+    commander), inline gear config panel (host/port/nick/channel/autoconnect,
+    Save&Reconnect), roster chips, verb/colour feed w/ auto-scroll + jump btn,
+    bottom send box (enabled when connected).
+- Colour: per user, the TCL conductor emits mIRC \x03 colour codes; app now
+  HONOURS server colours (parseIrcColored → coloured <Text> segments, 16-colour
+  palette nudged for dark bg) and only falls back to verb-colour for uncoloured
+  lines. (Spec's "strip+recolor" superseded by user's TCL-drives-colour choice.)
+- Wired into app/index.tsx: tab union + render + TabBtn ("swat", shield-account).
+- Commander verbs/mission composer + gating = Phase B (COMMANDERS hardcoded:
+  Maarten, Enforcer-Operator). Basic PRIVMSG send is live now.
+- Testing: needs a live Ergo WS on the tailnet (unreachable from sandbox) + real
+  device (SQLite). lint + tsc clean → on-device verification via APK.
