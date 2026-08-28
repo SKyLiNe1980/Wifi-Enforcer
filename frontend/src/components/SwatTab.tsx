@@ -37,6 +37,9 @@ export default function SwatTab() {
   const [showCfg, setShowCfg] = useState(false);
   const [autoScroll, setAutoScroll] = useState(true);
   const [draft, setDraft] = useState("");
+  const [missionOpen, setMissionOpen] = useState(false);
+  const [steps, setSteps] = useState<{ agent: string; cmd: string }[]>([{ agent: "", cmd: "" }]);
+  const [missionSeq, setMissionSeq] = useState(1);
   const feedRef = useRef<ScrollView>(null);
 
   useEffect(() => {
@@ -70,6 +73,33 @@ export default function SwatTab() {
   }, [draft]);
 
   const patch = (p: Partial<SwatConfig>) => setCfg((c) => (c ? { ...c, ...p } : c));
+
+  const connected = st.status === "connected";
+  // Quick-verb helpers. STATUS/LEASES/HELP fire immediately (no payload);
+  // TASK/ABORT prefill the input so the operator adds target/payload.
+  const fire = useCallback((v: string) => { if (connected) swatSend(v); }, [connected]);
+  const prefill = useCallback((v: string) => setDraft(v), []);
+
+  const buildMission = useCallback(() => {
+    const parts = steps
+      .filter((s) => s.agent.trim() && s.cmd.trim())
+      .map((s) => `@${s.agent.trim().replace(/^@/, "")} ${s.cmd.trim()}`);
+    if (!parts.length) return;
+    swatSend(`MISSION #m${missionSeq} ${parts.join(" | ")}`);
+    setMissionSeq((n) => n + 1);
+    setSteps([{ agent: "", cmd: "" }]);
+    setMissionOpen(false);
+  }, [steps, missionSeq]);
+
+  const CHIP = ({ label, color, onPress }: { label: string; color: string; onPress: () => void }) => (
+    <TouchableOpacity
+      onPress={onPress}
+      disabled={!connected}
+      style={[styles.vchip, { borderColor: color }, !connected && { opacity: 0.4 }]}
+    >
+      <Text style={[styles.vchipTxt, { color }]}>{label}</Text>
+    </TouchableOpacity>
+  );
 
   return (
     <View style={[styles.root, { paddingTop: insets.top ? 0 : 6 }]}>
@@ -183,6 +213,69 @@ export default function SwatTab() {
         )}
       </ScrollView>
 
+      {/* MISSION COMPOSER (commander only) */}
+      {missionOpen && commander ? (
+        <View style={styles.composer}>
+          <View style={styles.row}>
+            <Text style={[styles.title, { fontSize: 12 }]}>MISSION #m{missionSeq}</Text>
+            <View style={{ flex: 1 }} />
+            <TouchableOpacity onPress={() => setMissionOpen(false)}>
+              <MaterialCommunityIcons name="close" size={18} color={C.dim} />
+            </TouchableOpacity>
+          </View>
+          {steps.map((s, i) => (
+            <View key={i} style={[styles.row, { marginTop: 6 }]}>
+              <TextInput
+                style={[styles.input, { width: 96, marginRight: 6 }]}
+                value={s.agent}
+                onChangeText={(t) => setSteps((arr) => arr.map((x, j) => (j === i ? { ...x, agent: t } : x)))}
+                placeholder="@agent" placeholderTextColor={C.dim} autoCapitalize="none" autoCorrect={false}
+              />
+              <TextInput
+                style={[styles.input, { flex: 1 }]}
+                value={s.cmd}
+                onChangeText={(t) => setSteps((arr) => arr.map((x, j) => (j === i ? { ...x, cmd: t } : x)))}
+                placeholder="command" placeholderTextColor={C.dim} autoCapitalize="none" autoCorrect={false}
+              />
+              {steps.length > 1 ? (
+                <TouchableOpacity onPress={() => setSteps((arr) => arr.filter((_, j) => j !== i))} style={{ padding: 6 }}>
+                  <MaterialCommunityIcons name="minus-circle-outline" size={18} color={C.red} />
+                </TouchableOpacity>
+              ) : null}
+            </View>
+          ))}
+          <View style={[styles.row, { marginTop: 8, alignItems: "center" }]}>
+            <TouchableOpacity onPress={() => setSteps((arr) => [...arr, { agent: "", cmd: "" }])} style={styles.stepAdd}>
+              <MaterialCommunityIcons name="plus" size={14} color={C.cyan} />
+              <Text style={[styles.vchipTxt, { color: C.cyan }]}> STEP</Text>
+            </TouchableOpacity>
+            <View style={{ flex: 1 }} />
+            <TouchableOpacity onPress={buildMission} style={styles.launchBtn}>
+              <MaterialCommunityIcons name="rocket-launch" size={14} color={C.surface} />
+              <Text style={styles.launchTxt}> LAUNCH</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      ) : null}
+
+      {/* QUICK VERB CHIPS */}
+      <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.chipsRow} contentContainerStyle={{ alignItems: "center", paddingHorizontal: 8 }}>
+        <CHIP label="STATUS" color={C.grey} onPress={() => fire("STATUS")} />
+        <CHIP label="LEASES" color={C.grey} onPress={() => fire("LEASES")} />
+        <CHIP label="HELP" color={C.grey} onPress={() => fire("HELP")} />
+        <CHIP label="TASK @all" color={C.amber} onPress={() => prefill("TASK @all ")} />
+        <CHIP label="STOP #" color={C.amber} onPress={() => prefill("STOP #")} />
+        {commander ? (
+          <>
+            <View style={styles.chipDiv} />
+            <CHIP label="★ MISSION" color={C.amber} onPress={() => setMissionOpen((v) => !v)} />
+            <CHIP label="ABORT #" color={C.red} onPress={() => prefill("ABORT #")} />
+            <CHIP label="HALT" color={C.red} onPress={() => fire("HALT")} />
+            <CHIP label="RESUME" color={C.green} onPress={() => fire("RESUME")} />
+          </>
+        ) : null}
+      </ScrollView>
+
       {/* BOTTOM BAR */}
       <View style={styles.bottom}>
         {!autoScroll ? (
@@ -250,6 +343,27 @@ const styles = StyleSheet.create({
     flexDirection: "row", alignItems: "center", padding: 8, borderTopWidth: 1,
     borderTopColor: C.border, backgroundColor: C.panel,
   },
+  chipsRow: {
+    maxHeight: 40, borderTopWidth: 1, borderTopColor: C.border, backgroundColor: C.panel2,
+  },
+  vchip: {
+    borderWidth: 1, borderRadius: 4, paddingHorizontal: 9, paddingVertical: 5,
+    marginRight: 6, backgroundColor: C.panel,
+  },
+  vchipTxt: { fontFamily: MONO, fontSize: 10, fontWeight: "700", letterSpacing: 0.5 },
+  chipDiv: { width: 1, height: 20, backgroundColor: C.border, marginHorizontal: 6 },
+  composer: {
+    backgroundColor: C.panel2, borderTopWidth: 1, borderTopColor: C.border, padding: 10,
+  },
+  stepAdd: {
+    flexDirection: "row", alignItems: "center", borderWidth: 1, borderColor: C.cyan,
+    borderRadius: 4, paddingHorizontal: 8, paddingVertical: 5,
+  },
+  launchBtn: {
+    flexDirection: "row", alignItems: "center", backgroundColor: C.amber,
+    borderRadius: 4, paddingHorizontal: 12, paddingVertical: 7,
+  },
+  launchTxt: { color: C.surface, fontFamily: MONO, fontSize: 11, fontWeight: "800", letterSpacing: 1 },
   jump: { backgroundColor: C.amber, borderRadius: 4, padding: 6, marginRight: 6 },
   send: {
     flex: 1, backgroundColor: "#02050a", borderWidth: 1, borderColor: C.border, borderRadius: 6,

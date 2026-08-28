@@ -345,3 +345,23 @@ drives it with zero special-casing. Hand-rolled MCP on the Go **stdlib**
   Maarten, Enforcer-Operator). Basic PRIVMSG send is live now.
 - Testing: needs a live Ergo WS on the tailnet (unreachable from sandbox) + real
   device (SQLite). lint + tsc clean → on-device verification via APK.
+
+### USER PREFERENCES (permanent — read every session)
+- User builds REAL Android APKs every session (eas build -p android ...). ANDROID
+  ONLY — no iOS, ever. => In finish summaries, DO NOT append the boilerplate
+  "Notes" block about dev/preview/Publish/Expo Go/iOS. Skip it entirely.
+- On-device is the real test bed; web preview can't run the app (SQLite/native).
+
+### SWAT tab — Phase B DONE (commander controls)
+- Quick verb chips above the send box (SwatTab.tsx):
+  * anyone: STATUS, LEASES, HELP (fire immediately) · TASK @all, STOP # (prefill
+    input for target/payload)
+  * commander-only (gated by isCommander(self nick); Maarten/Enforcer-Operator):
+    ★MISSION (opens composer), ABORT # (prefill), HALT, RESUME
+- Mission composer (commander only): N step rows [@agent + command], add/remove,
+  auto id → sends `MISSION #m<seq> @a1 cmd | @a2 cmd | ...` (seq auto-increments).
+- Non-commanders: commander chips hidden; manual typing still allowed but the
+  conductor nick-gates server-side (correct).
+- Exact wire formats from spec §4. Colours still TCL-driven (parseIrcColored).
+- Phase C (future): push notifs on @mention/mission events, fallback host (orc
+  100.104.200.124), SASL PLAIN, wss:7779, conductor AUTH/WHO commander listing.
