@@ -300,7 +300,16 @@ export default function MCPTab() {
       // Anything other than the loopback default means the operator
       // has intentionally chosen a host — don't touch it.
       if (cur !== "" && cur !== "127.0.0.1") return;
-      const detected = await detectTailnetIp();
+      let detected = await detectTailnetIp();
+      // Fallback: if live tailnet detection came up empty (userspace
+      // networking chroot, no `tailscale` on PATH, etc.) but the server
+      // bind host is already a routable tailnet IP — mirror THAT into the
+      // probe host. Since this is a tailnet-mesh app the cockpit should
+      // never sit on 127.0.0.1 after a reinstall wipes SQLite.
+      if (!detected) {
+        const bind = (c.bind_host || "").trim();
+        if (bind && bind !== "127.0.0.1" && bind !== "0.0.0.0") detected = bind;
+      }
       if (!detected || cancelled) return;
       await mcpLocal.updateConfig({ cockpit_probe_host: detected });
       // Refresh the UI so the input shows the new value immediately.

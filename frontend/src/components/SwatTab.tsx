@@ -6,15 +6,18 @@
  */
 import React, { useEffect, useRef, useState, useSyncExternalStore, useCallback } from "react";
 import {
-  View, Text, StyleSheet, ScrollView, TextInput, TouchableOpacity, Platform, Switch,
+  View, Text, StyleSheet, ScrollView, TextInput, TouchableOpacity, Platform, Switch, AppState,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
+import { busEnableKeepAlive, HAS_SWAT_BUS } from "../lib/swatBus";
 import {
   subscribeSwat, getSwatState, connectSwat, disconnectSwat, swatSend,
   loadSwatConfig, saveSwatConfig, isCommander, parseIrcColored,
+  readSaslPassword, writeSaslPassword, clearOpsEcho,
   type SwatConfig, type EventColor,
 } from "../lib/swatIrc";
+import { SWAT_OPS, isSwatOp } from "../lib/swatOps";
 
 const C = {
   surface: "#04070a", panel: "#0a1116", panel2: "#0e1820", border: "#163041",
@@ -35,6 +38,8 @@ export default function SwatTab() {
   const st = useSyncExternalStore(subscribeSwat, getSwatState);
   const [cfg, setCfg] = useState<SwatConfig | null>(null);
   const [showCfg, setShowCfg] = useState(false);
+  const [saslPw, setSaslPw] = useState("");        // draft; blank keeps stored one
+  const [saslPwSet, setSaslPwSet] = useState(false); // a password is in SecureStore
   const [autoScroll, setAutoScroll] = useState(true);
   const [draft, setDraft] = useState("");
   const [missionOpen, setMissionOpen] = useState(false);
@@ -47,6 +52,7 @@ export default function SwatTab() {
       setCfg(c);
       if (c.autoconnect && getSwatState().status === "down") connectSwat();
     });
+    readSaslPassword().then((pw) => setSaslPwSet(pw.length > 0));
     return () => { /* keep connection alive across tab switches */ };
   }, []);
 
@@ -54,16 +60,35 @@ export default function SwatTab() {
     if (autoScroll) requestAnimationFrame(() => feedRef.current?.scrollToEnd({ animated: true }));
   }, [st.events, autoScroll]);
 
+  // On resume, if we intended to be connected but dropped while backgrounded,
+  // kick a reconnect immediately (don't wait for the backoff timer).
+  useEffect(() => {
+    const sub = AppState.addEventListener("change", (s) => {
+      if (s === "active" && cfg?.autoconnect && getSwatState().status === "down") connectSwat();
+    });
+    return () => sub.remove();
+  }, [cfg?.autoconnect]);
+
   const ledColor = st.status === "connected" ? C.green : st.status === "connecting" ? C.amber : C.red;
   const commander = isCommander(st.nick || cfg?.nick || "");
 
   const saveCfg = useCallback(async () => {
     if (!cfg) return;
     await saveSwatConfig(cfg);
+    // Persist SASL password only when the operator typed a new one, or wipe it
+    // when the account was cleared (SASL turned off).
+    if (saslPw.trim()) {
+      await writeSaslPassword(saslPw.trim());
+      setSaslPwSet(true);
+      setSaslPw("");
+    } else if (!cfg.saslAccount.trim()) {
+      await writeSaslPassword("");
+      setSaslPwSet(false);
+    }
     setShowCfg(false);
     disconnectSwat();
     connectSwat();
-  }, [cfg]);
+  }, [cfg, saslPw]);
 
   const send = useCallback(() => {
     const t = draft.trim();
@@ -155,6 +180,38 @@ export default function SwatTab() {
                 autoCapitalize="none" autoCorrect={false} placeholderTextColor={C.dim} />
             </View>
           </View>
+          {/* FALLBACK ENDPOINT — operator-promoted recovery instance */}
+          <View style={styles.row}>
+            <View style={{ flex: 2, marginRight: 8 }}>
+              <Text style={styles.lbl}>FALLBACK HOST</Text>
+              <TextInput style={styles.input} value={cfg.fallbackHost} onChangeText={(t) => patch({ fallbackHost: t })}
+                autoCapitalize="none" autoCorrect={false} placeholder="orc recovery box" placeholderTextColor={C.dim} />
+            </View>
+            <View style={{ width: 78 }}>
+              <Text style={styles.lbl}>PORT</Text>
+              <TextInput style={styles.input} value={String(cfg.fallbackPort)} keyboardType="numeric"
+                onChangeText={(t) => patch({ fallbackPort: parseInt(t || "0", 10) || 0 })} placeholderTextColor={C.dim} />
+            </View>
+          </View>
+          <View style={[styles.row, { alignItems: "center", marginTop: 8 }]}>
+            <Switch value={cfg.tls} onValueChange={(v) => patch({ tls: v })}
+              trackColor={{ false: C.border, true: "#1a3a2a" }} thumbColor={cfg.tls ? C.green : C.dim} />
+            <Text style={styles.lbl}>  secure wss (:7779)</Text>
+          </View>
+          {/* SASL PLAIN — commander identity hardening */}
+          <View style={styles.row}>
+            <View style={{ flex: 1, marginRight: 8 }}>
+              <Text style={styles.lbl}>SASL ACCOUNT (blank = off)</Text>
+              <TextInput style={styles.input} value={cfg.saslAccount} onChangeText={(t) => patch({ saslAccount: t })}
+                autoCapitalize="none" autoCorrect={false} placeholder="ergo account" placeholderTextColor={C.dim} />
+            </View>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.lbl}>SASL PASSWORD</Text>
+              <TextInput style={styles.input} value={saslPw} onChangeText={setSaslPw}
+                secureTextEntry autoCapitalize="none" autoCorrect={false}
+                placeholder={saslPwSet ? "•••••• (saved)" : "not set"} placeholderTextColor={C.dim} />
+            </View>
+          </View>
           <View style={[styles.row, { alignItems: "center", marginTop: 8 }]}>
             <Switch value={cfg.autoconnect} onValueChange={(v) => patch({ autoconnect: v })}
               trackColor={{ false: C.border, true: "#1a3a2a" }} thumbColor={cfg.autoconnect ? C.green : C.dim} />
@@ -164,6 +221,19 @@ export default function SwatTab() {
               <Text style={styles.saveTxt}>SAVE &amp; RECONNECT</Text>
             </TouchableOpacity>
           </View>
+          <View style={[styles.row, { alignItems: "center", marginTop: 8 }]}>
+            <Switch value={cfg.alertsEnabled} onValueChange={(v) => patch({ alertsEnabled: v })}
+              trackColor={{ false: C.border, true: "#1a3a2a" }} thumbColor={cfg.alertsEnabled ? C.green : C.dim} />
+            <Text style={styles.lbl}>  alert on @mention · MISSION · HALT (background)</Text>
+          </View>
+          {HAS_SWAT_BUS ? (
+            <TouchableOpacity onPress={busEnableKeepAlive} style={[styles.row, { alignItems: "center", marginTop: 10 }]}>
+              <MaterialCommunityIcons name="shield-sync" size={16} color={C.cyan} />
+              <Text style={[styles.lbl, { color: C.cyan, marginLeft: 6, flex: 1 }]}>
+                keep alive in background — grant notification + disable battery optimisation
+              </Text>
+            </TouchableOpacity>
+          ) : null}
         </View>
       ) : null}
 
@@ -182,6 +252,51 @@ export default function SwatTab() {
           )}
         </ScrollView>
       </View>
+
+      {/* OPS ECHO DRIFT PANEL — conductor's echoed swat_ops vs app's shipped list */}
+      {st.opsEcho ? (
+        <View style={styles.opsPanel}>
+          <View style={styles.opsHeader}>
+            <MaterialCommunityIcons name="shield-star" size={13} color={C.amber} />
+            <Text style={styles.opsTitle}>OPS ECHO · conductor</Text>
+            <Text style={styles.opsTs}>{ts(st.opsEcho.at)}</Text>
+            <View style={{ flex: 1 }} />
+            <TouchableOpacity onPress={clearOpsEcho} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+              <MaterialCommunityIcons name="close" size={16} color={C.dim} />
+            </TouchableOpacity>
+          </View>
+          <View style={styles.opsChips}>
+            {st.opsEcho.nicks.map((n) => {
+              const known = isSwatOp(n); // in the app's shipped list too
+              const col = known ? C.green : C.amber;
+              return (
+                <View key={`c-${n}`} style={[styles.opsChip, { borderColor: col }]}>
+                  <Text style={[styles.opsChipTxt, { color: col }]}>{n}</Text>
+                  {!known ? <Text style={styles.opsChipTxt}> ⚠</Text> : null}
+                </View>
+              );
+            })}
+          </View>
+          {(() => {
+            const echoLc = st.opsEcho!.nicks.map((n) => n.toLowerCase());
+            const missing = SWAT_OPS.filter((o) => !echoLc.includes(o.toLowerCase()));
+            const extra = st.opsEcho!.nicks.filter((n) => !isSwatOp(n));
+            if (!missing.length && !extra.length) {
+              return <Text style={styles.opsOk}>✓ in sync with shipped list</Text>;
+            }
+            return (
+              <View style={{ marginTop: 4 }}>
+                {extra.length ? (
+                  <Text style={styles.opsDrift}>⚠ conductor-only (app missing): {extra.join(", ")}</Text>
+                ) : null}
+                {missing.length ? (
+                  <Text style={styles.opsDrift}>⚠ app-only (conductor missing): {missing.join(", ")}</Text>
+                ) : null}
+              </View>
+            );
+          })()}
+        </View>
+      ) : null}
 
       {/* EVENT FEED */}
       <ScrollView
@@ -262,6 +377,7 @@ export default function SwatTab() {
       <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.chipsRow} contentContainerStyle={{ alignItems: "center", paddingHorizontal: 8 }}>
         <CHIP label="STATUS" color={C.grey} onPress={() => fire("STATUS")} />
         <CHIP label="LEASES" color={C.grey} onPress={() => fire("LEASES")} />
+        <CHIP label="OPS" color={C.grey} onPress={() => fire("OPS")} />
         <CHIP label="HELP" color={C.grey} onPress={() => fire("HELP")} />
         <CHIP label="TASK @all" color={C.amber} onPress={() => prefill("TASK @all ")} />
         <CHIP label="STOP #" color={C.amber} onPress={() => prefill("STOP #")} />
@@ -333,6 +449,21 @@ const styles = StyleSheet.create({
     marginRight: 5, backgroundColor: C.panel2,
   },
   chipTxt: { color: C.text, fontFamily: MONO, fontSize: 10 },
+  opsPanel: {
+    backgroundColor: C.panel2, borderBottomWidth: 1, borderBottomColor: C.border,
+    paddingHorizontal: 10, paddingVertical: 8,
+  },
+  opsHeader: { flexDirection: "row", alignItems: "center" },
+  opsTitle: { color: C.amber, fontFamily: MONO, fontSize: 10, fontWeight: "800", letterSpacing: 1, marginLeft: 6 },
+  opsTs: { color: "#3a5560", fontFamily: MONO, fontSize: 9, marginLeft: 8 },
+  opsChips: { flexDirection: "row", flexWrap: "wrap", marginTop: 6 },
+  opsChip: {
+    flexDirection: "row", alignItems: "center", borderWidth: 1, borderRadius: 4,
+    paddingHorizontal: 8, paddingVertical: 3, marginRight: 5, marginBottom: 5, backgroundColor: C.panel,
+  },
+  opsChipTxt: { color: C.amber, fontFamily: MONO, fontSize: 10 },
+  opsOk: { color: C.green, fontFamily: MONO, fontSize: 9, marginTop: 4 },
+  opsDrift: { color: C.amber, fontFamily: MONO, fontSize: 9, marginBottom: 2 },
   feed: { flex: 1, backgroundColor: C.surface },
   feedEmpty: { color: C.dim, fontFamily: MONO, fontSize: 11, textAlign: "center", marginTop: 24 },
   line: { flexDirection: "row", marginBottom: 3, flexWrap: "wrap" },

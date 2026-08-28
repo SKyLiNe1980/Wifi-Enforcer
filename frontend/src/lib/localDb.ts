@@ -1116,6 +1116,24 @@ export const mcpLocal = {
       if (!/[/\s]/.test(raw.host) && !raw.host.startsWith("http")) {
         patch.bind_host = raw.host;
         imported.push("bind_host");
+        // ── Mirror the imported host into cockpit_probe_host ──────────
+        // On a fresh reinstall SQLite is wiped and cockpit_probe_host
+        // seeds back to the loopback default (127.0.0.1). Because this
+        // is a tailnet-mesh app the probe target should track the
+        // server's real bind IP, not loopback — otherwise the cockpit
+        // probes localhost and lists the node as UNREACH. We ONLY do
+        // this when the operator hasn't deliberately set a probe host
+        // (current value is still the loopback default) AND the imported
+        // host is a routable address (not loopback / wildcard, which
+        // can't be probed directly).
+        const cur = await this.getConfig();
+        const curProbe = (cur.cockpit_probe_host || "").trim();
+        const isProbeDefault = curProbe === "" || curProbe === "127.0.0.1";
+        const isRoutable = raw.host !== "127.0.0.1" && raw.host !== "0.0.0.0";
+        if (isProbeDefault && isRoutable) {
+          patch.cockpit_probe_host = raw.host;
+          imported.push("cockpit_probe_host");
+        }
       } else {
         skipped.push("host (unexpected chars)");
       }

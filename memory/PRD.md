@@ -8,6 +8,24 @@ is expected and unrelated to feature work.
 
 ## Recent fixes
 
+### Cockpit probe host resets to 127.0.0.1 on reinstall (FIXED)
+- Bug: after a fresh APK reinstall, `cockpit_probe_host` reverted to the
+  loopback default `127.0.0.1` even though `bind_host` correctly restored to
+  the node's tailnet IP. Cockpit then probed localhost → node listed UNREACH.
+- Root cause: reinstall wipes SQLite (probe host re-seeds to 127.0.0.1). The
+  chroot auto-sync (`applyChrootYaml`) restored `bind_host` from the server's
+  `config.yaml` `server.host` but never mirrored it into `cockpit_probe_host`.
+  Live `detectTailnetIp()` also no-ops on userspace-networking chroots.
+- Fix:
+  - `frontend/src/lib/localDb.ts` → `applyChrootYaml`: when importing `host`,
+    also set `cockpit_probe_host = host` IF current probe host is still the
+    loopback default AND host is routable (not 127.0.0.1 / 0.0.0.0). Operator
+    overrides are preserved.
+  - `frontend/src/components/MCPTab.tsx` → tailnet auto-detect effect: if
+    `detectTailnetIp()` returns null, fall back to the routable `bind_host`.
+- Validation: frontend-only; tsc/lint clean. Native SQLite path can only be
+  verified on a real APK build (not web preview / testing_agent).
+
 ### Upstash cloud roster wipe on fresh reinstall (FIXED)
 - Bug: saving Upstash creds on a fresh install pushed the EMPTY local roster
   to the cloud (`pushRoster(url, tok, [])`), wiping the cloud database before
@@ -365,3 +383,67 @@ drives it with zero special-casing. Hand-rolled MCP on the Go **stdlib**
 - Exact wire formats from spec §4. Colours still TCL-driven (parseIrcColored).
 - Phase C (future): push notifs on @mention/mission events, fallback host (orc
   100.104.200.124), SASL PLAIN, wss:7779, conductor AUTH/WHO commander listing.
+
+### SWAT background-resilience DONE (Hermes Background-resilience.md)
+- Bug: backgrounding app → JS suspended → WebSocket dies → Enforcer-Operator quits.
+- Fix: (1) exponential-backoff reconnect 1s→60s (reset on IRC 001) + stale-socket
+  onclose guard (no reconnect storm); (2) SwatTab AppState 'active' → immediate
+  reconnect if intended-connected & down; (3) NATIVE Android foreground service
+  + PARTIAL_WAKE_LOCK + persistent notification (LED-coloured, Disconnect action)
+  keeps process/JS/WS alive in bg — plugins/withSwatBus.js + SwatBus{Module,
+  Service,Package}.kt; perms FOREGROUND_SERVICE(+DATA_SYNC)/POST_NOTIFICATIONS/
+  WAKE_LOCK/REQUEST_IGNORE_BATTERY_OPTIMIZATIONS. (4) 'keep alive in background'
+  opt-in in SwatTab config → notif perm + battery-opt exemption.
+- swatBus.ts = graceful no-op off-native. connect→busStart, disconnect→busStop,
+  status change→busUpdate(notification).
+- Verified: testing_agent 18/18 logic/regression pass (iteration_1.json); native
+  FGS/wakelock = APK-only, on-device verify (bg 5min → still in roster).
+- Fixed tester notes: emit() no longer rewinds state; stale onclose guarded.
+
+
+### SWAT tab — Phase C (part 1): static ops, failover, SASL PLAIN
+Scope this pass (push notifs = Phase C part 2, deferred — needs Firebase):
+- **Commander list = STATIC, authorize-static / display-live** (`src/lib/swatOps.ts`):
+  * `SWAT_OPS` is the app's shipped mirror of the sidecar `swat_ops` file
+    (one nick per line). `isCommander()` now delegates to `isSwatOp()` — a
+    local, case-insensitive check that NEVER hits the network. Deliberately no
+    live conductor lookup (fail-closed trap: conductor down → locked out of
+    ABORT). Display stays live (roster from NAMES, star chips). Added an `OPS`
+    quick-verb that asks the conductor to ECHO its copy for drift-spotting
+    (display only, never an auth input).
+- **Fallback host + wss** (`swatIrc.ts`):
+  * `SwatConfig` gained `fallbackHost`/`fallbackPort`/`tls`. `endpoints()`
+    builds a [primary, fallback] ring (empties/dupes stripped); `endpointIdx++`
+    on every failed `onclose`, so a stint on fallback is followed by a fresh
+    primary re-probe. Scheme = `wss` when `tls` (listener :7779) else `ws`.
+    NOTE: fallback is an operator-promoted recovery instance (Ergo can't
+    federate), not automatic HA — see ergo-recovery-runbook.md.
+- **SASL PLAIN** (`swatIrc.ts`): CAP LS 302 → REQ :sasl → AUTHENTICATE PLAIN →
+  base64(`\0account\0password`) → 903 ok (CAP END → NICK/USER) / 90x fail
+  (degrade: CAP END + register unauthenticated, surface error — never spin).
+  Account in kv config; password in SecureStore only (`swat_sasl_password`).
+  Gear panel gained fallback host/port, wss toggle, SASL account + secure pw.
+  Hand-rolled UTF-8→base64 (Hermes has no reliable btoa).
+- Verified: `tests/swat_logic.test.js` 30/30 (added SASL base64 cross-checked
+  vs Node Buffer, failover ring, static-ops auth). WS connect / CAP-SASL
+  handshake / gear UI = APK + live Ergo only (web preview can't bundle SQLite).
+
+### SWAT tab — Phase C (part 2): OPS-echo panel + mention/mission alerts
+- **OPS-echo drift panel** (`SwatTab.tsx` + `swatIrc.ts` `parseOpsEcho`):
+  conductor's reply to the `OPS` verb (PRIVMSG/NOTICE like `OPS: a b` or
+  `commanders = a, b`) is parsed into `state.opsEcho` and rendered as a
+  dismissible panel above the feed. Chips are green when the nick is also in
+  the app's shipped `SWAT_OPS`, amber+⚠ when conductor-only; a drift line
+  lists app-only / conductor-only mismatches. Display/eyeball only — NEVER an
+  authorization input.
+- **@mention / MISSION / HALT alerts = LOCAL notifications** (no Firebase):
+  * Native `SwatBus.notify(title, body, color)` (`SwatBusModule.kt`) posts a
+    high-importance heads-up on a new `swat_alerts` channel, colour-accented
+    (cyan mention / amber mission / red halt). Reuses existing POST_NOTIFICATIONS
+    perm; no FCM / remote push — the live WS (kept alive by the FGS) feeds it.
+  * `swatIrc.maybeAlert()` fires only while backgrounded (`AppState !=
+    "active"`) and skips our own echoes. Mention = word-boundary/@nick regex;
+    MISSION/HALT/ABORT by verb. Gated by new `alertsEnabled` config (default on,
+    gear toggle).
+- Verified: `tests/swat_logic.test.js` 40/40 (added OPS-echo parser + mention
+  detection). Native notify + panel render = APK + live Ergo only.
