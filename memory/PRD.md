@@ -399,3 +399,31 @@ drives it with zero special-casing. Hand-rolled MCP on the Go **stdlib**
 - Verified: testing_agent 18/18 logic/regression pass (iteration_1.json); native
   FGS/wakelock = APK-only, on-device verify (bg 5min → still in roster).
 - Fixed tester notes: emit() no longer rewinds state; stale onclose guarded.
+
+
+### SWAT tab — Phase C (part 1): static ops, failover, SASL PLAIN
+Scope this pass (push notifs = Phase C part 2, deferred — needs Firebase):
+- **Commander list = STATIC, authorize-static / display-live** (`src/lib/swatOps.ts`):
+  * `SWAT_OPS` is the app's shipped mirror of the sidecar `swat_ops` file
+    (one nick per line). `isCommander()` now delegates to `isSwatOp()` — a
+    local, case-insensitive check that NEVER hits the network. Deliberately no
+    live conductor lookup (fail-closed trap: conductor down → locked out of
+    ABORT). Display stays live (roster from NAMES, star chips). Added an `OPS`
+    quick-verb that asks the conductor to ECHO its copy for drift-spotting
+    (display only, never an auth input).
+- **Fallback host + wss** (`swatIrc.ts`):
+  * `SwatConfig` gained `fallbackHost`/`fallbackPort`/`tls`. `endpoints()`
+    builds a [primary, fallback] ring (empties/dupes stripped); `endpointIdx++`
+    on every failed `onclose`, so a stint on fallback is followed by a fresh
+    primary re-probe. Scheme = `wss` when `tls` (listener :7779) else `ws`.
+    NOTE: fallback is an operator-promoted recovery instance (Ergo can't
+    federate), not automatic HA — see ergo-recovery-runbook.md.
+- **SASL PLAIN** (`swatIrc.ts`): CAP LS 302 → REQ :sasl → AUTHENTICATE PLAIN →
+  base64(`\0account\0password`) → 903 ok (CAP END → NICK/USER) / 90x fail
+  (degrade: CAP END + register unauthenticated, surface error — never spin).
+  Account in kv config; password in SecureStore only (`swat_sasl_password`).
+  Gear panel gained fallback host/port, wss toggle, SASL account + secure pw.
+  Hand-rolled UTF-8→base64 (Hermes has no reliable btoa).
+- Verified: `tests/swat_logic.test.js` 30/30 (added SASL base64 cross-checked
+  vs Node Buffer, failover ring, static-ops auth). WS connect / CAP-SASL
+  handshake / gear UI = APK + live Ergo only (web preview can't bundle SQLite).

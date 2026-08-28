@@ -10,14 +10,24 @@
  * Exposes a tiny singleton store (subscribe/getState) so the SWAT tab can render
  * live without prop drilling. Config persists in the localDb kv store.
  */
+import * as SecureStore from "expo-secure-store";
 import { kvGet, kvSet } from "./localDb";
 import { busStart, busStop, busUpdate } from "./swatBus";
+import { isSwatOp } from "./swatOps";
 
 const KEY = "swat_config";
+const SASL_PW_KEY = "swat_sasl_password"; // password never touches kv/SQLite
 
 export type SwatConfig = {
   host: string;
   port: number;
+  // Operator-promoted recovery instance (see ergo-recovery-runbook.md). NOT a
+  // second live server — Ergo can't federate. Failover just means "try the
+  // box the operator points us at next".
+  fallbackHost: string;
+  fallbackPort: number;
+  tls: boolean;          // ws (false) vs wss (true) — wss listener is :7779
+  saslAccount: string;   // "" = SASL disabled (legacy NICK/USER only)
   nick: string;
   channel: string;
   realname: string;
@@ -28,6 +38,10 @@ export function defaultSwatConfig(): SwatConfig {
   return {
     host: "100.83.194.121",
     port: 7778,
+    fallbackHost: "100.104.200.124",
+    fallbackPort: 7778,
+    tls: false,
+    saslAccount: "",
     nick: "Enforcer-Operator",
     channel: "#SWAT",
     realname: "Enforcer Operator",
@@ -56,14 +70,15 @@ type State = {
 };
 
 const MAX_EVENTS = 500;
-const COMMANDERS = ["Maarten", "Enforcer-Operator"]; // phase-A hardcoded (spec §4)
 
 let ws: WebSocket | null = null;
 let wantConnected = false;
 let reconnectTimer: any = null;
 let attempts = 0; // exponential-backoff counter (reset on successful register)
+let endpointIdx = 0; // rotates primary → fallback → primary … on each failure
 let cfg: SwatConfig | null = null;
 let uidN = 0;
+let saslPassword = ""; // loaded from SecureStore at connect time
 
 let state: State = {
   status: "down",
@@ -94,7 +109,8 @@ function set(patch: Partial<State>) {
 }
 
 export function isCommander(nick: string): boolean {
-  return COMMANDERS.some((c) => c.toLowerCase() === (nick || "").toLowerCase());
+  // Static, local-only authorization (see swatOps.ts — "authorize static").
+  return isSwatOp(nick);
 }
 
 export async function loadSwatConfig(): Promise<SwatConfig> {
@@ -106,6 +122,73 @@ export async function loadSwatConfig(): Promise<SwatConfig> {
 export async function saveSwatConfig(next: SwatConfig): Promise<void> {
   cfg = next;
   await kvSet(KEY, next);
+}
+
+// ── SASL credential storage ────────────────────────────────────────────────
+// Password lives ONLY in expo-secure-store (AndroidKeyStore-backed). The
+// account name is non-secret and rides along in the kv config.
+export async function readSaslPassword(): Promise<string> {
+  try { return (await SecureStore.getItemAsync(SASL_PW_KEY)) || ""; } catch { return ""; }
+}
+export async function writeSaslPassword(pw: string): Promise<void> {
+  try {
+    if (pw) await SecureStore.setItemAsync(SASL_PW_KEY, pw);
+    else await SecureStore.deleteItemAsync(SASL_PW_KEY);
+  } catch { /* noop */ }
+}
+export async function hasSaslPassword(): Promise<boolean> {
+  return (await readSaslPassword()).length > 0;
+}
+
+// ── base64 (SASL PLAIN payload) ─────────────────────────────────────────────
+// Hermes has no reliable btoa; roll a tiny UTF-8 → base64 encoder that also
+// tolerates the NUL separators SASL PLAIN requires (\0account\0password).
+function utf8Bytes(s: string): number[] {
+  const out: number[] = [];
+  for (let i = 0; i < s.length; i += 1) {
+    const c = s.charCodeAt(i);
+    if (c < 0x80) out.push(c);
+    else if (c < 0x800) out.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f));
+    else out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
+  }
+  return out;
+}
+function b64(bytes: number[]): string {
+  const A = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  let out = "";
+  for (let i = 0; i < bytes.length; i += 3) {
+    const b0 = bytes[i];
+    const b1 = bytes[i + 1];
+    const b2 = bytes[i + 2];
+    out += A[b0 >> 2];
+    out += A[((b0 & 3) << 4) | ((b1 ?? 0) >> 4)];
+    out += i + 1 < bytes.length ? A[((b1 & 15) << 2) | ((b2 ?? 0) >> 6)] : "=";
+    out += i + 2 < bytes.length ? A[b2 & 63] : "=";
+  }
+  return out;
+}
+function saslPlainPayload(account: string, password: string): string {
+  return b64([0, ...utf8Bytes(account), 0, ...utf8Bytes(password)]);
+}
+
+// ── endpoint failover ───────────────────────────────────────────────────────
+// [primary, fallback] with empties/dupes stripped. endpointIdx rotates on
+// every failed connect so a stint on the fallback is always followed by a
+// fresh re-probe of the primary on the next reconnect cycle.
+type Endpoint = { host: string; port: number };
+function endpoints(): Endpoint[] {
+  const list: Endpoint[] = [];
+  const add = (h: string, p: number) => {
+    const host = (h || "").trim();
+    if (!host || !p) return;
+    if (list.some((e) => e.host === host && e.port === p)) return;
+    list.push({ host, port: p });
+  };
+  if (cfg) {
+    add(cfg.host, cfg.port);
+    add(cfg.fallbackHost, cfg.fallbackPort);
+  }
+  return list.length ? list : [{ host: cfg?.host || "127.0.0.1", port: cfg?.port || 7778 }];
 }
 
 // ── IRC helpers ──────────────────────────────────────────────────────────
@@ -237,6 +320,51 @@ function handleLine(line: string) {
   const p = parseLine(line);
   const chan = cfg?.channel || "#SWAT";
   switch (p.command) {
+    // ── IRCv3 CAP / SASL PLAIN negotiation ──────────────────────────────
+    case "CAP": {
+      const sub = (p.params[1] || "").toUpperCase();
+      if (sub === "LS") {
+        const offered = (p.trailing || "").toLowerCase().split(/\s+/);
+        if (cfg?.saslAccount && saslPassword && offered.includes("sasl")) {
+          rawSend("CAP REQ :sasl");
+        } else {
+          rawSend("CAP END");
+          register();
+        }
+      } else if (sub === "ACK") {
+        rawSend("AUTHENTICATE PLAIN");
+      } else { // NAK / anything unexpected → give up on caps, register plain
+        rawSend("CAP END");
+        register();
+      }
+      break;
+    }
+    case "AUTHENTICATE":
+      // Server ready for the credential blob.
+      if (p.params[0] === "+" || p.trailing === "+") {
+        rawSend(`AUTHENTICATE ${saslPlainPayload(cfg?.saslAccount || "", saslPassword)}`);
+      }
+      break;
+    case "900": // RPL_LOGGEDIN (informational)
+      break;
+    case "903": // RPL_SASLSUCCESS
+      pushEvent("*", "SASL auth ok", { system: true, color: "green" });
+      rawSend("CAP END");
+      register();
+      break;
+    case "902": // nick locked
+    case "904": // SASL failed
+    case "905": // message too long
+    case "906": // aborted
+    case "907": { // already authenticated
+      // Degrade gracefully — end caps and register unauthenticated instead of
+      // spinning. Commander gating still works off the static ops list.
+      set({ error: `SASL failed (${p.command}) — connected without account` });
+      pushEvent("*", `SASL auth failed (${p.command}) — continuing unauthenticated`, { system: true, color: "red" });
+      rawSend("CAP END");
+      register();
+      break;
+    }
     case "001": // welcome → join
       rawSend(`JOIN ${chan}`);
       pushEvent("*", `connected to ${state.host} — joining ${chan}`, { system: true, color: "grey" });
@@ -290,6 +418,14 @@ function rawSend(line: string) {
   }
 }
 
+/** Legacy registration handshake — sent after CAP END (or immediately when
+ *  SASL is disabled). */
+function register() {
+  if (!cfg) return;
+  rawSend(`NICK ${cfg.nick}`);
+  rawSend(`USER ${cfg.nick} 0 * :${cfg.realname || cfg.nick}`);
+}
+
 /** Public: send a verb/PRIVMSG line to the channel. */
 export function swatSend(text: string) {
   const chan = cfg?.channel || "#SWAT";
@@ -302,18 +438,28 @@ export function swatSend(text: string) {
 
 export async function connectSwat() {
   const c = await loadSwatConfig();
+  saslPassword = await readSaslPassword();
   wantConnected = true;
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
   if (ws) { try { ws.close(); } catch { /* noop */ } ws = null; }
   // Start the Android foreground service (keeps process + WS alive in bg).
   busStart(c.nick, c.channel);
-  set({ status: "connecting", host: `${c.host}:${c.port}`, nick: c.nick, roster: [], error: null });
+  // Pick the current endpoint from the failover ring.
+  const eps = endpoints();
+  const ep = eps[endpointIdx % eps.length];
+  const scheme = c.tls ? "wss" : "ws";
+  set({ status: "connecting", host: `${ep.host}:${ep.port}`, nick: c.nick, roster: [], error: null });
   try {
-    const sock = new WebSocket(`ws://${c.host}:${c.port}`);
+    const sock = new WebSocket(`${scheme}://${ep.host}:${ep.port}`);
     ws = sock;
     sock.onopen = () => {
-      rawSend(`NICK ${c.nick}`);
-      rawSend(`USER ${c.nick} 0 * :${c.realname || c.nick}`);
+      // If SASL is configured, negotiate caps FIRST; NICK/USER get sent from
+      // the CAP/SASL state machine (register()). Otherwise register directly.
+      if (c.saslAccount && saslPassword) {
+        rawSend("CAP LS 302");
+      } else {
+        register();
+      }
     };
     sock.onmessage = (ev: any) => {
       const data: string = typeof ev.data === "string" ? ev.data : String(ev.data);
@@ -328,6 +474,9 @@ export async function connectSwat() {
       if (ws !== sock) return;
       ws = null;
       if (wantConnected) {
+        // Rotate to the next endpoint (primary ⇄ fallback) so we re-probe the
+        // primary on the following cycle instead of getting stuck on fallback.
+        endpointIdx += 1;
         // exponential backoff 1s → 60s cap; keep status "connecting" so the
         // LED/notification reads yellow while we retry.
         const delay = Math.min(60000, 1000 * 2 ** attempts);

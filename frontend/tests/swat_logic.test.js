@@ -57,6 +57,55 @@ function backoffDelay(attempts) {
   return Math.min(60000, 1000 * 2 ** attempts);
 }
 
+// ── verbatim copies of the Phase-C logic (swatIrc.ts / swatOps.ts) ─────────
+function utf8Bytes(s) {
+  const out = [];
+  for (let i = 0; i < s.length; i += 1) {
+    const c = s.charCodeAt(i);
+    if (c < 0x80) out.push(c);
+    else if (c < 0x800) out.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f));
+    else out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
+  }
+  return out;
+}
+function b64(bytes) {
+  const A = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  let out = "";
+  for (let i = 0; i < bytes.length; i += 3) {
+    const b0 = bytes[i]; const b1 = bytes[i + 1]; const b2 = bytes[i + 2];
+    out += A[b0 >> 2];
+    out += A[((b0 & 3) << 4) | ((b1 ?? 0) >> 4)];
+    out += i + 1 < bytes.length ? A[((b1 & 15) << 2) | ((b2 ?? 0) >> 6)] : "=";
+    out += i + 2 < bytes.length ? A[b2 & 63] : "=";
+  }
+  return out;
+}
+function saslPlainPayload(account, password) {
+  return b64([0, ...utf8Bytes(account), 0, ...utf8Bytes(password)]);
+}
+
+// endpoint failover ring (swatIrc.ts endpoints())
+function endpoints(cfg) {
+  const list = [];
+  const add = (h, p) => {
+    const host = (h || "").trim();
+    if (!host || !p) return;
+    if (list.some((e) => e.host === host && e.port === p)) return;
+    list.push({ host, port: p });
+  };
+  add(cfg.host, cfg.port);
+  add(cfg.fallbackHost, cfg.fallbackPort);
+  return list.length ? list : [{ host: cfg.host || "127.0.0.1", port: cfg.port || 7778 }];
+}
+
+// static commander authorization (swatOps.ts isSwatOp)
+const SWAT_OPS = ["Maarten", "Enforcer-Operator"];
+function isSwatOp(nick) {
+  const n = (nick || "").trim().toLowerCase();
+  if (!n) return false;
+  return SWAT_OPS.some((o) => o.toLowerCase() === n);
+}
+
 // ── tests ────────────────────────────────────────────────────────────────
 let pass = 0, fail = 0;
 const t = (name, fn) => {
@@ -103,6 +152,50 @@ console.log("exponential backoff Math.min(60000, 1000*2**attempts):");
   .forEach(([a, exp]) => {
     t(`attempts=${a} → ${exp}ms`, () => assert.strictEqual(backoffDelay(a), exp));
   });
+
+console.log("SASL PLAIN base64 payload (\\0account\\0password):");
+// Reference values cross-checked with Buffer.from(...).toString("base64").
+t("simple ascii creds", () => {
+  const exp = Buffer.from("\x00enforcer\x00hunter2", "binary").toString("base64");
+  assert.strictEqual(saslPlainPayload("enforcer", "hunter2"), exp);
+});
+t("empty account+password", () => {
+  assert.strictEqual(saslPlainPayload("", ""), Buffer.from("\x00\x00", "binary").toString("base64"));
+});
+t("preserves NUL separators (decodes back)", () => {
+  const dec = Buffer.from(saslPlainPayload("acc", "pw"), "base64").toString("binary");
+  assert.strictEqual(dec, "\x00acc\x00pw");
+});
+t("utf-8 password", () => {
+  const exp = Buffer.from("\x00acc\x00pä", "utf8").toString("base64");
+  assert.strictEqual(saslPlainPayload("acc", "pä"), exp);
+});
+
+console.log("endpoint failover ring:");
+t("primary + fallback → 2 endpoints in order", () => {
+  const eps = endpoints({ host: "a", port: 1, fallbackHost: "b", fallbackPort: 2 });
+  assert.deepStrictEqual(eps, [{ host: "a", port: 1 }, { host: "b", port: 2 }]);
+});
+t("blank fallback → primary only", () => {
+  const eps = endpoints({ host: "a", port: 1, fallbackHost: "", fallbackPort: 0 });
+  assert.deepStrictEqual(eps, [{ host: "a", port: 1 }]);
+});
+t("dedupes identical primary/fallback", () => {
+  const eps = endpoints({ host: "a", port: 1, fallbackHost: "a", fallbackPort: 1 });
+  assert.strictEqual(eps.length, 1);
+});
+t("idx rotation re-probes primary (idx%len cycles a→b→a)", () => {
+  const eps = endpoints({ host: "a", port: 1, fallbackHost: "b", fallbackPort: 2 });
+  assert.strictEqual(eps[0 % eps.length].host, "a");
+  assert.strictEqual(eps[1 % eps.length].host, "b");
+  assert.strictEqual(eps[2 % eps.length].host, "a");
+});
+
+console.log("static commander authorization (fail-open, local):");
+t("known op (exact)", () => assert.strictEqual(isSwatOp("Maarten"), true));
+t("known op (case-insensitive)", () => assert.strictEqual(isSwatOp("enforcer-operator"), true));
+t("unknown nick → not a commander", () => assert.strictEqual(isSwatOp("randouser"), false));
+t("empty/whitespace → false", () => { assert.strictEqual(isSwatOp(""), false); assert.strictEqual(isSwatOp("   "), false); });
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

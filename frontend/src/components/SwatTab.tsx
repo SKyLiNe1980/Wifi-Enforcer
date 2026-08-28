@@ -14,6 +14,7 @@ import { busEnableKeepAlive, HAS_SWAT_BUS } from "../lib/swatBus";
 import {
   subscribeSwat, getSwatState, connectSwat, disconnectSwat, swatSend,
   loadSwatConfig, saveSwatConfig, isCommander, parseIrcColored,
+  readSaslPassword, writeSaslPassword,
   type SwatConfig, type EventColor,
 } from "../lib/swatIrc";
 
@@ -36,6 +37,8 @@ export default function SwatTab() {
   const st = useSyncExternalStore(subscribeSwat, getSwatState);
   const [cfg, setCfg] = useState<SwatConfig | null>(null);
   const [showCfg, setShowCfg] = useState(false);
+  const [saslPw, setSaslPw] = useState("");        // draft; blank keeps stored one
+  const [saslPwSet, setSaslPwSet] = useState(false); // a password is in SecureStore
   const [autoScroll, setAutoScroll] = useState(true);
   const [draft, setDraft] = useState("");
   const [missionOpen, setMissionOpen] = useState(false);
@@ -48,6 +51,7 @@ export default function SwatTab() {
       setCfg(c);
       if (c.autoconnect && getSwatState().status === "down") connectSwat();
     });
+    readSaslPassword().then((pw) => setSaslPwSet(pw.length > 0));
     return () => { /* keep connection alive across tab switches */ };
   }, []);
 
@@ -70,10 +74,20 @@ export default function SwatTab() {
   const saveCfg = useCallback(async () => {
     if (!cfg) return;
     await saveSwatConfig(cfg);
+    // Persist SASL password only when the operator typed a new one, or wipe it
+    // when the account was cleared (SASL turned off).
+    if (saslPw.trim()) {
+      await writeSaslPassword(saslPw.trim());
+      setSaslPwSet(true);
+      setSaslPw("");
+    } else if (!cfg.saslAccount.trim()) {
+      await writeSaslPassword("");
+      setSaslPwSet(false);
+    }
     setShowCfg(false);
     disconnectSwat();
     connectSwat();
-  }, [cfg]);
+  }, [cfg, saslPw]);
 
   const send = useCallback(() => {
     const t = draft.trim();
@@ -163,6 +177,38 @@ export default function SwatTab() {
               <Text style={styles.lbl}>CHANNEL</Text>
               <TextInput style={styles.input} value={cfg.channel} onChangeText={(t) => patch({ channel: t })}
                 autoCapitalize="none" autoCorrect={false} placeholderTextColor={C.dim} />
+            </View>
+          </View>
+          {/* FALLBACK ENDPOINT — operator-promoted recovery instance */}
+          <View style={styles.row}>
+            <View style={{ flex: 2, marginRight: 8 }}>
+              <Text style={styles.lbl}>FALLBACK HOST</Text>
+              <TextInput style={styles.input} value={cfg.fallbackHost} onChangeText={(t) => patch({ fallbackHost: t })}
+                autoCapitalize="none" autoCorrect={false} placeholder="orc recovery box" placeholderTextColor={C.dim} />
+            </View>
+            <View style={{ width: 78 }}>
+              <Text style={styles.lbl}>PORT</Text>
+              <TextInput style={styles.input} value={String(cfg.fallbackPort)} keyboardType="numeric"
+                onChangeText={(t) => patch({ fallbackPort: parseInt(t || "0", 10) || 0 })} placeholderTextColor={C.dim} />
+            </View>
+          </View>
+          <View style={[styles.row, { alignItems: "center", marginTop: 8 }]}>
+            <Switch value={cfg.tls} onValueChange={(v) => patch({ tls: v })}
+              trackColor={{ false: C.border, true: "#1a3a2a" }} thumbColor={cfg.tls ? C.green : C.dim} />
+            <Text style={styles.lbl}>  secure wss (:7779)</Text>
+          </View>
+          {/* SASL PLAIN — commander identity hardening */}
+          <View style={styles.row}>
+            <View style={{ flex: 1, marginRight: 8 }}>
+              <Text style={styles.lbl}>SASL ACCOUNT (blank = off)</Text>
+              <TextInput style={styles.input} value={cfg.saslAccount} onChangeText={(t) => patch({ saslAccount: t })}
+                autoCapitalize="none" autoCorrect={false} placeholder="ergo account" placeholderTextColor={C.dim} />
+            </View>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.lbl}>SASL PASSWORD</Text>
+              <TextInput style={styles.input} value={saslPw} onChangeText={setSaslPw}
+                secureTextEntry autoCapitalize="none" autoCorrect={false}
+                placeholder={saslPwSet ? "•••••• (saved)" : "not set"} placeholderTextColor={C.dim} />
             </View>
           </View>
           <View style={[styles.row, { alignItems: "center", marginTop: 8 }]}>
@@ -280,6 +326,7 @@ export default function SwatTab() {
       <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.chipsRow} contentContainerStyle={{ alignItems: "center", paddingHorizontal: 8 }}>
         <CHIP label="STATUS" color={C.grey} onPress={() => fire("STATUS")} />
         <CHIP label="LEASES" color={C.grey} onPress={() => fire("LEASES")} />
+        <CHIP label="OPS" color={C.grey} onPress={() => fire("OPS")} />
         <CHIP label="HELP" color={C.grey} onPress={() => fire("HELP")} />
         <CHIP label="TASK @all" color={C.amber} onPress={() => prefill("TASK @all ")} />
         <CHIP label="STOP #" color={C.amber} onPress={() => prefill("STOP #")} />
