@@ -447,3 +447,26 @@ Scope this pass (push notifs = Phase C part 2, deferred — needs Firebase):
     gear toggle).
 - Verified: `tests/swat_logic.test.js` 40/40 (added OPS-echo parser + mention
   detection). Native notify + panel render = APK + live Ergo only.
+
+### SWAT tab — Phase C (part 3): feedback pass (failover wiped, perms UX, wakelock toggle)
+Operator on-device feedback after first APK build:
+- **Failover WIPED** — Ergo can't federate; recovery = drop binary + restore
+  ircd.yaml. Removed `fallbackHost`/`fallbackPort` from `SwatConfig`, the
+  `endpoints()` ring + `endpointIdx`; `connectSwat` uses the single host again.
+  wss:7779 toggle + SASL stay.
+- **Permissions → real buttons + first-launch prompt** (`swatPerms.ts` + gear
+  panel): killed the tiny blue blend-in line. New "keep-alive & permissions"
+  group with clear status+action rows: 🔔 Notifications (fires the REAL
+  `PermissionsAndroid.POST_NOTIFICATIONS` dialog on first launch; deep-links to
+  settings when blocked), 🔋 Battery optimisation (FIX), 🔒 Wakelock. Status
+  refreshes on app-resume.
+- **Wakelock toggle replaces the nuking Disconnect** (`SwatBusService.kt` /
+  `SwatBusModule.kt`): FGS no longer auto-acquires the wakelock — it's OFF by
+  default (Kali-term style). The persistent notification's action button is now
+  ACQUIRE ⇄ RELEASE WAKELOCK (ACTION_WAKE_ON/OFF/TOGGLE); Disconnect lives only
+  on the in-app LED icon so the notification is never nuked. New JS bridges
+  busSetWake/busToggleWake/busIsWakeHeld + gear toggle mirror the state.
+- Deferred (operator's call): notification "0 online" roster count (busUpdate
+  only fires on status change, not roster change), other minor UI.
+- Verified: `tests/swat_logic.test.js` 36/36; tsc/lint clean. Native wakelock
+  notification + runtime perm dialog = APK-only.

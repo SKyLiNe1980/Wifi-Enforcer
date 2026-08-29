@@ -84,20 +84,6 @@ function saslPlainPayload(account, password) {
   return b64([0, ...utf8Bytes(account), 0, ...utf8Bytes(password)]);
 }
 
-// endpoint failover ring (swatIrc.ts endpoints())
-function endpoints(cfg) {
-  const list = [];
-  const add = (h, p) => {
-    const host = (h || "").trim();
-    if (!host || !p) return;
-    if (list.some((e) => e.host === host && e.port === p)) return;
-    list.push({ host, port: p });
-  };
-  add(cfg.host, cfg.port);
-  add(cfg.fallbackHost, cfg.fallbackPort);
-  return list.length ? list : [{ host: cfg.host || "127.0.0.1", port: cfg.port || 7778 }];
-}
-
 // static commander authorization (swatOps.ts isSwatOp)
 const SWAT_OPS = ["Maarten", "Enforcer-Operator"];
 function isSwatOp(nick) {
@@ -188,26 +174,6 @@ t("preserves NUL separators (decodes back)", () => {
 t("utf-8 password", () => {
   const exp = Buffer.from("\x00acc\x00pä", "utf8").toString("base64");
   assert.strictEqual(saslPlainPayload("acc", "pä"), exp);
-});
-
-console.log("endpoint failover ring:");
-t("primary + fallback → 2 endpoints in order", () => {
-  const eps = endpoints({ host: "a", port: 1, fallbackHost: "b", fallbackPort: 2 });
-  assert.deepStrictEqual(eps, [{ host: "a", port: 1 }, { host: "b", port: 2 }]);
-});
-t("blank fallback → primary only", () => {
-  const eps = endpoints({ host: "a", port: 1, fallbackHost: "", fallbackPort: 0 });
-  assert.deepStrictEqual(eps, [{ host: "a", port: 1 }]);
-});
-t("dedupes identical primary/fallback", () => {
-  const eps = endpoints({ host: "a", port: 1, fallbackHost: "a", fallbackPort: 1 });
-  assert.strictEqual(eps.length, 1);
-});
-t("idx rotation re-probes primary (idx%len cycles a→b→a)", () => {
-  const eps = endpoints({ host: "a", port: 1, fallbackHost: "b", fallbackPort: 2 });
-  assert.strictEqual(eps[0 % eps.length].host, "a");
-  assert.strictEqual(eps[1 % eps.length].host, "b");
-  assert.strictEqual(eps[2 % eps.length].host, "a");
 });
 
 console.log("static commander authorization (fail-open, local):");

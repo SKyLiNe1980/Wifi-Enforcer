@@ -22,11 +22,6 @@ const SASL_PW_KEY = "swat_sasl_password"; // password never touches kv/SQLite
 export type SwatConfig = {
   host: string;
   port: number;
-  // Operator-promoted recovery instance (see ergo-recovery-runbook.md). NOT a
-  // second live server — Ergo can't federate. Failover just means "try the
-  // box the operator points us at next".
-  fallbackHost: string;
-  fallbackPort: number;
   tls: boolean;          // ws (false) vs wss (true) — wss listener is :7779
   saslAccount: string;   // "" = SASL disabled (legacy NICK/USER only)
   nick: string;
@@ -40,8 +35,6 @@ export function defaultSwatConfig(): SwatConfig {
   return {
     host: "100.83.194.121",
     port: 7778,
-    fallbackHost: "100.104.200.124",
-    fallbackPort: 7778,
     tls: false,
     saslAccount: "",
     nick: "Enforcer-Operator",
@@ -80,7 +73,6 @@ let ws: WebSocket | null = null;
 let wantConnected = false;
 let reconnectTimer: any = null;
 let attempts = 0; // exponential-backoff counter (reset on successful register)
-let endpointIdx = 0; // rotates primary → fallback → primary … on each failure
 let cfg: SwatConfig | null = null;
 let uidN = 0;
 let saslPassword = ""; // loaded from SecureStore at connect time
@@ -175,26 +167,6 @@ function b64(bytes: number[]): string {
 }
 function saslPlainPayload(account: string, password: string): string {
   return b64([0, ...utf8Bytes(account), 0, ...utf8Bytes(password)]);
-}
-
-// ── endpoint failover ───────────────────────────────────────────────────────
-// [primary, fallback] with empties/dupes stripped. endpointIdx rotates on
-// every failed connect so a stint on the fallback is always followed by a
-// fresh re-probe of the primary on the next reconnect cycle.
-type Endpoint = { host: string; port: number };
-function endpoints(): Endpoint[] {
-  const list: Endpoint[] = [];
-  const add = (h: string, p: number) => {
-    const host = (h || "").trim();
-    if (!host || !p) return;
-    if (list.some((e) => e.host === host && e.port === p)) return;
-    list.push({ host, port: p });
-  };
-  if (cfg) {
-    add(cfg.host, cfg.port);
-    add(cfg.fallbackHost, cfg.fallbackPort);
-  }
-  return list.length ? list : [{ host: cfg?.host || "127.0.0.1", port: cfg?.port || 7778 }];
 }
 
 // ── IRC helpers ──────────────────────────────────────────────────────────
@@ -516,13 +488,10 @@ export async function connectSwat() {
   if (ws) { try { ws.close(); } catch { /* noop */ } ws = null; }
   // Start the Android foreground service (keeps process + WS alive in bg).
   busStart(c.nick, c.channel);
-  // Pick the current endpoint from the failover ring.
-  const eps = endpoints();
-  const ep = eps[endpointIdx % eps.length];
   const scheme = c.tls ? "wss" : "ws";
-  set({ status: "connecting", host: `${ep.host}:${ep.port}`, nick: c.nick, roster: [], error: null });
+  set({ status: "connecting", host: `${c.host}:${c.port}`, nick: c.nick, roster: [], error: null });
   try {
-    const sock = new WebSocket(`${scheme}://${ep.host}:${ep.port}`);
+    const sock = new WebSocket(`${scheme}://${c.host}:${c.port}`);
     ws = sock;
     sock.onopen = () => {
       // If SASL is configured, negotiate caps FIRST; NICK/USER get sent from
@@ -546,9 +515,6 @@ export async function connectSwat() {
       if (ws !== sock) return;
       ws = null;
       if (wantConnected) {
-        // Rotate to the next endpoint (primary ⇄ fallback) so we re-probe the
-        // primary on the following cycle instead of getting stuck on fallback.
-        endpointIdx += 1;
         // exponential backoff 1s → 60s cap; keep status "connecting" so the
         // LED/notification reads yellow while we retry.
         const delay = Math.min(60000, 1000 * 2 ** attempts);

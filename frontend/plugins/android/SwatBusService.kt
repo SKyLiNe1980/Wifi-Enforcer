@@ -34,18 +34,21 @@ class SwatBusService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val action = intent?.action ?: ACTION_START
         when (action) {
-            ACTION_STOP -> { stopSelf(); return START_NOT_STICKY }
+            ACTION_STOP -> { releaseWake(); stopSelf(); return START_NOT_STICKY }
             ACTION_UPDATE -> {
                 status = intent?.getStringExtra("status") ?: status
                 nick = intent?.getStringExtra("nick") ?: nick
                 channel = intent?.getStringExtra("channel") ?: channel
                 info = intent?.getStringExtra("info") ?: info
             }
-            else -> { // ACTION_START
+            ACTION_WAKE_ON -> acquireWake()
+            ACTION_WAKE_OFF -> releaseWake()
+            ACTION_WAKE_TOGGLE -> { if (wakeHeld) releaseWake() else acquireWake() }
+            else -> { // ACTION_START — wakelock stays OFF by default (Kali-term
+                      // style: operator toggles it on demand from the notification).
                 nick = intent?.getStringExtra("nick") ?: nick
                 channel = intent?.getStringExtra("channel") ?: channel
                 status = "connecting"
-                acquireWake()
             }
         }
         promote()
@@ -53,12 +56,19 @@ class SwatBusService : Service() {
     }
 
     private fun acquireWake() {
-        if (wake?.isHeld == true) return
+        if (wake?.isHeld == true) { wakeHeld = true; return }
         val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
         wake = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "enforcer:swatbus").apply {
             setReferenceCounted(false)
             acquire(12 * 60 * 60 * 1000L) // 12h safety cap
         }
+        wakeHeld = true
+    }
+
+    private fun releaseWake() {
+        try { if (wake?.isHeld == true) wake?.release() } catch (_: Exception) {}
+        wake = null
+        wakeHeld = false
     }
 
     private fun ledColor(): Int = when (status) {
@@ -78,8 +88,9 @@ class SwatBusService : Service() {
                 mgr.createNotificationChannel(ch)
             }
         }
-        val stopPI = PendingIntent.getService(
-            this, 1, Intent(this, SwatBusService::class.java).setAction(ACTION_STOP),
+        val wakeAction = if (wakeHeld) ACTION_WAKE_OFF else ACTION_WAKE_ON
+        val wakePI = PendingIntent.getService(
+            this, 1, Intent(this, SwatBusService::class.java).setAction(wakeAction),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
         val open = packageManager.getLaunchIntentForPackage(packageName)
@@ -89,14 +100,20 @@ class SwatBusService : Service() {
 
         val b = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
             Notification.Builder(this, chId) else @Suppress("DEPRECATION") Notification.Builder(this)
+        val wakeTag = if (wakeHeld) "  ·  🔒 wakelock" else ""
         b.setContentTitle("SWAT · ${status.uppercase()}")
-            .setContentText("$nick @ $channel${if (info.isNotEmpty()) "  ·  $info" else ""}")
+            .setContentText("$nick @ $channel${if (info.isNotEmpty()) "  ·  $info" else ""}$wakeTag")
             .setSmallIcon(applicationInfo.icon)
             .setColor(ledColor())
             .setColorized(true)
             .setOngoing(true)
         if (openPI != null) b.setContentIntent(openPI)
-        b.addAction(Notification.Action.Builder(0, "Disconnect", stopPI).build())
+        // Kali-term-style wakelock toggle (replaces the old Disconnect action,
+        // which nuked the whole notification). Disconnect now lives on the
+        // in-app LED icon only.
+        b.addAction(Notification.Action.Builder(
+            0, if (wakeHeld) "Release Wakelock" else "Acquire Wakelock", wakePI,
+        ).build())
         val notif = b.build()
 
         try {
@@ -113,17 +130,20 @@ class SwatBusService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         isRunning = false
-        try { if (wake?.isHeld == true) wake?.release() } catch (_: Exception) {}
-        wake = null
+        releaseWake()
     }
 
     companion object {
         @Volatile var isRunning = false
+        @Volatile var wakeHeld = false
         private const val TAG = "SwatBus"
         private const val NOTIF_ID = 7742
         const val ACTION_START = "com.wifienforcer.swatbus.START"
         const val ACTION_STOP = "com.wifienforcer.swatbus.STOP"
         const val ACTION_UPDATE = "com.wifienforcer.swatbus.UPDATE"
+        const val ACTION_WAKE_ON = "com.wifienforcer.swatbus.WAKE_ON"
+        const val ACTION_WAKE_OFF = "com.wifienforcer.swatbus.WAKE_OFF"
+        const val ACTION_WAKE_TOGGLE = "com.wifienforcer.swatbus.WAKE_TOGGLE"
         @Volatile private var status = "connecting"
         @Volatile private var nick = ""
         @Volatile private var channel = "#SWAT"
