@@ -297,10 +297,15 @@ class RootShellModule(private val reactContext: ReactApplicationContext) :
             stdin.flush()
 
             // Raw byte-stream reader threads (one per fd). See readStreamRaw.
-            Thread({ readStreamRaw(session, proc.inputStream, "stdout") },
-                "rootshell-stdout-$sessionId").start()
-            Thread({ readStreamRaw(session, proc.errorStream, "stderr") },
-                "rootshell-stderr-$sessionId").start()
+            // Keep refs so the waiter can JOIN them before the final flush —
+            // otherwise trailing bytes from quick-exit commands land in a
+            // removed session and get dropped (the exit-tail race).
+            val outReader = Thread({ readStreamRaw(session, proc.inputStream, "stdout") },
+                "rootshell-stdout-$sessionId")
+            val errReader = Thread({ readStreamRaw(session, proc.errorStream, "stderr") },
+                "rootshell-stderr-$sessionId")
+            outReader.start()
+            errReader.start()
 
             // Waiter
             Thread({
@@ -308,6 +313,11 @@ class RootShellModule(private val reactContext: ReactApplicationContext) :
                     val code = proc.waitFor()
                     val dur = (System.currentTimeMillis() - session.startedAt).toInt()
                     session.ended = true
+                    // Drain fully: readers break at EOF once the pipes close.
+                    // JOIN them BEFORE flushing so every last byte (e.g. the
+                    // one-shot output of `agy --help`) is in the buffer.
+                    try { outReader.join(2000) } catch (_: InterruptedException) {}
+                    try { errReader.join(2000) } catch (_: InterruptedException) {}
                     // Flush any trailing buffered lines BEFORE the exit event so
                     // JS sees all output before it sees "ended" status.
                     flushSession(session)

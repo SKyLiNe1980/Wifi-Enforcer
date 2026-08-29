@@ -447,3 +447,51 @@ Scope this pass (push notifs = Phase C part 2, deferred — needs Firebase):
     gear toggle).
 - Verified: `tests/swat_logic.test.js` 40/40 (added OPS-echo parser + mention
   detection). Native notify + panel render = APK + live Ergo only.
+
+### SWAT tab — Phase C (part 3): feedback pass (failover wiped, perms UX, wakelock toggle)
+Operator on-device feedback after first APK build:
+- **Failover WIPED** — Ergo can't federate; recovery = drop binary + restore
+  ircd.yaml. Removed `fallbackHost`/`fallbackPort` from `SwatConfig`, the
+  `endpoints()` ring + `endpointIdx`; `connectSwat` uses the single host again.
+  wss:7779 toggle + SASL stay.
+- **Permissions → real buttons + first-launch prompt** (`swatPerms.ts` + gear
+  panel): killed the tiny blue blend-in line. New "keep-alive & permissions"
+  group with clear status+action rows: 🔔 Notifications (fires the REAL
+  `PermissionsAndroid.POST_NOTIFICATIONS` dialog on first launch; deep-links to
+  settings when blocked), 🔋 Battery optimisation (FIX), 🔒 Wakelock. Status
+  refreshes on app-resume.
+- **Wakelock toggle replaces the nuking Disconnect** (`SwatBusService.kt` /
+  `SwatBusModule.kt`): FGS no longer auto-acquires the wakelock — it's OFF by
+  default (Kali-term style). The persistent notification's action button is now
+  ACQUIRE ⇄ RELEASE WAKELOCK (ACTION_WAKE_ON/OFF/TOGGLE); Disconnect lives only
+  on the in-app LED icon so the notification is never nuked. New JS bridges
+  busSetWake/busToggleWake/busIsWakeHeld + gear toggle mirror the state.
+- Deferred (operator's call): notification "0 online" roster count (busUpdate
+  only fires on status change, not roster change), other minor UI.
+- Verified: `tests/swat_logic.test.js` 36/36; tsc/lint clean. Native wakelock
+  notification + runtime perm dialog = APK-only.
+
+### Kali Term — terminal render/output bug pass (backlog dip)
+Operator-supplied bug list (kalitermpoints.txt). Tier-1 fixes, Tier-2 chroot-
+native pty daemon deferred by operator.
+- **#1 STDERR DEATH** (`TerminalShell.tsx` shellInvocation): dropped
+  `2>/dev/null` from the login shell — it nulled fd2 for the shell AND every
+  child, silently swallowing `agy --help` / wifite errors. stderr is drained
+  by its own native reader thread so it's safe to let through. Also switched
+  `script -qc` → `script -qfc` (`-f` = per-write flush; without it script
+  block-buffers ~4KB and short output feels stuck).
+- **#3 HARDCODED SIZE LIES** (same line): removed `COLUMNS=120 LINES=40` — lied
+  to every app (phone ≈50 cols). The fit→resize flow supplies real dims. (AITab
+  keeps a fixed size on purpose for Rich.Live; documented the divergence.)
+- **#2 EXIT-TAIL RACE** (`RootShellModule.kt` executeStream waiter): kept refs
+  to both reader threads and `join(2000ms)` them AFTER `waitFor()` but BEFORE
+  `flushSession`/EXIT/`sessions.remove()`, so trailing bytes from quick-exit
+  commands aren't stranded in a removed session.
+- **#4 RESIZE WIRING** — VERIFIED intact, no change: xterm `fit.fit()` →
+  post({resize,cols,rows}) → onMessage → `sessionManager.resize` (dedupe) →
+  `resizeSession` native `stty cols X rows Y` with echo-stripping. Real
+  measured dims throughout.
+- **Tier 2 (deferred)**: repackage enforcer-mcp sessions.py (openpty+TIOCSCTTY+
+  setsid) as a WS endpoint on the chroot tail IP and swap TerminalShell's
+  backend to it — real controlling tty, no script hack, no exit race by design.
+- Verified: tsc/lint clean. Native su-pipe behaviour = APK-only.

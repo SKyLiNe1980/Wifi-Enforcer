@@ -107,6 +107,25 @@ class SwatBusModule(private val ctx: ReactApplicationContext) :
     @ReactMethod
     fun isIgnoringBattery(promise: Promise) { promise.resolve(isIgnoring()) }
 
+    // ── Wakelock control (Kali-term style toggle) ──────────────────────────
+    @ReactMethod
+    fun setWake(on: Boolean, promise: Promise) {
+        try {
+            val action = if (on) SwatBusService.ACTION_WAKE_ON else SwatBusService.ACTION_WAKE_OFF
+            ctx.startService(svc(action))
+            promise.resolve(true)
+        } catch (e: Exception) { promise.reject("E_SWAT_WAKE", e.message, e) }
+    }
+
+    @ReactMethod
+    fun toggleWake(promise: Promise) {
+        try { ctx.startService(svc(SwatBusService.ACTION_WAKE_TOGGLE)); promise.resolve(true) }
+        catch (e: Exception) { promise.reject("E_SWAT_WAKE", e.message, e) }
+    }
+
+    @ReactMethod
+    fun isWakeHeld(promise: Promise) { promise.resolve(SwatBusService.wakeHeld) }
+
     /**
      * Fire a one-shot, high-importance HEADS-UP notification for a #SWAT event
      * (@mention / MISSION / HALT). Purely LOCAL — the live WebSocket (kept

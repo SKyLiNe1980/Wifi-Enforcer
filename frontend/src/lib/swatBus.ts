@@ -42,7 +42,30 @@ export async function busEnableKeepAlive(): Promise<void> {
   try { await N.requestBatteryExemption(); } catch { /* noop */ }
 }
 
+/** Open the battery-optimisation exemption dialog (REQUEST_IGNORE_BATTERY_OPT). */
+export async function busRequestBattery(): Promise<void> {
+  if (!HAS_SWAT_BUS) return;
+  try { await N.requestBatteryExemption(); } catch { /* noop */ }
+}
+
 export async function busIsIgnoringBattery(): Promise<boolean> {
   if (!HAS_SWAT_BUS) return false;
   try { return await N.isIgnoringBattery(); } catch { return false; }
+}
+
+// ── Wakelock (Kali-term style, default OFF) ─────────────────────────────────
+/** Acquire/release the partial wakelock. */
+export async function busSetWake(on: boolean): Promise<void> {
+  if (!HAS_SWAT_BUS) return;
+  try { await N.setWake(on); } catch { /* noop */ }
+}
+/** Flip the wakelock. */
+export async function busToggleWake(): Promise<void> {
+  if (!HAS_SWAT_BUS) return;
+  try { await N.toggleWake(); } catch { /* noop */ }
+}
+/** Is the wakelock currently held? */
+export async function busIsWakeHeld(): Promise<boolean> {
+  if (!HAS_SWAT_BUS) return false;
+  try { return await N.isWakeHeld(); } catch { return false; }
 }

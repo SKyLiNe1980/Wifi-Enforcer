@@ -10,7 +10,13 @@ import {
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
-import { busEnableKeepAlive, HAS_SWAT_BUS } from "../lib/swatBus";
+import {
+  HAS_SWAT_BUS, busToggleWake, busIsWakeHeld,
+} from "../lib/swatBus";
+import {
+  checkNotifPerm, requestNotifPerm, openAppSettings,
+  isBatteryExempt, requestBatteryExempt, type PermState,
+} from "../lib/swatPerms";
 import {
   subscribeSwat, getSwatState, connectSwat, disconnectSwat, swatSend,
   loadSwatConfig, saveSwatConfig, isCommander, parseIrcColored,
@@ -40,6 +46,10 @@ export default function SwatTab() {
   const [showCfg, setShowCfg] = useState(false);
   const [saslPw, setSaslPw] = useState("");        // draft; blank keeps stored one
   const [saslPwSet, setSaslPwSet] = useState(false); // a password is in SecureStore
+  const [notifPerm, setNotifPerm] = useState<PermState>("denied");
+  const [battOk, setBattOk] = useState(false);
+  const [wakeHeld, setWakeHeld] = useState(false);
+  const promptedRef = useRef(false);
   const [autoScroll, setAutoScroll] = useState(true);
   const [draft, setDraft] = useState("");
   const [missionOpen, setMissionOpen] = useState(false);
@@ -47,13 +57,51 @@ export default function SwatTab() {
   const [missionSeq, setMissionSeq] = useState(1);
   const feedRef = useRef<ScrollView>(null);
 
+  // Refresh permission + wakelock status (also called on app-resume so the
+  // gear panel reflects changes made from the notification / OS settings).
+  const refreshStatus = useCallback(async () => {
+    const [n, b, w] = await Promise.all([checkNotifPerm(), isBatteryExempt(), busIsWakeHeld()]);
+    setNotifPerm(n);
+    setBattOk(b);
+    setWakeHeld(w);
+    return n;
+  }, []);
+
   useEffect(() => {
     loadSwatConfig().then((c) => {
       setCfg(c);
       if (c.autoconnect && getSwatState().status === "down") connectSwat();
     });
     readSaslPassword().then((pw) => setSaslPwSet(pw.length > 0));
+    // First-launch: fire the real notification permission dialog once (clear
+    // intent — the whole tab is about background #SWAT alerts).
+    (async () => {
+      const state = await refreshStatus();
+      if (HAS_SWAT_BUS && state === "denied" && !promptedRef.current) {
+        promptedRef.current = true;
+        const res = await requestNotifPerm();
+        setNotifPerm(res);
+      }
+    })();
     return () => { /* keep connection alive across tab switches */ };
+  }, [refreshStatus]);
+
+  const onGrantNotif = useCallback(async () => {
+    if (notifPerm === "blocked") { await openAppSettings(); return; }
+    const res = await requestNotifPerm();
+    setNotifPerm(res);
+    if (res === "blocked") await openAppSettings();
+  }, [notifPerm]);
+
+  const onFixBattery = useCallback(async () => {
+    await requestBatteryExempt();
+    // OS dialog is async / external; re-check shortly after.
+    setTimeout(() => { isBatteryExempt().then(setBattOk); }, 1500);
+  }, []);
+
+  const onToggleWake = useCallback(async () => {
+    await busToggleWake();
+    setTimeout(() => { busIsWakeHeld().then(setWakeHeld); }, 300);
   }, []);
 
   useEffect(() => {
@@ -64,10 +112,13 @@ export default function SwatTab() {
   // kick a reconnect immediately (don't wait for the backoff timer).
   useEffect(() => {
     const sub = AppState.addEventListener("change", (s) => {
-      if (s === "active" && cfg?.autoconnect && getSwatState().status === "down") connectSwat();
+      if (s === "active") {
+        refreshStatus();
+        if (cfg?.autoconnect && getSwatState().status === "down") connectSwat();
+      }
     });
     return () => sub.remove();
-  }, [cfg?.autoconnect]);
+  }, [cfg?.autoconnect, refreshStatus]);
 
   const ledColor = st.status === "connected" ? C.green : st.status === "connecting" ? C.amber : C.red;
   const commander = isCommander(st.nick || cfg?.nick || "");
@@ -126,6 +177,27 @@ export default function SwatTab() {
     </TouchableOpacity>
   );
 
+  const PermRow = ({
+    icon, label, ok, okText, badText, action, onPress,
+  }: {
+    icon: any; label: string; ok: boolean; okText: string; badText: string;
+    action: string; onPress: () => void;
+  }) => (
+    <View style={styles.permRow}>
+      <MaterialCommunityIcons name={icon} size={16} color={ok ? C.green : C.amber} />
+      <Text style={styles.permLabel} numberOfLines={1}>{label}</Text>
+      <Text style={[styles.permState, { color: ok ? C.green : C.amber }]}>
+        {ok ? okText : badText}
+      </Text>
+      <TouchableOpacity
+        onPress={onPress}
+        style={[styles.permBtn, { borderColor: ok ? C.green : C.amber }]}
+      >
+        <Text style={[styles.permBtnTxt, { color: ok ? C.green : C.amber }]}>{action}</Text>
+      </TouchableOpacity>
+    </View>
+  );
+
   return (
     <View style={[styles.root, { paddingTop: insets.top ? 0 : 6 }]}>
       {/* TOP STRIP */}
@@ -180,19 +252,6 @@ export default function SwatTab() {
                 autoCapitalize="none" autoCorrect={false} placeholderTextColor={C.dim} />
             </View>
           </View>
-          {/* FALLBACK ENDPOINT — operator-promoted recovery instance */}
-          <View style={styles.row}>
-            <View style={{ flex: 2, marginRight: 8 }}>
-              <Text style={styles.lbl}>FALLBACK HOST</Text>
-              <TextInput style={styles.input} value={cfg.fallbackHost} onChangeText={(t) => patch({ fallbackHost: t })}
-                autoCapitalize="none" autoCorrect={false} placeholder="orc recovery box" placeholderTextColor={C.dim} />
-            </View>
-            <View style={{ width: 78 }}>
-              <Text style={styles.lbl}>PORT</Text>
-              <TextInput style={styles.input} value={String(cfg.fallbackPort)} keyboardType="numeric"
-                onChangeText={(t) => patch({ fallbackPort: parseInt(t || "0", 10) || 0 })} placeholderTextColor={C.dim} />
-            </View>
-          </View>
           <View style={[styles.row, { alignItems: "center", marginTop: 8 }]}>
             <Switch value={cfg.tls} onValueChange={(v) => patch({ tls: v })}
               trackColor={{ false: C.border, true: "#1a3a2a" }} thumbColor={cfg.tls ? C.green : C.dim} />
@@ -227,12 +286,40 @@ export default function SwatTab() {
             <Text style={styles.lbl}>  alert on @mention · MISSION · HALT (background)</Text>
           </View>
           {HAS_SWAT_BUS ? (
-            <TouchableOpacity onPress={busEnableKeepAlive} style={[styles.row, { alignItems: "center", marginTop: 10 }]}>
-              <MaterialCommunityIcons name="shield-sync" size={16} color={C.cyan} />
-              <Text style={[styles.lbl, { color: C.cyan, marginLeft: 6, flex: 1 }]}>
-                keep alive in background — grant notification + disable battery optimisation
+            <View style={styles.keepAlive}>
+              <Text style={[styles.lbl, { marginBottom: 6 }]}>{"// keep-alive & permissions"}</Text>
+              <PermRow
+                icon="bell-ring"
+                label="Notifications"
+                ok={notifPerm === "granted"}
+                okText="granted"
+                badText={notifPerm === "blocked" ? "blocked" : "denied"}
+                action={notifPerm === "blocked" ? "SETTINGS" : "GRANT"}
+                onPress={onGrantNotif}
+              />
+              <PermRow
+                icon="battery-heart-variant"
+                label="Battery optimisation"
+                ok={battOk}
+                okText="exempt"
+                badText="optimised"
+                action="FIX"
+                onPress={onFixBattery}
+              />
+              <PermRow
+                icon="lock"
+                label="Wakelock (CPU on, screen off)"
+                ok={wakeHeld}
+                okText="acquired"
+                badText="off"
+                action={wakeHeld ? "RELEASE" : "ACQUIRE"}
+                onPress={onToggleWake}
+              />
+              <Text style={styles.keepAliveHint}>
+                Persistent notification stays up while connected. Wakelock is your
+                insurance for critical ops — toggle it here or from the notification.
               </Text>
-            </TouchableOpacity>
+            </View>
           ) : null}
         </View>
       ) : null}
@@ -439,6 +526,15 @@ const styles = StyleSheet.create({
   },
   saveBtn: { backgroundColor: C.green, borderRadius: 4, paddingHorizontal: 10, paddingVertical: 8 },
   saveTxt: { color: C.surface, fontFamily: MONO, fontSize: 10, fontWeight: "800", letterSpacing: 1 },
+  keepAlive: {
+    marginTop: 12, paddingTop: 10, borderTopWidth: 1, borderTopColor: C.border,
+  },
+  keepAliveHint: { color: C.dim, fontFamily: MONO, fontSize: 9, marginTop: 6, lineHeight: 13 },
+  permRow: { flexDirection: "row", alignItems: "center", marginTop: 8 },
+  permLabel: { color: C.text, fontFamily: MONO, fontSize: 11, marginLeft: 8, flex: 1 },
+  permState: { fontFamily: MONO, fontSize: 9, marginRight: 8, letterSpacing: 0.5 },
+  permBtn: { borderWidth: 1, borderRadius: 4, paddingHorizontal: 10, paddingVertical: 6, minWidth: 74, alignItems: "center" },
+  permBtnTxt: { fontFamily: MONO, fontSize: 10, fontWeight: "800", letterSpacing: 1 },
   rosterWrap: {
     flexDirection: "row", alignItems: "center", paddingHorizontal: 10, paddingVertical: 6,
     borderBottomWidth: 1, borderBottomColor: C.border, backgroundColor: C.panel,
