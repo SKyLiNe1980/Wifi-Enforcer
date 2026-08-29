@@ -58,12 +58,23 @@ const persistent: { sessionId: string | null } = { sessionId: null };
  *
  * Falls back to `bash -l` if zsh is missing (`|| bash -l` chained inside
  * the same `script` invocation so the PTY is still set up correctly).
+ *
+ * NOTE (vs AITab.applyAIWrap): we share the capability env (TERM/COLORTERM/
+ * FORCE_COLOR) but deliberately DIVERGE on two points for the interactive
+ * shell:
+ *   - NO `2>/dev/null` on the login shell. Nulling fd2 silently swallows
+ *     stderr for the shell AND every child — so `agy --help`, wifite errors,
+ *     etc. vanished. Real stderr is drained separately by the native reader
+ *     thread, so it's safe (and necessary) to let it through.
+ *   - NO hardcoded COLUMNS/LINES. Those lied to every app (phone is ~50 cols,
+ *     not 120). The fit→resize flow measures the real terminal dims and pushes
+ *     them via `stty`, so we let the pty start unsized. (AITab keeps a fixed
+ *     size on purpose for Rich.Live animation stability.)
+ *   - `script -qf` — the `-f` flushes output per write; without it script
+ *     block-buffers ~4KB and small outputs feel "stuck".
  */
 function shellInvocation(): string {
-  // Same TUI-friendly env block as AITab's applyAIWrap — see AITab.tsx for
-  // the per-var rationale. We keep these in sync deliberately so an
-  // interactive shell and an AI agent see identical terminal capability.
-  return `SHELL=/bin/zsh HOME=/root TERM=xterm-256color COLORTERM=truecolor FORCE_COLOR=1 COLUMNS=120 LINES=40 PYTHONUNBUFFERED=1 script -qc 'zsh -l 2>/dev/null || bash -l' /dev/null`;
+  return `SHELL=/bin/zsh HOME=/root TERM=xterm-256color COLORTERM=truecolor FORCE_COLOR=1 PYTHONUNBUFFERED=1 script -qfc 'zsh -l || bash -l' /dev/null`;
 }
 
 export default function TerminalShell({ execMode, wrap, pendingInjection }: Props) {

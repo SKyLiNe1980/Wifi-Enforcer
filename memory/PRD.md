@@ -470,3 +470,28 @@ Operator on-device feedback after first APK build:
   only fires on status change, not roster change), other minor UI.
 - Verified: `tests/swat_logic.test.js` 36/36; tsc/lint clean. Native wakelock
   notification + runtime perm dialog = APK-only.
+
+### Kali Term — terminal render/output bug pass (backlog dip)
+Operator-supplied bug list (kalitermpoints.txt). Tier-1 fixes, Tier-2 chroot-
+native pty daemon deferred by operator.
+- **#1 STDERR DEATH** (`TerminalShell.tsx` shellInvocation): dropped
+  `2>/dev/null` from the login shell — it nulled fd2 for the shell AND every
+  child, silently swallowing `agy --help` / wifite errors. stderr is drained
+  by its own native reader thread so it's safe to let through. Also switched
+  `script -qc` → `script -qfc` (`-f` = per-write flush; without it script
+  block-buffers ~4KB and short output feels stuck).
+- **#3 HARDCODED SIZE LIES** (same line): removed `COLUMNS=120 LINES=40` — lied
+  to every app (phone ≈50 cols). The fit→resize flow supplies real dims. (AITab
+  keeps a fixed size on purpose for Rich.Live; documented the divergence.)
+- **#2 EXIT-TAIL RACE** (`RootShellModule.kt` executeStream waiter): kept refs
+  to both reader threads and `join(2000ms)` them AFTER `waitFor()` but BEFORE
+  `flushSession`/EXIT/`sessions.remove()`, so trailing bytes from quick-exit
+  commands aren't stranded in a removed session.
+- **#4 RESIZE WIRING** — VERIFIED intact, no change: xterm `fit.fit()` →
+  post({resize,cols,rows}) → onMessage → `sessionManager.resize` (dedupe) →
+  `resizeSession` native `stty cols X rows Y` with echo-stripping. Real
+  measured dims throughout.
+- **Tier 2 (deferred)**: repackage enforcer-mcp sessions.py (openpty+TIOCSCTTY+
+  setsid) as a WS endpoint on the chroot tail IP and swap TerminalShell's
+  backend to it — real controlling tty, no script hack, no exit race by design.
+- Verified: tsc/lint clean. Native su-pipe behaviour = APK-only.
