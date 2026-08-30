@@ -571,3 +571,12 @@ Batched so ONE APK build validates the full SSH experience (Terminal+AI+Live).
 - NOT covered (Phase 3b, if needed): dashboard runScan / quick-scan paths that
   still read raw execMode — left chroot-gated for now; the 3 tabs are the demo
   surface. Tier-2 chroot-native pty daemon still the next big pick.
+
+### SSH backend mode — build fix (JSch resource clash)
+EAS build failed: mergeReleaseJavaResource — duplicate
+'META-INF/versions/9/OSGI-INF/MANIFEST.MF' from com.github.mwiede:jsch and its
+transitive org.jspecify:jspecify. Fix in withSshShell.js: append an
+`android { packaging { resources { excludes += [...OSGI MANIFEST...] } } }`
+block to app/build.gradle (second android{} merges into the extension).
+NOTE: icon.png / adaptive-icon.png are 1408x768 (non-square) — Expo warns but
+build proceeds; NOT the failure. Left operator's branding untouched.
