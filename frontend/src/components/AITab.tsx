@@ -5,7 +5,9 @@ import {
 } from "react-native";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { sessionManager, SessionState } from "../lib/sessionManager";
-import { hasNativeStreaming, HAS_NATIVE_ROOT, writeStdin } from "../lib/rootShell";
+import { hasNativeStreaming, HAS_NATIVE_ROOT } from "../lib/rootShell";
+import { HAS_NATIVE_SSH } from "../lib/sshBackend";
+import { writeStdin } from "../lib/backend";
 import { aiProfilesLocal, nodesLocal } from "../lib/localDb";
 import { cleanAnsi as sharedCleanAnsi } from "../lib/ansiUtils";
 import XTermView from "./XTermView";
@@ -50,6 +52,7 @@ type Props = {
   execMode: "mock" | "real" | "kali";
   wrap: (cmd: string) => string;   // outer exec-mode wrapper (kali chroot etc.)
   apiBase: string;                  // backend URL for ai-profiles + ai-logs
+  sshMode?: boolean;                // transport is SSH (no device root needed)
 };
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
@@ -237,7 +240,12 @@ export default function AITab(props: Props) {
   // ─── Start / Stop ────────────────────────────────────────────────────────
   const handleStart = useCallback(async () => {
     if (!selectedProfile) return;
-    if (!HAS_NATIVE_ROOT || !hasNativeStreaming()) {
+    if (props.sshMode) {
+      if (!HAS_NATIVE_SSH) {
+        Alert.alert("Native build required", "SSH backend needs the native APK build.");
+        return;
+      }
+    } else if (!HAS_NATIVE_ROOT || !hasNativeStreaming()) {
       Alert.alert(
         "Native build required",
         "AI agents need the native root bridge + streaming. Build a real APK (`eas build`) and run on your device — this won't work in Expo Go or web preview.",

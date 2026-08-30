@@ -556,3 +556,18 @@ is password (Kalidroid default kali/kali) or a pasted private key.
 - Build: main bundle 1369 modules, tsc/lint clean. APK-only to actually run.
 - Phase 3 (next): route AI + Live tabs through the selector (treat ssh as non-
   mock, AI wrap backend-aware). Then tier-2 chroot-native pty daemon.
+
+### SSH backend mode — Phase 3 (AI + Live tabs) [DONE]
+Batched so ONE APK build validates the full SSH experience (Terminal+AI+Live).
+- `AITab.tsx`: added `sshMode` prop — start gate requires HAS_NATIVE_SSH (not
+  device root) when ssh; direct `writeStdin` (agent stdin) now routed via
+  backend selector; imports HAS_NATIVE_SSH.
+- `app/index.tsx`: AITab gets `execMode="kali"` + `sshMode` when ssh; LiveTab
+  gets `execMode="kali"` when ssh so its `forceMock = execMode==="mock"` flips
+  to real and streams route over ssh (wrap already identity in ssh mode).
+- Both tabs already stream through sessionManager → backend selector, so no
+  transport changes needed beyond the mock/root gating.
+- Build: tsc/lint clean, bundle compiles (blank web = known SQLite-only).
+- NOT covered (Phase 3b, if needed): dashboard runScan / quick-scan paths that
+  still read raw execMode — left chroot-gated for now; the 3 tabs are the demo
+  surface. Tier-2 chroot-native pty daemon still the next big pick.

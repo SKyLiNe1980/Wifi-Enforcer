@@ -1809,16 +1809,17 @@ export default function App() {
               ifaceC={ifaceC}
               primaryIface={primaryIface}
               country={country}
-              execMode={execMode}
+              execMode={backendKind === "ssh" ? "kali" : execMode}
               wrap={wrapForMode}
               apiBase={API}
             />
           )}
           {tab === "ai" && (
             <AITab
-              execMode={execMode}
+              execMode={backendKind === "ssh" ? "kali" : execMode}
               wrap={wrapForMode}
               apiBase={API}
+              sshMode={backendKind === "ssh"}
             />
           )}
           {tab === "mcp" && <MCPTab />}
