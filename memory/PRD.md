@@ -495,3 +495,40 @@ native pty daemon deferred by operator.
   setsid) as a WS endpoint on the chroot tail IP and swap TerminalShell's
   backend to it — real controlling tty, no script hack, no exit race by design.
 - Verified: tsc/lint clean. Native su-pipe behaviour = APK-only.
+
+### SSH backend mode — Phase 1 (native transport foundation) [DONE]
+Strategic: make the Kali backend PLUGGABLE (chroot su-pipe OR SSH) to de-risk
+the shrinking rooted-NetHunter device pool and support Kalidroid/Podroid VMs
+(QEMU + USB passthrough → mon-mode/injection survive) and remote boxes.
+Operator decisions: key-first auth (password too), ONE persistent SSH session
+(true terminal, no oneshots), default host = tun0/tailscale0 IP, port 9922
+(kali/podroid forward VM sshd:22 → 9922 on device IP), TOFU host keys, toggle =
+FULL backend swap (not just terminal). Android-host-root features (overlay,
+host su) stay su-only regardless.
+
+Built this phase (all APK-only, cannot run in web/Expo Go):
+- `plugins/android/SshShellModule.kt` — JSch (mwiede fork) transport mirroring
+  RootShell's contract (executeStream/killSession/writeStdin/resizeSession +
+  chunk/exit/error events). ONE persistent Session; empty cmd → ChannelShell
+  (persistent login PTY = Terminal), non-empty → ChannelExec+PTY (tools/agents).
+  Resize via real setPtySize (SIGWINCH — no stty hack, no `script`). TOFU:
+  emits SshShell.hostkey fingerprint for JS store-on-first-use/warn.
+- `plugins/android/SshShellPackage.kt`, `plugins/withSshShell.js` (adds
+  com.github.mwiede:jsch:0.2.17 dep + proguard keeps + MainApplication reg),
+  registered in app.json.
+- `src/lib/sshBackend.ts` — JS wrapper mirroring rootShell.ts + connect/
+  disconnect/isConnected + onSshState/onSshHostKey subscriptions.
+- Non-breaking: chroot path untouched; nothing wired to it yet.
+
+### SSH backend mode — Phase 2 (NEXT: selector + settings + Terminal)
+- `src/lib/backend.ts` selector routing startStream/killStream/writeStdin/
+  resizeSession + hasStreaming to chroot|ssh based on `exec_backend` config.
+- Point `sessionManager.ts` import at backend.ts (rename hasNativeStreaming→
+  hasStreaming).
+- Backend-aware wrap/shell: `app/index.tsx` wrapForMode → identity in ssh mode;
+  TerminalShell.shellInvocation → "" (bare login shell) in ssh mode.
+- Settings: exec-backend toggle + SSH connection panel (host default =
+  detectTailnetIp()/tun0, port 9922, user kali, auth key/pw, TOFU fingerprint
+  store+warn). Password/private key in SecureStore. Connection status + reconnect.
+  Reuse existing provisioning SSH key material (locate source).
+- Phase 3: route AI + Live tabs through the selector (AI wrap backend-aware).

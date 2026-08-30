@@ -46,6 +46,7 @@
       "./plugins/withCleartextTraffic",
       "./plugins/withOverlay",
       "./plugins/withSwatBus",
+      "./plugins/withSshShell",
       "expo-web-browser",
       "expo-font"
     ],
