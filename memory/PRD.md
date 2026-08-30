@@ -596,3 +596,17 @@ Fix (JS-ONLY, no native rebuild of the SSH module needed):
   be a plain `cat /etc/enforcer-mcp/config.yaml` (no nethunter/nh wrapper).
 - Reaches device via a fresh JS bundle → needs an APK rebuild, but NO native
   changes (existing SshShell module is compatible).
+
+### MCP tab — editable bearer token + orientation
+- Bug: cockpit bearer token was DISPLAY-ONLY (generate/import) → operator
+  couldn't type/paste it. Fixed: editable TextInput bound to a local
+  `bearerDraft`, committed on BLUR (not per-keystroke, to avoid restarting the
+  health-probe loop). REVEAL toggles secureTextEntry; COPY/IMPORT/REGEN kept.
+  Removed now-unused shortToken().
+- Clarified "flicking switch wiped the redis token": NOT a wipe — patchConfig
+  merges partial patches. Redis restores PER-NODE bearer tokens; the cockpit's
+  own config.bearer_token is separate and was simply empty (hence the correct
+  "token mismatch"). Editable field lets operator set it to match a node.
+- Orientation: app.json "portrait" → "default" (landscape now supported —
+  useful for the terminal). Needs a rebuild (native config); MCPTab change is
+  JS. No native-module changes, so still a straightforward build.
