@@ -22,6 +22,22 @@ const path = require("path");
 const KOTLIN_FILES = ["SshShellModule.kt", "SshShellPackage.kt"];
 const JSCH_DEP = `    implementation("com.github.mwiede:jsch:0.2.17")`;
 
+// JSch + its transitive jspecify both ship META-INF/versions/9/OSGI-INF/
+// MANIFEST.MF, which makes AGP's mergeJavaResource task fail on a duplicate.
+// Append a packaging exclude so the merge picks one and moves on.
+const PACKAGING_BLOCK = `
+// === added by withSshShell: dedupe JSch/jspecify OSGI manifests ===
+android {
+    packaging {
+        resources {
+            excludes += ["META-INF/versions/9/OSGI-INF/MANIFEST.MF"]
+            excludes += ["META-INF/versions/9/OSGI-INF/**"]
+        }
+    }
+}
+// ===================================================================
+`;
+
 const PROGUARD_RULES = `
 # === SshShell native module + JSch (added by withSshShell config plugin) ===
 -keep class com.wifienforcer.sshshell.** { *; }
@@ -42,6 +58,12 @@ function withJschDependency(config) {
       console.log("[withSshShell] ✓ added JSch dependency");
     } else {
       console.log("[withSshShell] JSch dependency already present");
+    }
+    // Append the packaging dedupe block (a second android {} block merges into
+    // the existing extension — valid Gradle).
+    if (!src.includes("dedupe JSch/jspecify OSGI manifests")) {
+      src = `${src}\n${PACKAGING_BLOCK}`;
+      console.log("[withSshShell] ✓ added packaging exclude for JSch manifests");
     }
     config.modResults.contents = src;
     return config;
