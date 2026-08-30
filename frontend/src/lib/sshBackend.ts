@@ -113,3 +113,61 @@ export async function listStreams() {
   if (!SshShell) return [];
   try { return await SshShell.listSessions(); } catch { return []; }
 }
+
+// ── one-shot exec (matches rootShell.execReal shape) ────────────────────────
+// Built on the existing native executeStream (ChannelExec) — no native rebuild
+// needed. Buffers stdout until the channel exits.
+function b64ToUtf8(b64: string): string {
+  const A = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  const clean = (b64 || "").replace(/[^A-Za-z0-9+/=]/g, "");
+  const bytes: number[] = [];
+  for (let i = 0; i < clean.length; i += 4) {
+    const e0 = A.indexOf(clean[i]);
+    const e1 = A.indexOf(clean[i + 1]);
+    const e2 = A.indexOf(clean[i + 2]);
+    const e3 = A.indexOf(clean[i + 3]);
+    const c0 = (e0 << 2) | (e1 >> 4);
+    bytes.push(c0);
+    if (clean[i + 2] !== "=" && e2 >= 0) bytes.push(((e1 & 15) << 4) | (e2 >> 2));
+    if (clean[i + 3] !== "=" && e3 >= 0) bytes.push(((e2 & 3) << 6) | e3);
+  }
+  // decode UTF-8
+  let out = "";
+  for (let i = 0; i < bytes.length; ) {
+    const b = bytes[i];
+    if (b < 0x80) { out += String.fromCharCode(b); i += 1; }
+    else if (b >= 0xc0 && b < 0xe0) { out += String.fromCharCode(((b & 0x1f) << 6) | (bytes[i + 1] & 0x3f)); i += 2; }
+    else if (b >= 0xe0) { out += String.fromCharCode(((b & 0x0f) << 12) | ((bytes[i + 1] & 0x3f) << 6) | (bytes[i + 2] & 0x3f)); i += 3; }
+    else { i += 1; }
+  }
+  return out;
+}
+
+export function execReal(
+  command: string,
+  timeoutMs: number = 20000,
+): Promise<{ command: string; output: string; exit_code: number; duration_ms: number; mocked: boolean }> {
+  return new Promise((resolve) => {
+    if (!SshShell) {
+      resolve({ command, output: "", exit_code: -1, duration_ms: 0, mocked: false });
+      return;
+    }
+    const sid = `xr-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`;
+    const started = Date.now();
+    let out = "";
+    let done = false;
+    let stop: () => void = () => {};
+    const finish = (code: number) => {
+      if (done) return;
+      done = true;
+      try { stop(); } catch { /* noop */ }
+      resolve({ command, output: out, exit_code: code, duration_ms: Date.now() - started, mocked: false });
+    };
+    stop = startStream(sid, command, {
+      onChunk: (e: any) => { try { out += b64ToUtf8(e.dataB64 || ""); } catch { /* noop */ } },
+      onExit: (e: any) => finish(typeof e.exit_code === "number" ? e.exit_code : 0),
+      onError: () => finish(-1),
+    });
+    setTimeout(() => finish(out ? 0 : -1), timeoutMs);
+  });
+}

@@ -26,6 +26,8 @@ import {
   type MCPConfig, type MCPTool, type MCPAuditEntry, type MCPNode,
 } from "../lib/localDb";
 import { startStream, killStream, hasNativeStreaming, execReal, HAS_NATIVE_ROOT } from "../lib/rootShell";
+import { HAS_NATIVE_SSH } from "../lib/sshBackend";
+import { getActiveBackend, execReal as backendExecReal } from "../lib/backend";
 import { detectTailnetIp } from "../lib/tailnetDetect";
 import {
   prepareDebPayload, detectTailscaleIp, startHttpServer, stopHttpServer,
@@ -60,12 +62,6 @@ const MONO = Platform.select({ ios: "Menlo", android: "monospace", default: "mon
 async function generateBearerToken(): Promise<string> {
   const bytes = await Crypto.getRandomBytesAsync(32);
   return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
-}
-
-function shortToken(t: string): string {
-  if (!t) return "(none)";
-  if (t.length <= 16) return t;
-  return `${t.slice(0, 6)}…${t.slice(-4)}`;
 }
 
 function formatTs(iso: string): string {
@@ -104,6 +100,9 @@ export default function MCPTab() {
   const [crackOut, setCrackOut] = useState("");
   const [busy, setBusy] = useState(false);
   const [tokenVisible, setTokenVisible] = useState(false);
+  // Editable bearer draft — committed to config on blur (NOT per keystroke, so
+  // we don't restart the health-probe loop on every character).
+  const [bearerDraft, setBearerDraft] = useState("");
 
   // Local form state — committed to SQLite via debounced updateConfig().
   const [portInput, setPortInput] = useState("8765");
@@ -598,6 +597,15 @@ export default function MCPTab() {
     await patchConfig({ bearer_token: token });
     Alert.alert("New bearer token generated", "Copy it now — it's the only way external MCP clients can connect.");
   }, [patchConfig]);
+
+  // Keep the editable draft in sync when the token changes elsewhere
+  // (generate / import / chroot-sync / redis restore).
+  useEffect(() => { setBearerDraft(config?.bearer_token || ""); }, [config?.bearer_token]);
+
+  const commitBearerDraft = useCallback(() => {
+    const v = bearerDraft.replace(/\s/g, "").toLowerCase();
+    if (v !== (config?.bearer_token || "")) patchConfig({ bearer_token: v });
+  }, [bearerDraft, config?.bearer_token, patchConfig]);
 
   const handleImportToken = useCallback(async () => {
     try {
@@ -1529,7 +1537,15 @@ export default function MCPTab() {
       if (!opts.silent) Alert.alert("No command set", "Configure chroot_yaml_cmd first.");
       return null;
     }
-    if (!HAS_NATIVE_ROOT) {
+    const sshActive = getActiveBackend() === "ssh";
+    if (sshActive) {
+      // SSH backend: read the yaml straight out of the Kalidroid VM over the
+      // SSH channel — no chroot wrap, no device root.
+      if (!HAS_NATIVE_SSH) {
+        if (!opts.silent) Alert.alert("SSH unavailable", "Enable & connect the SSH backend first (Settings).");
+        return null;
+      }
+    } else if (!HAS_NATIVE_ROOT) {
       if (!opts.silent) {
         Alert.alert("Root shell unavailable",
           "This works only on the deployed APK (not Expo Go / web preview). " +
@@ -1538,18 +1554,19 @@ export default function MCPTab() {
       return null;
     }
     setChrootSyncStatus("running");
-    setChrootSyncMsg("reading chroot yaml…");
+    setChrootSyncMsg(sshActive ? "reading yaml over SSH…" : "reading chroot yaml…");
     try {
-      // Wrap the inner cmd with settings.chroot_path so we actually
-      // cross the data_mirror boundary into Kali.
-      const wrapped = await wrapChrootCmd(cmd);
-      const res = await execReal(wrapped);
+      // chroot mode wraps to cross the data_mirror boundary; SSH mode runs the
+      // raw command (we're already inside Kali) and routes over the SSH channel.
+      const toRun = sshActive ? cmd : await wrapChrootCmd(cmd);
+      const res = await backendExecReal(toRun);
       // execReal returns { output, exit_code, ... }. exit_code != 0 usually
       // means: chroot not mounted, file missing, or permission denied.
       if (res.exit_code !== 0 && !res.output) {
         throw new Error(`shell exit ${res.exit_code}: ${res.output || "(no output)"}`);
       }
-      const parsed = await mcpLocal.applyChrootYaml(res.output || "");
+      // Strip CRs — an SSH PTY exec emits \r\n line endings.
+      const parsed = await mcpLocal.applyChrootYaml((res.output || "").replace(/\r/g, ""));
       if (parsed.imported.length === 0) {
         setChrootSyncStatus("failed");
         const msg = `nothing imported (skipped: ${parsed.skipped.join(", ") || "none"})`;
@@ -2076,11 +2093,18 @@ export default function MCPTab() {
             </Text>
 
             <View style={[s.tokenBox, { marginTop: 14 }]}>
-              <Text style={s.tokenText} selectable>
-                {!config.bearer_token
-                  ? "(no token yet — tap REGENERATE)"
-                  : tokenVisible ? config.bearer_token : shortToken(config.bearer_token)}
-              </Text>
+              <TextInput
+                style={[s.tokenText, { padding: 0 }]}
+                value={bearerDraft}
+                onChangeText={setBearerDraft}
+                onBlur={commitBearerDraft}
+                secureTextEntry={!tokenVisible}
+                autoCapitalize="none"
+                autoCorrect={false}
+                autoComplete="off"
+                placeholder="(no token — type/paste, IMPORT, or REGEN)"
+                placeholderTextColor={C.textDim}
+              />
             </View>
             <View style={[s.row, { marginTop: 10, gap: 6 }]}>
               <TouchableOpacity

@@ -3,7 +3,7 @@
     "name": "Enforcer",
     "slug": "wifi-enforcer",
     "version": "1.1.0",
-    "orientation": "portrait",
+    "orientation": "default",
     "icon": "./assets/images/icon.png",
     "scheme": "wifienforcer",
     "userInterfaceStyle": "dark",

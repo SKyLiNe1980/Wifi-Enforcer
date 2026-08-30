@@ -580,3 +580,53 @@ transitive org.jspecify:jspecify. Fix in withSshShell.js: append an
 block to app/build.gradle (second android{} merges into the extension).
 NOTE: icon.png / adaptive-icon.png are 1408x768 (non-square) — Expo warns but
 build proceeds; NOT the failure. Left operator's branding untouched.
+
+### SSH backend mode — MCP config.yaml sync over SSH [DONE]
+Issue: MCP tab's handleChrootSync read config.yaml via busybox-chroot wrap +
+HAS_NATIVE_ROOT gate → meaningless on stock S25U in SSH mode (no chroot).
+Fix (JS-ONLY, no native rebuild of the SSH module needed):
+- `sshBackend.ts`: added `execReal()` one-shot built on the existing native
+  executeStream (ChannelExec) — buffers stdout, own base64→utf8 decoder.
+- `backend.ts`: added `execReal()` to the selector.
+- `MCPTab.tsx` handleChrootSync: when getActiveBackend()==="ssh" → require
+  HAS_NATIVE_SSH (not root), run the RAW chroot_yaml_cmd (no wrap) via
+  backendExecReal, strip \r (SSH PTY emits \r\n) before applyChrootYaml.
+- Redis cloud roster pull confirmed working over SSH on-device (nodes green).
+- NOTE for operator: SSH runs chroot_yaml_cmd VERBATIM inside Kali, so it must
+  be a plain `cat /etc/enforcer-mcp/config.yaml` (no nethunter/nh wrapper).
+- Reaches device via a fresh JS bundle → needs an APK rebuild, but NO native
+  changes (existing SshShell module is compatible).
+
+### MCP tab — editable bearer token + orientation
+- Bug: cockpit bearer token was DISPLAY-ONLY (generate/import) → operator
+  couldn't type/paste it. Fixed: editable TextInput bound to a local
+  `bearerDraft`, committed on BLUR (not per-keystroke, to avoid restarting the
+  health-probe loop). REVEAL toggles secureTextEntry; COPY/IMPORT/REGEN kept.
+  Removed now-unused shortToken().
+- Clarified "flicking switch wiped the redis token": NOT a wipe — patchConfig
+  merges partial patches. Redis restores PER-NODE bearer tokens; the cockpit's
+  own config.bearer_token is separate and was simply empty (hence the correct
+  "token mismatch"). Editable field lets operator set it to match a node.
+- Orientation: app.json "portrait" → "default" (landscape now supported —
+  useful for the terminal). Needs a rebuild (native config); MCPTab change is
+  JS. No native-module changes, so still a straightforward build.
+
+### SWAT — registration-timeout fallback + mesh bearer editable (reminder)
+- "Server Error: Registration timeout" is emitted by ERGO (server), not the
+  app: WS connected but client never completed NICK/USER→001 in time. Prime
+  suspect = SASL/CAP handshake stalling (Phase C). Fix: added `regTimer` — 9s
+  after socket open, if 001 hasn't landed, force `CAP END` + `register()` so a
+  stalled CAP can't hang us into the server's kill. Cleared on 001 / close /
+  reconnect / disconnect. If timeout persists AFTER rebuild → it's the Ergo box
+  (operator noted it has a tailnet/health problem), not the client.
+- Mesh bearer editable fix (editable TextInput + bearerDraft/onBlur) is already
+  in code from a prior turn — lands on next rebuild.
+
+### SWAT — IRC-over-WS subprotocol fix (registration timeout)
+Ergo log showed the S25U connecting from the phone's tail IP (100.114.63.84,
+correct — SWAT WS runs on the Android host, not the VM) but never registering
+→ "Registration timeout". Root cause: our WebSocket requested NO subprotocol,
+so Ergo's ws listener accepted the socket but didn't parse NICK/USER as IRC.
+Fix: `new WebSocket(url, ["text.ircv3.net"])` (IRCv3 WS subprotocol; one IRC
+msg per UTF-8 text frame). Needs rebuild. If S10 runs IDENTICAL code and still
+connects without it, look next at Ergo reverse-DNS/ident stall on that IP.
