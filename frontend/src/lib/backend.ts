@@ -45,3 +45,8 @@ export function resizeSession(sessionId: string, cols: number, rows: number): Pr
 export function hasStreaming(): boolean {
   return active === "ssh" ? ssh.HAS_NATIVE_SSH : chroot.hasNativeStreaming();
 }
+
+/** One-shot exec on the active backend. Same shape as rootShell.execReal. */
+export function execReal(command: string) {
+  return active === "ssh" ? ssh.execReal(command) : chroot.execReal(command);
+}

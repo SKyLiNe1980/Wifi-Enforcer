@@ -580,3 +580,19 @@ transitive org.jspecify:jspecify. Fix in withSshShell.js: append an
 block to app/build.gradle (second android{} merges into the extension).
 NOTE: icon.png / adaptive-icon.png are 1408x768 (non-square) — Expo warns but
 build proceeds; NOT the failure. Left operator's branding untouched.
+
+### SSH backend mode — MCP config.yaml sync over SSH [DONE]
+Issue: MCP tab's handleChrootSync read config.yaml via busybox-chroot wrap +
+HAS_NATIVE_ROOT gate → meaningless on stock S25U in SSH mode (no chroot).
+Fix (JS-ONLY, no native rebuild of the SSH module needed):
+- `sshBackend.ts`: added `execReal()` one-shot built on the existing native
+  executeStream (ChannelExec) — buffers stdout, own base64→utf8 decoder.
+- `backend.ts`: added `execReal()` to the selector.
+- `MCPTab.tsx` handleChrootSync: when getActiveBackend()==="ssh" → require
+  HAS_NATIVE_SSH (not root), run the RAW chroot_yaml_cmd (no wrap) via
+  backendExecReal, strip \r (SSH PTY emits \r\n) before applyChrootYaml.
+- Redis cloud roster pull confirmed working over SSH on-device (nodes green).
+- NOTE for operator: SSH runs chroot_yaml_cmd VERBATIM inside Kali, so it must
+  be a plain `cat /etc/enforcer-mcp/config.yaml` (no nethunter/nh wrapper).
+- Reaches device via a fresh JS bundle → needs an APK rebuild, but NO native
+  changes (existing SshShell module is compatible).

@@ -26,6 +26,8 @@ import {
   type MCPConfig, type MCPTool, type MCPAuditEntry, type MCPNode,
 } from "../lib/localDb";
 import { startStream, killStream, hasNativeStreaming, execReal, HAS_NATIVE_ROOT } from "../lib/rootShell";
+import { HAS_NATIVE_SSH } from "../lib/sshBackend";
+import { getActiveBackend, execReal as backendExecReal } from "../lib/backend";
 import { detectTailnetIp } from "../lib/tailnetDetect";
 import {
   prepareDebPayload, detectTailscaleIp, startHttpServer, stopHttpServer,
@@ -1529,7 +1531,15 @@ export default function MCPTab() {
       if (!opts.silent) Alert.alert("No command set", "Configure chroot_yaml_cmd first.");
       return null;
     }
-    if (!HAS_NATIVE_ROOT) {
+    const sshActive = getActiveBackend() === "ssh";
+    if (sshActive) {
+      // SSH backend: read the yaml straight out of the Kalidroid VM over the
+      // SSH channel — no chroot wrap, no device root.
+      if (!HAS_NATIVE_SSH) {
+        if (!opts.silent) Alert.alert("SSH unavailable", "Enable & connect the SSH backend first (Settings).");
+        return null;
+      }
+    } else if (!HAS_NATIVE_ROOT) {
       if (!opts.silent) {
         Alert.alert("Root shell unavailable",
           "This works only on the deployed APK (not Expo Go / web preview). " +
@@ -1538,18 +1548,19 @@ export default function MCPTab() {
       return null;
     }
     setChrootSyncStatus("running");
-    setChrootSyncMsg("reading chroot yaml…");
+    setChrootSyncMsg(sshActive ? "reading yaml over SSH…" : "reading chroot yaml…");
     try {
-      // Wrap the inner cmd with settings.chroot_path so we actually
-      // cross the data_mirror boundary into Kali.
-      const wrapped = await wrapChrootCmd(cmd);
-      const res = await execReal(wrapped);
+      // chroot mode wraps to cross the data_mirror boundary; SSH mode runs the
+      // raw command (we're already inside Kali) and routes over the SSH channel.
+      const toRun = sshActive ? cmd : await wrapChrootCmd(cmd);
+      const res = await backendExecReal(toRun);
       // execReal returns { output, exit_code, ... }. exit_code != 0 usually
       // means: chroot not mounted, file missing, or permission denied.
       if (res.exit_code !== 0 && !res.output) {
         throw new Error(`shell exit ${res.exit_code}: ${res.output || "(no output)"}`);
       }
-      const parsed = await mcpLocal.applyChrootYaml(res.output || "");
+      // Strip CRs — an SSH PTY exec emits \r\n line endings.
+      const parsed = await mcpLocal.applyChrootYaml((res.output || "").replace(/\r/g, ""));
       if (parsed.imported.length === 0) {
         setChrootSyncStatus("failed");
         const msg = `nothing imported (skipped: ${parsed.skipped.join(", ") || "none"})`;
