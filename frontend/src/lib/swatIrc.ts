@@ -72,6 +72,10 @@ const MAX_EVENTS = 500;
 let ws: WebSocket | null = null;
 let wantConnected = false;
 let reconnectTimer: any = null;
+// Fallback: if IRC registration (→ 001) doesn't land shortly after the socket
+// opens, force NICK/USER so a stalled CAP/SASL negotiation can't hang us into
+// the server's "Registration timeout" kill.
+let regTimer: any = null;
 let attempts = 0; // exponential-backoff counter (reset on successful register)
 let cfg: SwatConfig | null = null;
 let uidN = 0;
@@ -388,6 +392,7 @@ function handleLine(line: string) {
       break;
     }
     case "001": // welcome → join
+      if (regTimer) { clearTimeout(regTimer); regTimer = null; }
       rawSend(`JOIN ${chan}`);
       pushEvent("*", `connected to ${state.host} — joining ${chan}`, { system: true, color: "grey" });
       attempts = 0; // successful registration → reset backoff
@@ -485,6 +490,7 @@ export async function connectSwat() {
   saslPassword = await readSaslPassword();
   wantConnected = true;
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  if (regTimer) { clearTimeout(regTimer); regTimer = null; }
   if (ws) { try { ws.close(); } catch { /* noop */ } ws = null; }
   // Start the Android foreground service (keeps process + WS alive in bg).
   busStart(c.nick, c.channel);
@@ -501,6 +507,17 @@ export async function connectSwat() {
       } else {
         register();
       }
+      // Safety net: if 001 hasn't arrived in 9s, the CAP/SASL handshake stalled
+      // (or the server never answered) — abort caps and register plain so we
+      // don't sit until Ergo kills us with "Registration timeout".
+      if (regTimer) clearTimeout(regTimer);
+      regTimer = setTimeout(() => {
+        if (ws === sock && state.status !== "connected") {
+          pushEvent("*", "registration slow — forcing NICK/USER (CAP END)", { system: true, color: "yellow" });
+          rawSend("CAP END");
+          register();
+        }
+      }, 9000);
     };
     sock.onmessage = (ev: any) => {
       const data: string = typeof ev.data === "string" ? ev.data : String(ev.data);
@@ -514,6 +531,7 @@ export async function connectSwat() {
       // replaced it) so we can't double-schedule reconnects → storm.
       if (ws !== sock) return;
       ws = null;
+      if (regTimer) { clearTimeout(regTimer); regTimer = null; }
       if (wantConnected) {
         // exponential backoff 1s → 60s cap; keep status "connecting" so the
         // LED/notification reads yellow while we retry.
@@ -534,6 +552,7 @@ export function disconnectSwat() {
   wantConnected = false;
   attempts = 0;
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  if (regTimer) { clearTimeout(regTimer); regTimer = null; }
   if (ws) { try { ws.close(); } catch { /* noop */ } ws = null; }
   busStop();
   set({ status: "down", roster: [] });

@@ -610,3 +610,14 @@ Fix (JS-ONLY, no native rebuild of the SSH module needed):
 - Orientation: app.json "portrait" → "default" (landscape now supported —
   useful for the terminal). Needs a rebuild (native config); MCPTab change is
   JS. No native-module changes, so still a straightforward build.
+
+### SWAT — registration-timeout fallback + mesh bearer editable (reminder)
+- "Server Error: Registration timeout" is emitted by ERGO (server), not the
+  app: WS connected but client never completed NICK/USER→001 in time. Prime
+  suspect = SASL/CAP handshake stalling (Phase C). Fix: added `regTimer` — 9s
+  after socket open, if 001 hasn't landed, force `CAP END` + `register()` so a
+  stalled CAP can't hang us into the server's kill. Cleared on 001 / close /
+  reconnect / disconnect. If timeout persists AFTER rebuild → it's the Ergo box
+  (operator noted it has a tailnet/health problem), not the client.
+- Mesh bearer editable fix (editable TextInput + bearerDraft/onBlur) is already
+  in code from a prior turn — lands on next rebuild.
