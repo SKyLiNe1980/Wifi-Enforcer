@@ -36,11 +36,12 @@ export default function SshBackendPanel({
   const [authMode, setAuthMode] = useState<"password" | "key">(config.authMode);
   const [pw, setPw] = useState("");   // blank keeps stored
   const [key, setKey] = useState(""); // blank keeps stored
+  const [chrootBoot, setChrootBoot] = useState(config.chrootBootstrap);
 
   // Re-sync drafts if the persisted config changes underneath us.
   useEffect(() => {
     setEnabled(config.enabled); setHost(config.host); setPort(String(config.port));
-    setUser(config.user); setAuthMode(config.authMode);
+    setUser(config.user); setAuthMode(config.authMode); setChrootBoot(config.chrootBootstrap);
   }, [config]);
 
   const apply = () => {
@@ -52,6 +53,7 @@ export default function SshBackendPanel({
         user: user.trim() || "kali",
         authMode,
         fingerprint: config.fingerprint,
+        chrootBootstrap: chrootBoot,
       },
       pw,
       key,
@@ -136,6 +138,18 @@ export default function SshBackendPanel({
             placeholderTextColor={C.textDim} />
         </View>
       )}
+
+      <View style={st.enableRow}>
+        <Switch
+          value={chrootBoot}
+          onValueChange={setChrootBoot}
+          trackColor={{ false: C.border, true: "#0a3a22" }}
+          thumbColor={chrootBoot ? C.green : C.textDim}
+        />
+        <Text style={st.enableLbl}>
+          {"  NetHunter chroot target — start sshd via helper if it's down"}
+        </Text>
+      </View>
 
       {config.fingerprint ? (
         <Text style={st.fp}>trusted host key: {config.fingerprint}</Text>

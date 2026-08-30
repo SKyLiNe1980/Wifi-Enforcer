@@ -448,6 +448,18 @@ export default function App() {
     const { password, privateKey } = await readSshSecrets();
     setSshStatus("connecting");
     setSshStatusDetail("");
+    // Chroot bootstrap: if this is a NetHunter-chroot target, use the local
+    // root helper to start sshd when it's down — the ONE thing SSH can't do
+    // for itself (start the daemon we're about to connect to). Skips silently
+    // on rootless devices (Kalidroid/remote targets leave this off).
+    if (cfg.chrootBootstrap && HAS_NATIVE_ROOT) {
+      setSshStatusDetail("bootstrapping sshd in chroot…");
+      try {
+        await execReal(
+          `${chrootPath} sh -c 'pgrep -x sshd >/dev/null 2>&1 || service ssh start >/dev/null 2>&1 || /usr/sbin/sshd'`,
+        );
+      } catch { /* best-effort; connect attempt below will surface real errors */ }
+    }
     try {
       await sshConnect({
         host: cfg.host,
@@ -460,7 +472,7 @@ export default function App() {
       setSshStatus("error");
       setSshStatusDetail(e?.message || "connect failed");
     }
-  }, []);
+  }, [chrootPath]);
 
   useEffect(() => {
     let mounted = true;

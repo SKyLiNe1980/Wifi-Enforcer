@@ -76,6 +76,7 @@ let reconnectTimer: any = null;
 // opens, force NICK/USER so a stalled CAP/SASL negotiation can't hang us into
 // the server's "Registration timeout" kill.
 let regTimer: any = null;
+let nickTries = 0; // 433 collision retries (reset per connect)
 let attempts = 0; // exponential-backoff counter (reset on successful register)
 let cfg: SwatConfig | null = null;
 let uidN = 0;
@@ -391,8 +392,24 @@ function handleLine(line: string) {
       register();
       break;
     }
+    case "433": { // ERR_NICKNAMEINUSE — auto-suffix so a dupe nick (e.g. both
+                  // S10 + S25U as "Enforcer-Operator") can't silently fail.
+      const base = cfg?.nick || "Enforcer-Operator";
+      if (nickTries >= 5) {
+        set({ error: `nick "${base}" and retries in use — set a unique nick` });
+        pushEvent("*", `nick "${base}" in use — giving up after 5 tries; pick a unique nick`, { system: true, color: "red" });
+        break;
+      }
+      nickTries += 1;
+      const alt = `${base}_${nickTries}`;
+      pushEvent("*", `nick "${base}" in use — retrying as ${alt}`, { system: true, color: "yellow" });
+      rawSend(`NICK ${alt}`);
+      set({ nick: alt });
+      break;
+    }
     case "001": // welcome → join
       if (regTimer) { clearTimeout(regTimer); regTimer = null; }
+      nickTries = 0;
       rawSend(`JOIN ${chan}`);
       pushEvent("*", `connected to ${state.host} — joining ${chan}`, { system: true, color: "grey" });
       attempts = 0; // successful registration → reset backoff
@@ -489,6 +506,7 @@ export async function connectSwat() {
   const c = await loadSwatConfig();
   saslPassword = await readSaslPassword();
   wantConnected = true;
+  nickTries = 0;
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
   if (regTimer) { clearTimeout(regTimer); regTimer = null; }
   if (ws) { try { ws.close(); } catch { /* noop */ } ws = null; }

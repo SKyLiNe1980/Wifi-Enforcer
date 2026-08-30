@@ -630,3 +630,18 @@ so Ergo's ws listener accepted the socket but didn't parse NICK/USER as IRC.
 Fix: `new WebSocket(url, ["text.ircv3.net"])` (IRCv3 WS subprotocol; one IRC
 msg per UTF-8 text frame). Needs rebuild. If S10 runs IDENTICAL code and still
 connects without it, look next at Ergo reverse-DNS/ident stall on that IP.
+
+### SWAT 433 nick-collision + SSH chroot-bootstrap preflight
+Decision (with operator + Herm): keep chroot helper BENCHED as fallback/backup,
+review in a few weeks. SSH = default operational transport everywhere incl. the
+NetHunter chroot's own sshd. Helper's one durable job = bootstrap/break-glass.
+- 433 fix (swatIrc.ts): on ERR_NICKNAMEINUSE auto-suffix nick (base_1..base_5)
+  with a visible feed line; gives up after 5 with a clear error. Root cause of
+  the silent SWAT fail: S10 + S25U both "Enforcer-Operator". nickTries reset
+  per connect + on 001.
+- Chroot bootstrap preflight: SshBackendConfig.chrootBootstrap (panel toggle).
+  On connect, if set AND HAS_NATIVE_ROOT → helper runs
+  `<chrootPath> sh -c 'pgrep -x sshd || service ssh start || /usr/sbin/sshd'`
+  BEFORE sshConnect (the one thing SSH can't do for itself). Skips on rootless.
+  Host-Android root actions (landing-page wifi) untouched — separate host su.
+- Both JS-only; need rebuild. No native changes.
