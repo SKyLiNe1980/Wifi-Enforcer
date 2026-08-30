@@ -10,7 +10,7 @@
  * (e.g. airodump on wlan2, tcpdump on wlan3, wifite on wlan4) can run
  * simultaneously.
  */
-import { startStream, killStream, hasNativeStreaming, writeStdin, resizeSession } from "./rootShell";
+import { startStream, killStream, hasStreaming, writeStdin, resizeSession } from "./backend";
 
 export type LineRecord = {
   stream: "stdout" | "stderr";
@@ -208,7 +208,7 @@ class SessionManager {
     // hasn't built its method table yet when rootShell.ts is first evaluated.
     // forceMock=true also routes us into the mock branch (when user globally
     // chose MOCK exec mode in settings).
-    const streamingAvailable = !opts.forceMock && hasNativeStreaming();
+    const streamingAvailable = !opts.forceMock && hasStreaming();
     state.mocked = !streamingAvailable;
 
     // Register with backend (best-effort)

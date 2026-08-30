@@ -22,7 +22,9 @@ import { Alert, Platform, StyleSheet, Text, TouchableOpacity, View } from "react
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import * as Clipboard from "expo-clipboard";
 import { sessionManager, SessionState } from "../lib/sessionManager";
-import { hasNativeStreaming, HAS_NATIVE_ROOT, writeStdin } from "../lib/rootShell";
+import { hasNativeStreaming, HAS_NATIVE_ROOT } from "../lib/rootShell";
+import { HAS_NATIVE_SSH } from "../lib/sshBackend";
+import { writeStdin } from "../lib/backend";
 import XTermView from "./XTermView";
 
 const C = {
@@ -36,6 +38,9 @@ const MONO = Platform.select({ ios: "Menlo", android: "monospace", default: "mon
 type Props = {
   execMode: "mock" | "real" | "kali";
   wrap: (cmd: string) => string;
+  /** When true, the transport is an SSH session that drops us straight into a
+   *  real login PTY — so no chroot wrap and no `script`/`stty` hack. */
+  sshMode?: boolean;
   /** Optional: a one-shot command to inject as if the user typed it.
    *  Quick action buttons use this to fire commands into the shell. */
   pendingInjection?: { id: number; cmd: string };
@@ -72,12 +77,16 @@ const persistent: { sessionId: string | null } = { sessionId: null };
  *     size on purpose for Rich.Live animation stability.)
  *   - `script -qf` — the `-f` flushes output per write; without it script
  *     block-buffers ~4KB and small outputs feel "stuck".
+ *
+ * SSH mode: returns "" — the SSH ChannelShell IS a real login PTY, so we open
+ * a bare shell (no chroot prefix, no `script`).
  */
-function shellInvocation(): string {
+function shellInvocation(sshMode: boolean): string {
+  if (sshMode) return "";
   return `SHELL=/bin/zsh HOME=/root TERM=xterm-256color COLORTERM=truecolor FORCE_COLOR=1 PYTHONUNBUFFERED=1 script -qfc 'zsh -l || bash -l' /dev/null`;
 }
 
-export default function TerminalShell({ execMode, wrap, pendingInjection }: Props) {
+export default function TerminalShell({ execMode, wrap, sshMode = false, pendingInjection }: Props) {
   const [sessionId, setSessionId] = useState<string | null>(persistent.sessionId);
   const [, force] = useState(0);
   const lastInjectionRef = useRef<number | null>(null);
@@ -98,23 +107,31 @@ export default function TerminalShell({ execMode, wrap, pendingInjection }: Prop
 
   // ─── Start / stop ─────────────────────────────────────────────────────
   const handleStart = useCallback(async () => {
-    if (!HAS_NATIVE_ROOT || !hasNativeStreaming()) {
-      Alert.alert(
-        "Native build required",
-        "Persistent shell needs the native streaming bridge. Build the APK (`eas build -p android --profile preview`) and run on your device.",
-      );
-      return;
-    }
-    if (execMode === "mock") {
-      Alert.alert(
-        "Preview mode",
-        "Switch to ANDROID or KALI in Settings → execution mode to spawn a real persistent shell.",
-      );
-      return;
+    if (sshMode) {
+      // SSH transport — independent of device root / execMode.
+      if (!HAS_NATIVE_SSH) {
+        Alert.alert("Native build required", "SSH backend needs the native APK build.");
+        return;
+      }
+    } else {
+      if (!HAS_NATIVE_ROOT || !hasNativeStreaming()) {
+        Alert.alert(
+          "Native build required",
+          "Persistent shell needs the native streaming bridge. Build the APK (`eas build -p android --profile preview`) and run on your device.",
+        );
+        return;
+      }
+      if (execMode === "mock") {
+        Alert.alert(
+          "Preview mode",
+          "Switch to ANDROID or KALI in Settings → execution mode to spawn a real persistent shell.",
+        );
+        return;
+      }
     }
     try {
       const id = await sessionManager.start({
-        command: wrap(shellInvocation()),
+        command: wrap(shellInvocation(sshMode)),
         label: "shell",
         owner: "kali",
       });
@@ -124,7 +141,7 @@ export default function TerminalShell({ execMode, wrap, pendingInjection }: Prop
     } catch (e: any) {
       Alert.alert("Failed to start shell", e?.message || "Unknown error");
     }
-  }, [execMode, wrap]);
+  }, [execMode, wrap, sshMode]);
 
   const handleStop = useCallback(() => {
     if (!sessionId) return;
