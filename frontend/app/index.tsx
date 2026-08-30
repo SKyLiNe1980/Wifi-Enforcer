@@ -31,6 +31,15 @@ import MCPTab from "../src/components/MCPTab";
 import SwatTab from "../src/components/SwatTab";
 import TerminalShell from "../src/components/TerminalShell";
 import WlanControl from "../src/components/WlanControl";
+import SshBackendPanel, { type SshStatus } from "../src/components/SshBackendPanel";
+import { setActiveBackend } from "../src/lib/backend";
+import {
+  loadSshConfig, saveSshConfig, readSshSecrets, writeSshPassword, writeSshKey,
+  type SshBackendConfig,
+} from "../src/lib/sshConfig";
+import {
+  sshConnect, sshDisconnect, onSshState, onSshHostKey, HAS_NATIVE_SSH,
+} from "../src/lib/sshBackend";
 import {
   settingsLocal,
   profilesLocal,
@@ -267,6 +276,13 @@ export default function App() {
   const [execMode, setExecMode] = useState<ExecMode>("mock");
   const [bridgeRoot, setBridgeRoot] = useState<boolean | null>(null);
   const [chrootPath, setChrootPath] = useState(NETHUNTER_CHROOT);
+  // ─── SSH backend mode ─────────────────────────────────────────────────────
+  const [backendKind, setBackendKind] = useState<"chroot" | "ssh">("chroot");
+  const [sshCfg, setSshCfg] = useState<SshBackendConfig | null>(null);
+  const [sshStatus, setSshStatus] = useState<SshStatus>("down");
+  const [sshStatusDetail, setSshStatusDetail] = useState("");
+  const [sshSavedPw, setSshSavedPw] = useState(false);
+  const [sshSavedKey, setSshSavedKey] = useState(false);
   const termRef = useRef<ScrollView>(null);
 
   // ─── Settings sub-tabs ───────────────────────────────────────────────────
@@ -415,6 +431,8 @@ export default function App() {
 
   // Wrap a command for the current exec mode (frontend-side wrapping for kali)
   const wrapForMode = useCallback((cmd: string): string => {
+    // SSH backend lands us INSIDE Kali already — no chroot prefix.
+    if (backendKind === "ssh") return cmd;
     if (execMode === "kali") {
       // OffSec NetHunter wrap: bootkali's only non-interactive arbitrary-cmd interface
       // is `bootkali custom_cmd <command>`. The helper word-concats args and runs
@@ -422,7 +440,96 @@ export default function App() {
       return `${chrootPath} ${cmd}`;
     }
     return cmd;
-  }, [execMode, chrootPath]);
+  }, [execMode, chrootPath, backendKind]);
+
+  // ─── SSH backend lifecycle ────────────────────────────────────────────────
+  const applySshConnection = useCallback(async (cfg: SshBackendConfig) => {
+    if (!HAS_NATIVE_SSH) return;
+    const { password, privateKey } = await readSshSecrets();
+    setSshStatus("connecting");
+    setSshStatusDetail("");
+    try {
+      await sshConnect({
+        host: cfg.host,
+        port: cfg.port,
+        username: cfg.user,
+        password: cfg.authMode === "password" ? password : undefined,
+        privateKey: cfg.authMode === "key" ? privateKey : undefined,
+      });
+    } catch (e: any) {
+      setSshStatus("error");
+      setSshStatusDetail(e?.message || "connect failed");
+    }
+  }, []);
+
+  useEffect(() => {
+    let mounted = true;
+    (async () => {
+      const cfg = await loadSshConfig();
+      const secrets = await readSshSecrets();
+      if (!mounted) return;
+      setSshCfg(cfg);
+      setSshSavedPw(!!secrets.password);
+      setSshSavedKey(!!secrets.privateKey);
+      if (cfg.enabled && HAS_NATIVE_SSH) {
+        setBackendKind("ssh");
+        setActiveBackend("ssh");
+        applySshConnection(cfg);
+      }
+    })();
+    const offState = onSshState((e) => {
+      if (!mounted) return;
+      setSshStatus(e.state === "connected" ? "connected" : e.state === "error" ? "error" : "down");
+      setSshStatusDetail(e.detail || "");
+    });
+    const offKey = onSshHostKey((e) => {
+      if (!mounted) return;
+      setSshCfg((prev) => {
+        if (!prev) return prev;
+        if (prev.fingerprint && prev.fingerprint !== e.fingerprint) {
+          Alert.alert(
+            "⚠ SSH host key changed",
+            `stored: ${prev.fingerprint}\nnow:    ${e.fingerprint}\n\nIf you didn't rebuild the VM this could be a MITM. Only keep using it if you expected the change.`,
+          );
+          return prev;
+        }
+        const next = { ...prev, fingerprint: e.fingerprint }; // TOFU store-on-first-sight
+        saveSshConfig(next).catch(() => {});
+        return next;
+      });
+    });
+    return () => { mounted = false; offState(); offKey(); };
+  }, [applySshConnection]);
+
+  const handleSshApply = useCallback(async (cfg: SshBackendConfig, pw: string, key: string) => {
+    if (pw) { await writeSshPassword(pw); setSshSavedPw(true); }
+    if (key) { await writeSshKey(key); setSshSavedKey(true); }
+    await saveSshConfig(cfg);
+    setSshCfg(cfg);
+    if (cfg.enabled) {
+      setBackendKind("ssh");
+      setActiveBackend("ssh");
+      await applySshConnection(cfg);
+    } else {
+      setBackendKind("chroot");
+      setActiveBackend("chroot");
+      await sshDisconnect();
+      setSshStatus("down");
+    }
+  }, [applySshConnection]);
+
+  const handleSshDisconnect = useCallback(async () => {
+    await sshDisconnect();
+    setSshStatus("down");
+    setBackendKind("chroot");
+    setActiveBackend("chroot");
+    setSshCfg((prev) => {
+      if (!prev) return prev;
+      const next = { ...prev, enabled: false };
+      saveSshConfig(next).catch(() => {});
+      return next;
+    });
+  }, []);
 
   const fetchAll = useCallback(async () => {
     setResource("profiles", { kind: "loading" });
@@ -1074,7 +1181,11 @@ export default function App() {
       </View>
 
       {terminalMode === "shell" ? (
-        <TerminalShell execMode={execMode} wrap={wrapForMode} />
+        <TerminalShell
+          execMode={backendKind === "ssh" ? "kali" : execMode}
+          wrap={wrapForMode}
+          sshMode={backendKind === "ssh"}
+        />
       ) : (
         <>
           <ScrollView ref={termRef} style={{ flex: 1, backgroundColor: "#02050a" }}
@@ -1495,6 +1606,18 @@ export default function App() {
           </Text>
         </View>
       )}
+
+      {sshCfg ? (
+        <SshBackendPanel
+          config={sshCfg}
+          status={sshStatus}
+          statusDetail={sshStatusDetail}
+          savedPw={sshSavedPw}
+          savedKey={sshSavedKey}
+          onApply={handleSshApply}
+          onDisconnect={handleSshDisconnect}
+        />
+      ) : null}
 
       <View style={s.sectionRow}>
         <Text style={s.sectionTitle}>// pcap endpoints ({pcapEndpointsList.length})</Text>

@@ -532,3 +532,27 @@ Built this phase (all APK-only, cannot run in web/Expo Go):
   store+warn). Password/private key in SecureStore. Connection status + reconnect.
   Reuse existing provisioning SSH key material (locate source).
 - Phase 3: route AI + Live tabs through the selector (AI wrap backend-aware).
+
+### SSH backend mode — Phase 2 (selector + settings + Terminal) [DONE]
+Confirmed: S25U test target is STOCK (no root) — SSH path is fully root-
+independent (connects over the network to Kalidroid's forwarded sshd). The
+chroot-side key /root/.ssh/enforcer_cockpit is NOT used (wrong context); auth
+is password (Kalidroid default kali/kali) or a pasted private key.
+- `src/lib/backend.ts` — transport selector routing startStream/killStream/
+  writeStdin/resizeSession/hasStreaming to chroot|ssh. Default chroot.
+- `sessionManager.ts` now imports from backend.ts (hasNativeStreaming→hasStreaming).
+- `src/lib/sshConfig.ts` — kv config (enabled/host/port/user/authMode/
+  fingerprint) + password & key in SecureStore.
+- `src/components/SshBackendPanel.tsx` — Settings panel: enable switch, host/
+  port/user, PASSWORD|KEY toggle, secure fields, status dot, TOFU fingerprint,
+  APPLY & CONNECT / DISCONNECT.
+- `app/index.tsx` — backendKind state; wrapForMode → identity in ssh; SSH
+  lifecycle (load config+secrets on mount, connect if enabled, onSshState/
+  onSshHostKey subs with TOFU store+warn); renders SshBackendPanel; passes
+  sshMode + execMode="kali" to TerminalShell when ssh.
+- `TerminalShell.tsx` — sshMode prop: bypasses root/exec-mode gates (needs only
+  HAS_NATIVE_SSH), shellInvocation()→"" (bare ChannelShell login PTY), writeStdin
+  routed via backend.
+- Build: main bundle 1369 modules, tsc/lint clean. APK-only to actually run.
+- Phase 3 (next): route AI + Live tabs through the selector (treat ssh as non-
+  mock, AI wrap backend-aware). Then tier-2 chroot-native pty daemon.
