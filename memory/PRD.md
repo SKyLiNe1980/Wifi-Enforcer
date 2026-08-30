@@ -621,3 +621,12 @@ Fix (JS-ONLY, no native rebuild of the SSH module needed):
   (operator noted it has a tailnet/health problem), not the client.
 - Mesh bearer editable fix (editable TextInput + bearerDraft/onBlur) is already
   in code from a prior turn — lands on next rebuild.
+
+### SWAT — IRC-over-WS subprotocol fix (registration timeout)
+Ergo log showed the S25U connecting from the phone's tail IP (100.114.63.84,
+correct — SWAT WS runs on the Android host, not the VM) but never registering
+→ "Registration timeout". Root cause: our WebSocket requested NO subprotocol,
+so Ergo's ws listener accepted the socket but didn't parse NICK/USER as IRC.
+Fix: `new WebSocket(url, ["text.ircv3.net"])` (IRCv3 WS subprotocol; one IRC
+msg per UTF-8 text frame). Needs rebuild. If S10 runs IDENTICAL code and still
+connects without it, look next at Ergo reverse-DNS/ident stall on that IP.

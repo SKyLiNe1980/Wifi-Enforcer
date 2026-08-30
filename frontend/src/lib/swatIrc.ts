@@ -497,7 +497,11 @@ export async function connectSwat() {
   const scheme = c.tls ? "wss" : "ws";
   set({ status: "connecting", host: `${c.host}:${c.port}`, nick: c.nick, roster: [], error: null });
   try {
-    const sock = new WebSocket(`${scheme}://${c.host}:${c.port}`);
+    // Ergo's WS listener only parses a connection as IRC when the client
+    // negotiates an IRCv3 WebSocket subprotocol. Without it the socket opens
+    // but NICK/USER frames are ignored → server kills us with "Registration
+    // timeout". text.ircv3.net = one IRC message per (UTF-8) text frame.
+    const sock = new WebSocket(`${scheme}://${c.host}:${c.port}`, ["text.ircv3.net"]);
     ws = sock;
     sock.onopen = () => {
       // If SASL is configured, negotiate caps FIRST; NICK/USER get sent from
