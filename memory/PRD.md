@@ -645,3 +645,48 @@ NetHunter chroot's own sshd. Helper's one durable job = bootstrap/break-glass.
   BEFORE sshConnect (the one thing SSH can't do for itself). Skips on rootless.
   Host-Android root actions (landing-page wifi) untouched — separate host su.
 - Both JS-only; need rebuild. No native changes.
+
+### MCP RESYNC-all fan-out + Live-tab inline endpoint quick-add
+Two operator-reported bugs (JS-only; land on next rebuild):
+- BUG 1 — "RESYNC" (resync all) missed nodes that per-node SYNC TOOLS found.
+  Root cause: handleManualResync only pulled /tools from the single cockpit
+  probe host, never the remote nodes. Fix (MCPTab.tsx): RESYNC now fans out
+  across the cockpit + every ENABLED node currently reporting "running" (green,
+  nodeHealth[id]==="running") with a bearer token, syncs each silently, merges
+  (SQLite upserts tools by name), marks per-node tool_count, and reports an
+  aggregate: "+N new · M updated · T total · K/S sources (F failed)". Unreachable
+  nodes are skipped so a dead VPS can't stall the batch.
+- BUG 2 — Live tab endpoint-picker was a dead-end ("add one in Settings").
+  Fix (LiveTab.tsx): added an inline "+ add endpoint" quick-add form INSIDE the
+  picker modal (name/host/port/tcp-udp) → pcapEndpointsLocal.upsert → refresh,
+  no need to leave Live. Validates name+host required, port 1-65535.
+- Verification: web preview can't run these (expo-sqlite web worker crash =
+  known blank screen). Both files compile clean (metro bundle OK, lint clean).
+  Must be verified on a real APK build.
+
+### Phase 3b — Quick-scans routed through SSH backend selector
+Dashboard quick-tab commands (execute + runProfile) previously called
+rootShell.execReal / RootShell.execBatch DIRECTLY and gated on HAS_NATIVE_ROOT,
+so on a rootless SSH target (Kalidroid) they silently fell back to preview/mock.
+Fix (app/index.tsx):
+- execute(): isReal now = SSH-active ? (HAS_NATIVE_SSH && backendHasStreaming())
+  : (real/kali && HAS_NATIVE_ROOT). Actual call routes via backend.execReal
+  (SSH or su→chroot). wrapForMode already returns raw cmd for SSH (no chroot
+  prefix — we're already inside Kali).
+- runProfile(): when SSH active, runs each command SEQUENTIALLY via
+  backend.execReal (SSH has no execBatch); root/chroot path keeps execBatch.
+- Header badge now shows "SSH"/"SSH…" (cyan) when the SSH backend is active so
+  the operator knows quick-scans land on the VM, not the Android host.
+- JS-only; native bundle compiles (android bundle HTTP 200). Verify on APK.
+
+### Two quick fixes (build-and-sleep batch)
+- Redis Cloud-sync token now auto-persists on TEST + RESTORE (MCPTab.tsx):
+  handleTestCloudSync / handleDiscoverFromTailnet previously USED a freshly
+  typed token/URL without saving it, so the "•• saved ••" flag reset to unsaved
+  on the next tab remount (recurring gripe). Both now saveUpstashToken/Url +
+  setCloudSyncTokenSaved(true) the moment they use typed creds. TEST appends
+  "· creds saved" to the status line.
+- SWAT "0 online" badge fix (swatIrc.ts): set() only called busUpdate on STATUS
+  changes, so roster JOIN/PART + initial NAMES left the notification/badge stuck
+  at the last count. Now fires busUpdate on status OR roster change → live count.
+- Both JS-only, lint clean, android bundle compiles. Verify on APK.

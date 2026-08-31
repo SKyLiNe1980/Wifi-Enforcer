@@ -106,7 +106,11 @@ export function getSwatState(): State {
 function set(patch: Partial<State>) {
   state = { ...state, ...patch };
   emit();
-  if (patch.status !== undefined) {
+  // Refresh the notification/badge "N online" on BOTH status AND roster
+  // changes. Previously only status changes fired busUpdate, so JOIN/PART
+  // and the initial NAMES reply left the badge stuck at its last count
+  // (the "0 online" symptom — roster filled but the badge never caught up).
+  if (patch.status !== undefined || patch.roster !== undefined) {
     busUpdate(state.status, state.nick, cfg?.channel || "#SWAT", `${state.roster.length} online`);
   }
 }

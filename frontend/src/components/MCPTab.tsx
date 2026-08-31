@@ -665,16 +665,82 @@ export default function MCPTab() {
     );
   }, []);
 
+  // ─── RESYNC ALL ─────────────────────────────────────────────────────
+  // The top "RESYNC" button fans out across the local cockpit AND every
+  // enabled node that's currently reporting "running" (green). Previously
+  // this only hit the single cockpit probe host, so tools that live only
+  // on a remote node (e.g. a GPU rig's `hashcat`) were silently missed —
+  // even though the per-node "SYNC TOOLS" button found them. We skip
+  // unreachable / erroring nodes so one dead VPS doesn't stall the batch.
+  // Tool rows are upserted by name in SQLite, so merging across sources
+  // is safe (later sources refresh earlier definitions).
   const handleManualResync = useCallback(async () => {
     if (!config) return;
-    const host = (config.cockpit_probe_host || "127.0.0.1").trim();
-    const base = `http://${host}:${config.port}`;
     if (!config.bearer_token) {
       Alert.alert("No bearer token", "Generate or import a token first.");
       return;
     }
-    await syncToolsNow(base, config.bearer_token, { silent: false });
-  }, [config, syncToolsNow]);
+    setToolSyncStatus("syncing");
+
+    type Src = { label: string; base: string; token: string; nodeId?: string };
+    const sources: Src[] = [];
+    const cockpitHost = (config.cockpit_probe_host || "127.0.0.1").trim();
+    sources.push({
+      label: "cockpit",
+      base: `http://${cockpitHost}:${config.port}`,
+      token: config.bearer_token,
+    });
+    for (const n of nodes) {
+      if (!n.enabled) continue;
+      if (nodeHealth[n.id] !== "running") continue; // only green nodes
+      if (!n.bearer_token) continue;
+      sources.push({
+        label: n.name,
+        base: `http://${n.host}:${n.port}`,
+        token: n.bearer_token,
+        nodeId: n.id,
+      });
+    }
+
+    let totalInserted = 0;
+    let totalUpdated = 0;
+    let lastTotal = 0;
+    let okCount = 0;
+    let failCount = 0;
+    for (const src of sources) {
+      const res = await syncToolsNow(src.base, src.token, { silent: true });
+      if (res) {
+        totalInserted += res.inserted;
+        totalUpdated += res.updated;
+        lastTotal = res.total;
+        okCount++;
+        if (src.nodeId) {
+          await nodesLocal.markToolSync(src.nodeId, res.total).catch(() => {});
+        }
+      } else {
+        failCount++;
+      }
+    }
+
+    if (okCount === 0) {
+      setToolSyncStatus("failed");
+      setToolSyncMsg("all sources failed");
+      Alert.alert("Tool sync failed", "No sources responded. Check node health and bearer tokens.");
+      return;
+    }
+
+    setToolSyncStatus("synced");
+    const msg =
+      `+${totalInserted} new · ${totalUpdated} updated · ${lastTotal} total · ` +
+      `${okCount}/${sources.length} source${sources.length === 1 ? "" : "s"}` +
+      (failCount ? ` (${failCount} failed)` : "");
+    setToolSyncMsg(msg);
+    lastToolSyncRef.current = Date.now();
+    const newTools = await mcpLocal.listTools();
+    setTools(newTools);
+    refreshLists();
+    Alert.alert("Tools synced", msg);
+  }, [config, nodes, nodeHealth, syncToolsNow, refreshLists]);
 
   // ─── Per-remote-node health probe ───────────────────────────────────
   // Polls each enabled remote node's /health every 10s. Slower than the
@@ -1255,10 +1321,17 @@ export default function MCPTab() {
     setCloudSyncBusy(true);
     setCloudSyncStatus("");
     try {
-      const url = (await loadUpstashUrl()) || cloudSyncUrl.trim();
-      const tok = cloudSyncToken.trim() || (await loadUpstashToken()) || "";
+      const typedUrl = cloudSyncUrl.trim();
+      const typedTok = cloudSyncToken.trim();
+      const url = (await loadUpstashUrl()) || typedUrl;
+      const tok = typedTok || (await loadUpstashToken()) || "";
       const r = await upstashTest(url, tok);
-      setCloudSyncStatus(`ok: PING → ${r}`);
+      // Auto-persist freshly-typed creds the moment a successful TEST proves
+      // they work — stops the token field silently resetting to "not saved"
+      // on the next tab remount (the recurring "token keeps unsaving" gripe).
+      if (typedUrl) await saveUpstashUrl(typedUrl);
+      if (typedTok) { await saveUpstashToken(typedTok); setCloudSyncTokenSaved(true); }
+      setCloudSyncStatus(`ok: PING → ${r}` + (typedTok ? " · creds saved" : ""));
     } catch (e: any) {
       setCloudSyncStatus(`err: ${e?.message || e}`);
     } finally { setCloudSyncBusy(false); }
@@ -1276,9 +1349,15 @@ export default function MCPTab() {
     setCloudSyncBusy(true);
     setCloudSyncStatus("");
     try {
-      const url = (await loadUpstashUrl()) || cloudSyncUrl.trim();
-      const tok = (await loadUpstashToken()) || cloudSyncToken.trim();
+      const typedUrl = cloudSyncUrl.trim();
+      const typedTok = cloudSyncToken.trim();
+      const url = (await loadUpstashUrl()) || typedUrl;
+      const tok = (await loadUpstashToken()) || typedTok;
       if (!url || !tok) throw new Error("save + set creds first (URL + R/W token)");
+      // Auto-persist freshly-typed creds used for RESTORE so they survive the
+      // next remount instead of resetting to "not saved".
+      if (typedUrl) await saveUpstashUrl(typedUrl);
+      if (typedTok) { await saveUpstashToken(typedTok); setCloudSyncTokenSaved(true); }
 
       // Pull tailnet peers AND the Redis roster in parallel. We'll merge:
       //   • tailnet gives us live IPs + which peers are actually online now

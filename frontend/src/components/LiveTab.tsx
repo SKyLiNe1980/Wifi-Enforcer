@@ -135,6 +135,24 @@ export default function LiveTab(props: Props) {
   const [endpointPickerOpen, setEndpointPickerOpen] = useState(false);
   const [pendingProfile, setPendingProfile] = useState<AttackProfile | null>(null);
 
+  // ─── Inline "quick-add endpoint" form (inside the picker modal) ────────
+  // Lets the operator add a PCAP endpoint without leaving the Live tab and
+  // digging through Settings → General. Toggled open by the "+ add" button
+  // in the picker; on save we persist via pcapEndpointsLocal, refresh the
+  // list, and collapse back to the picker with the new endpoint selectable.
+  const [epAddOpen, setEpAddOpen] = useState(false);
+  const [epAddName, setEpAddName] = useState("");
+  const [epAddHost, setEpAddHost] = useState("");
+  const [epAddPort, setEpAddPort] = useState("");
+  const [epAddTransport, setEpAddTransport] = useState<"tcp" | "udp">("tcp");
+  const [epAddSaving, setEpAddSaving] = useState(false);
+
+  const resetEpAddForm = useCallback(() => {
+    setEpAddOpen(false);
+    setEpAddName(""); setEpAddHost(""); setEpAddPort("");
+    setEpAddTransport("tcp");
+  }, []);
+
   // ─── Map sessionId → view_mode ──────────────────────────────────────────
   // Sessions only carry a label, not the originating profile's view_mode.
   // We track it locally so the output renderer can pick xterm vs scrollback
@@ -155,6 +173,30 @@ export default function LiveTab(props: Props) {
       setPcapEndpoints(data as any);
     } catch (e) { console.warn("[LiveTab] pcap endpoints read failed:", e); }
   }, []);
+
+  const saveNewEndpoint = useCallback(async () => {
+    const name = epAddName.trim();
+    const host = epAddHost.trim();
+    const port = Number(epAddPort);
+    if (!name || !host) {
+      Alert.alert("Missing fields", "Name and host are required.");
+      return;
+    }
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      Alert.alert("Bad port", "Port must be between 1 and 65535.");
+      return;
+    }
+    setEpAddSaving(true);
+    try {
+      await pcapEndpointsLocal.upsert({ name, host, port, transport: epAddTransport });
+      await fetchPcapEndpoints();
+      resetEpAddForm();
+    } catch (e: any) {
+      Alert.alert("Save failed", e?.message || "sqlite write error");
+    } finally {
+      setEpAddSaving(false);
+    }
+  }, [epAddName, epAddHost, epAddPort, epAddTransport, fetchPcapEndpoints, resetEpAddForm]);
 
   useEffect(() => { fetchAttackProfiles(); fetchPcapEndpoints(); },
     [fetchAttackProfiles, fetchPcapEndpoints]);
@@ -612,7 +654,7 @@ export default function LiveTab(props: Props) {
         visible={endpointPickerOpen}
         animationType="none"
         transparent
-        onRequestClose={() => { setEndpointPickerOpen(false); setPendingProfile(null); }}
+        onRequestClose={() => { setEndpointPickerOpen(false); setPendingProfile(null); resetEpAddForm(); }}
       >
         <View style={s.modalBackdrop}>
           <View style={s.modalSheet}>
@@ -621,7 +663,7 @@ export default function LiveTab(props: Props) {
                 // pick endpoint for {pendingProfile?.name || "?"}
               </Text>
               <TouchableOpacity
-                onPress={() => { setEndpointPickerOpen(false); setPendingProfile(null); }}
+                onPress={() => { setEndpointPickerOpen(false); setPendingProfile(null); resetEpAddForm(); }}
                 testID="btn-ep-close"
               >
                 <Ionicons name="close" size={20} color={C.green} />
@@ -631,7 +673,7 @@ export default function LiveTab(props: Props) {
               packets will stream live to the selected endpoint via{" "}
               <Text style={{ color: C.cyan }}>tcpdump | nc</Text>
             </Text>
-            <ScrollView style={{ maxHeight: 340 }}>
+            <ScrollView style={{ maxHeight: 380 }} keyboardShouldPersistTaps="handled">
               {pcapEndpoints.map((ep) => (
                 <TouchableOpacity
                   key={ep.id}
@@ -650,10 +692,80 @@ export default function LiveTab(props: Props) {
                   <Ionicons name="chevron-forward" size={16} color={C.textDim} />
                 </TouchableOpacity>
               ))}
-              {pcapEndpoints.length === 0 && (
+              {pcapEndpoints.length === 0 && !epAddOpen && (
                 <Text style={[s.helper, { padding: 16, textAlign: "center" }]}>
-                  no endpoints — add one in Settings → General
+                  no endpoints yet — tap &quot;+ add endpoint&quot; below to create one
                 </Text>
+              )}
+
+              {/* Inline quick-add form — add an endpoint without leaving Live */}
+              {epAddOpen ? (
+                <View style={s.epAddForm}>
+                  <Text style={[s.modalTitle, { fontSize: 11, marginBottom: 8 }]}>// new endpoint</Text>
+                  <TextInput
+                    testID="input-ep-name"
+                    value={epAddName} onChangeText={setEpAddName}
+                    placeholder="name (e.g. wireshark-box)" placeholderTextColor={C.textDim}
+                    style={s.epInput} autoCapitalize="none" autoCorrect={false}
+                  />
+                  <TextInput
+                    testID="input-ep-host"
+                    value={epAddHost} onChangeText={setEpAddHost}
+                    placeholder="host / tailnet IP" placeholderTextColor={C.textDim}
+                    style={s.epInput} autoCapitalize="none" autoCorrect={false}
+                    keyboardType="numbers-and-punctuation"
+                  />
+                  <TextInput
+                    testID="input-ep-port"
+                    value={epAddPort} onChangeText={setEpAddPort}
+                    placeholder="port (e.g. 19000)" placeholderTextColor={C.textDim}
+                    style={s.epInput} keyboardType="number-pad"
+                  />
+                  <View style={{ flexDirection: "row", marginTop: 6, marginBottom: 4 }}>
+                    {(["tcp", "udp"] as const).map((t) => (
+                      <TouchableOpacity
+                        key={t}
+                        testID={`btn-ep-transport-${t}`}
+                        onPress={() => setEpAddTransport(t)}
+                        style={[
+                          s.epTransportChip,
+                          epAddTransport === t && { borderColor: C.green, backgroundColor: "#0a1f12" },
+                        ]}
+                      >
+                        <Text style={[s.epHost, epAddTransport === t && { color: C.green }]}>{t}</Text>
+                      </TouchableOpacity>
+                    ))}
+                  </View>
+                  <View style={{ flexDirection: "row", justifyContent: "flex-end", marginTop: 8 }}>
+                    <TouchableOpacity
+                      testID="btn-ep-add-cancel"
+                      onPress={resetEpAddForm}
+                      style={[s.epActionBtn, { borderColor: C.border, marginRight: 6 }]}
+                    >
+                      <Text style={[s.epHost, { color: C.textDim }]}>CANCEL</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      testID="btn-ep-add-save"
+                      onPress={saveNewEndpoint}
+                      disabled={epAddSaving}
+                      style={[s.epActionBtn, { borderColor: C.green, opacity: epAddSaving ? 0.5 : 1 }]}
+                    >
+                      <Ionicons name="save-outline" size={13} color={C.green} />
+                      <Text style={[s.epHost, { color: C.green, marginLeft: 4 }]}>
+                        {epAddSaving ? "SAVING…" : "SAVE"}
+                      </Text>
+                    </TouchableOpacity>
+                  </View>
+                </View>
+              ) : (
+                <TouchableOpacity
+                  testID="btn-ep-add-open"
+                  onPress={() => setEpAddOpen(true)}
+                  style={s.epAddBtn}
+                >
+                  <Ionicons name="add" size={16} color={C.catPcap} />
+                  <Text style={[s.epName, { color: C.catPcap, marginLeft: 6 }]}>add endpoint</Text>
+                </TouchableOpacity>
               )}
             </ScrollView>
           </View>
@@ -764,4 +876,27 @@ const s = StyleSheet.create({
   },
   epName: { color: C.text, fontFamily: MONO, fontSize: 12, fontWeight: "700" },
   epHost: { color: C.cyan, fontFamily: MONO, fontSize: 10, marginTop: 2 },
+  epAddBtn: {
+    flexDirection: "row", alignItems: "center", justifyContent: "center",
+    paddingVertical: 10, marginTop: 4, marginBottom: 4,
+    borderWidth: 1, borderColor: C.catPcap, borderStyle: "dashed", borderRadius: 4,
+  },
+  epAddForm: {
+    marginTop: 6, padding: 10,
+    backgroundColor: C.panel2, borderWidth: 1, borderColor: C.border, borderRadius: 4,
+  },
+  epInput: {
+    color: C.green, fontFamily: MONO, fontSize: 12,
+    backgroundColor: C.bg, borderWidth: 1, borderColor: C.border, borderRadius: 4,
+    paddingHorizontal: 8, paddingVertical: 8, marginTop: 6,
+  },
+  epTransportChip: {
+    paddingHorizontal: 12, paddingVertical: 5, marginRight: 6,
+    borderWidth: 1, borderColor: C.border, borderRadius: 3,
+  },
+  epActionBtn: {
+    flexDirection: "row", alignItems: "center",
+    paddingHorizontal: 12, paddingVertical: 6,
+    borderWidth: 1, borderRadius: 4,
+  },
 });
