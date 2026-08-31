@@ -22,7 +22,7 @@
  * "unknown" (yellow dot) rather than lying.
  */
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Platform, StyleSheet, Text, TouchableOpacity, View } from "react-native";
+import { Modal, Platform, StyleSheet, Text, TouchableOpacity, View } from "react-native";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { execReal, HAS_NATIVE_ROOT } from "../lib/rootShell";
 
@@ -132,16 +132,20 @@ type Props = {
   /** Called with the raw command about to run so index.tsx can also log it
    *  in its command_logs table + jump to terminal for output visibility. */
   onExecCommand: (cmd: string, label: string) => Promise<void>;
+  /** Save the current toggle combo as a reusable profile. Receives the
+   *  toggle-derived command sequence; the parent opens its save sheet. */
+  onSaveCombo?: (commands: string[]) => void;
   disabled?: boolean;
 };
 
 export default function WlanControl({
-  iface, country, onIfaceChange, onExecCommand, disabled,
+  iface, country, onIfaceChange, onExecCommand, onSaveCombo, disabled,
 }: Props) {
   const [detected, setDetected] = useState<string[]>([]);
   const [state, setState] = useState<Awaited<ReturnType<typeof probeAllStates>> | null>(null);
   const [probing, setProbing] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
+  const [chanSheetOpen, setChanSheetOpen] = useState(false);
   const mountedRef = useRef(true);
   useEffect(() => () => { mountedRef.current = false; }, []);
 
@@ -216,6 +220,32 @@ export default function WlanControl({
     runAndRefresh(`iw dev ${iface} set channel ${ch}`, `ch ${ch}`);
   }, [iface, runAndRefresh]);
 
+  // ─── One-tap preset combos ──────────────────────────────────────────
+  // Built-in staged sequences that fire the whole chain at once. Applying
+  // a preset runs through the same exec pipeline as individual toggles and
+  // re-probes state afterwards so the toggles light up to match.
+  const PRESETS = useMemo(() => [
+    { key: "sniff", label: "sniff", icon: "access-point" as const, color: C.cyan,
+      cmd: `svc wifi disable && ifconfig ${iface} down && iw dev ${iface} set type monitor && ifconfig ${iface} up` },
+    { key: "inject", label: "inject", icon: "radio-tower" as const, color: C.magenta,
+      cmd: `svc wifi disable && iw reg set ${country || "00"} && ifconfig ${iface} down && iw dev ${iface} set type monitor && ifconfig ${iface} up` },
+    { key: "reset", label: "reset", icon: "backup-restore" as const, color: C.yellow,
+      cmd: `ifconfig ${iface} down && iw dev ${iface} set type managed && ifconfig ${iface} up && svc wifi enable` },
+  ], [iface, country]);
+
+  // Snapshot the CURRENT toggle states into a reproducible command sequence
+  // (ordered so monitor-mode's down→set→up chain stays valid).
+  const buildComboFromState = useCallback((): string[] => {
+    if (!state) return [];
+    const cmds: string[] = [];
+    cmds.push(`svc wifi ${state.wifiOn === "on" ? "enable" : "disable"}`);
+    if (country && state.regDomain === "on") cmds.push(`iw reg set ${country}`);
+    cmds.push(`ifconfig ${iface} down`);
+    cmds.push(`iw dev ${iface} set type ${state.monitor === "on" ? "monitor" : "managed"}`);
+    if (state.ifaceUp === "on") cmds.push(`ifconfig ${iface} up`);
+    return cmds;
+  }, [state, iface, country]);
+
   const ifaceList = useMemo(() => {
     // Merge detected list with the currently-selected iface so it's
     // always shown even if `iw dev` momentarily misses it.
@@ -254,17 +284,69 @@ export default function WlanControl({
         </TouchableOpacity>
       </View>
 
-      {/* Toggles */}
-      <Text style={[s.sectionTitle, { marginTop: 16 }]}>{"// controls"}</Text>
-
+      {/* Host interop — Android WiFi service is step 0: kill it before Kali
+          gets clean raw hardware access. Styled as a master switch (red when
+          ON = still interfering). */}
+      <Text style={[s.sectionTitle, { marginTop: 16 }]}>{"// host interop"}</Text>
       <ToggleRow
-        label="WiFi service"
-        sub="svc wifi enable / disable"
+        label="Android WiFi svc"
+        sub={state?.wifiOn === "on" ? "⚠ may fight Kali — kill first" : "off — hardware free for Kali"}
         state={state?.wifiOn ?? "unknown"}
         busy={busy === "wifi enable" || busy === "wifi disable"}
         onPress={handleWifiToggle}
         disabled={disabled}
+        master
       />
+
+      {/* Live telemetry HUD — hoisted above the controls so active state is
+          glanceable without scrolling. */}
+      <Text style={[s.sectionTitle, { marginTop: 16 }]}>{"// live"}</Text>
+      <View style={s.hudCard}>
+        {state?.info ? (
+          <View style={{ flexDirection: "row", flexWrap: "wrap" }}>
+            <HudCell k="mode" v={state.info.mode || "—"} color={state.info.mode === "monitor" ? C.magenta : C.cyan} />
+            <HudCell k="ch" v={state.info.channel || "—"} color={C.cyan} />
+            <HudCell k="tx" v={state.info.txpower || "—"} color={C.cyan} />
+            <HudCell k="mac" v={state.info.mac || "—"} color={C.cyan} wide />
+          </View>
+        ) : (
+          <Text style={s.helperFine}>… probing</Text>
+        )}
+      </View>
+
+      {/* Preset combos — one-tap staged actions + save the current combo */}
+      <View style={s.sectionRow}>
+        <Text style={s.sectionTitle}>{"// presets"}</Text>
+        {onSaveCombo && (
+          <TouchableOpacity
+            testID="btn-save-combo"
+            onPress={() => onSaveCombo(buildComboFromState())}
+            disabled={disabled || !state}
+            style={[s.chip, { borderColor: C.green, paddingVertical: 4 }]}
+          >
+            <MaterialCommunityIcons name="content-save" size={12} color={C.green} />
+            <Text style={[s.chipText, { color: C.green, marginLeft: 4, fontSize: 11 }]}>save combo</Text>
+          </TouchableOpacity>
+        )}
+      </View>
+      <View style={s.chipRow}>
+        {PRESETS.map((p) => (
+          <TouchableOpacity
+            key={p.key}
+            testID={`preset-${p.key}`}
+            onPress={() => runAndRefresh(p.cmd, p.key)}
+            disabled={disabled || !!busy}
+            style={[s.chip, { borderColor: p.color }]}
+          >
+            <MaterialCommunityIcons name={p.icon} size={12} color={p.color} />
+            <Text style={[s.chipText, { color: p.color, marginLeft: 4 }]}>{p.label}</Text>
+          </TouchableOpacity>
+        ))}
+      </View>
+
+      {/* Controls */}
+      <Text style={[s.sectionTitle, { marginTop: 16 }]}>{"// controls"}</Text>
+
       <ToggleRow
         label={`iface ${iface}`}
         sub={`ifconfig ${iface} up / down`}
@@ -290,65 +372,83 @@ export default function WlanControl({
         disabled={disabled}
       />
 
-      {/* Live iface stats */}
-      <Text style={[s.sectionTitle, { marginTop: 16 }]}>{"// live"}</Text>
-      <View style={s.card}>
-        {state?.info ? (
-          <>
-            <StatRow k="mode"    v={state.info.mode || "—"}    color={state.info.mode === "monitor" ? C.magenta : C.cyan} />
-            <StatRow k="channel" v={state.info.channel || "—"} color={C.cyan} />
-            <StatRow k="txpower" v={state.info.txpower || "—"} color={C.cyan} />
-            <StatRow k="mac"     v={state.info.mac || "—"}     color={C.cyan} />
-          </>
-        ) : (
-          <Text style={s.helperFine}>… probing</Text>
-        )}
-      </View>
-
-      {/* Channel dial */}
+      {/* Channel — compact readout that opens a bottom-sheet picker. The old
+          always-visible chip grid ate ~30% of the viewport; collapsed here
+          until the Enforcer Toolbar jog-wheels take over channel/TX entirely. */}
       <Text style={[s.sectionTitle, { marginTop: 16 }]}>{"// channel"}</Text>
-      <Text style={s.helperFine}>
-        2.4 GHz
-      </Text>
-      <View style={s.chipRow}>
-        {CHANNELS_24.map((ch) => (
-          <ChannelChip key={ch} ch={ch}
-            active={state?.info.channel === String(ch)}
-            busy={busy === `ch ${ch}`}
-            onPress={() => handleSetChannel(ch)}
-            disabled={disabled}
-          />
-        ))}
-      </View>
-      <Text style={[s.helperFine, { marginTop: 6 }]}>
-        5 GHz
-      </Text>
-      <View style={s.chipRow}>
-        {CHANNELS_5.map((ch) => (
-          <ChannelChip key={ch} ch={ch}
-            active={state?.info.channel === String(ch)}
-            busy={busy === `ch ${ch}`}
-            onPress={() => handleSetChannel(ch)}
-            disabled={disabled}
-          />
-        ))}
-      </View>
+      <TouchableOpacity
+        testID="btn-channel-readout"
+        style={s.readoutRow}
+        onPress={() => setChanSheetOpen(true)}
+        disabled={disabled}
+        activeOpacity={0.7}
+      >
+        <Text style={s.readoutText}>Ch: <Text style={{ color: C.green, fontWeight: "800" }}>{state?.info.channel || "—"}</Text></Text>
+        <Text style={s.readoutText}>Tx: <Text style={{ color: C.cyan, fontWeight: "800" }}>{state?.info.txpower || "—"}</Text></Text>
+        <MaterialCommunityIcons name="chevron-down" size={16} color={C.textDim} />
+      </TouchableOpacity>
+
+      {/* Channel picker bottom-sheet */}
+      <Modal
+        visible={chanSheetOpen}
+        transparent
+        animationType="none"
+        onRequestClose={() => setChanSheetOpen(false)}
+      >
+        <TouchableOpacity
+          style={s.sheetBackdrop}
+          activeOpacity={1}
+          onPress={() => setChanSheetOpen(false)}
+        >
+          <View style={s.sheet}>
+            <View style={s.sheetHeader}>
+              <Text style={s.sectionTitle}>{"// set channel"}</Text>
+              <TouchableOpacity onPress={() => setChanSheetOpen(false)} testID="btn-channel-close">
+                <MaterialCommunityIcons name="close" size={18} color={C.green} />
+              </TouchableOpacity>
+            </View>
+            <Text style={s.helperFine}>2.4 GHz</Text>
+            <View style={s.chipRow}>
+              {CHANNELS_24.map((ch) => (
+                <ChannelChip key={ch} ch={ch}
+                  active={state?.info.channel === String(ch)}
+                  busy={busy === `ch ${ch}`}
+                  onPress={() => { handleSetChannel(ch); setChanSheetOpen(false); }}
+                  disabled={disabled}
+                />
+              ))}
+            </View>
+            <Text style={[s.helperFine, { marginTop: 8 }]}>5 GHz</Text>
+            <View style={s.chipRow}>
+              {CHANNELS_5.map((ch) => (
+                <ChannelChip key={ch} ch={ch}
+                  active={state?.info.channel === String(ch)}
+                  busy={busy === `ch ${ch}`}
+                  onPress={() => { handleSetChannel(ch); setChanSheetOpen(false); }}
+                  disabled={disabled}
+                />
+              ))}
+            </View>
+          </View>
+        </TouchableOpacity>
+      </Modal>
     </View>
   );
 }
 
 // ─── Sub-components ────────────────────────────────────────────────────
 function ToggleRow({
-  label, sub, state, busy, onPress, disabled,
+  label, sub, state, busy, onPress, disabled, master,
 }: {
   label: string; sub: string; state: ToggleState; busy: boolean;
-  onPress: () => void; disabled?: boolean;
+  onPress: () => void; disabled?: boolean; master?: boolean;
 }) {
   // Dot color mirrors the mcp node status pill: green = on, dim = off,
-  // yellow = probing/unknown/busy. The subtle inner glow is done with a
-  // slightly larger, translucent halo circle underneath.
+  // yellow = probing/unknown/busy. For a `master` interop switch, ON is
+  // shown RED (it means the Android WiFi stack is still fighting Kali).
+  const onColor = master ? C.red : C.green;
   const dotColor =
-    state === "on" ? C.green :
+    state === "on" ? onColor :
     state === "off" ? C.textDim :
     C.yellow;
   const glowShown = state === "on" || busy;
@@ -357,7 +457,11 @@ function ToggleRow({
       onPress={onPress}
       disabled={disabled || busy}
       activeOpacity={0.7}
-      style={[s.toggleRow, disabled && { opacity: 0.5 }]}
+      style={[
+        s.toggleRow,
+        master && { borderColor: state === "on" ? C.red : C.greenDim },
+        disabled && { opacity: 0.5 },
+      ]}
     >
       <View style={s.dotWrap}>
         {glowShown && <View style={[s.dotGlow, { backgroundColor: dotColor }]} />}
@@ -365,23 +469,23 @@ function ToggleRow({
       </View>
       <View style={{ flex: 1, marginLeft: 12 }}>
         <Text style={s.toggleLabel}>{label}</Text>
-        <Text style={s.toggleSub}>{sub}</Text>
+        <Text style={[s.toggleSub, master && state === "on" && { color: C.red }]}>{sub}</Text>
       </View>
-      <View style={[s.toggleTrack, state === "on" && { backgroundColor: C.greenDim }]}>
+      <View style={[s.toggleTrack, state === "on" && { backgroundColor: master ? "#5a1020" : C.greenDim }]}>
         <View style={[s.toggleKnob, {
           left: state === "on" ? 20 : 2,
-          backgroundColor: busy ? C.yellow : state === "on" ? C.green : C.text,
+          backgroundColor: busy ? C.yellow : state === "on" ? onColor : C.text,
         }]} />
       </View>
     </TouchableOpacity>
   );
 }
 
-function StatRow({ k, v, color }: { k: string; v: string; color: string }) {
+function HudCell({ k, v, color, wide }: { k: string; v: string; color: string; wide?: boolean }) {
   return (
-    <View style={{ flexDirection: "row", marginBottom: 2 }}>
-      <Text style={[s.helperFine, { width: 80 }]}>{k}</Text>
-      <Text style={[s.helperFine, { color, flex: 1 }]}>{v}</Text>
+    <View style={{ width: wide ? "100%" : "50%", flexDirection: "row", marginBottom: 3 }}>
+      <Text style={[s.helperFine, { color: C.textDim, width: 42 }]}>{k}</Text>
+      <Text style={[s.helperFine, { color, flex: 1 }]} numberOfLines={1}>{v}</Text>
     </View>
   );
 }
@@ -406,6 +510,10 @@ function ChannelChip({ ch, active, busy, onPress, disabled }: {
 const s = StyleSheet.create({
   root: { paddingVertical: 4 },
   sectionTitle: { color: C.green, fontFamily: MONO, fontSize: 12, fontWeight: "700", letterSpacing: 1 },
+  sectionRow: {
+    flexDirection: "row", justifyContent: "space-between", alignItems: "center",
+    marginTop: 16,
+  },
   helperFine: { color: C.text, fontFamily: MONO, fontSize: 11 },
   chipRow: { flexDirection: "row", marginTop: 6, flexWrap: "wrap", gap: 6 },
   chip: {
@@ -418,6 +526,29 @@ const s = StyleSheet.create({
   card: {
     padding: 12, borderWidth: 1, borderColor: C.border, borderRadius: 4,
     backgroundColor: C.panel, marginTop: 6,
+  },
+  hudCard: {
+    paddingHorizontal: 12, paddingVertical: 10,
+    borderWidth: 1, borderColor: C.border, borderRadius: 4,
+    backgroundColor: C.panel2, marginTop: 6,
+  },
+  readoutRow: {
+    flexDirection: "row", alignItems: "center", gap: 18,
+    paddingHorizontal: 14, paddingVertical: 12,
+    borderWidth: 1, borderColor: C.border, borderRadius: 4,
+    backgroundColor: C.panel, marginTop: 6,
+  },
+  readoutText: { color: C.text, fontFamily: MONO, fontSize: 13, flexShrink: 1 },
+  sheetBackdrop: {
+    flex: 1, backgroundColor: "rgba(0,0,0,0.7)", justifyContent: "flex-end",
+  },
+  sheet: {
+    backgroundColor: C.panel, borderTopWidth: 1, borderColor: C.border,
+    borderTopLeftRadius: 10, borderTopRightRadius: 10, padding: 16, paddingBottom: 28,
+  },
+  sheetHeader: {
+    flexDirection: "row", justifyContent: "space-between", alignItems: "center",
+    marginBottom: 10,
   },
   toggleRow: {
     flexDirection: "row", alignItems: "center",

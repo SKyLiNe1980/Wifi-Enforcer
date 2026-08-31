@@ -271,6 +271,10 @@ export default function App() {
   const [importOpen, setImportOpen] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
   const [saveOpen, setSaveOpen] = useState(false);
+  // When the WLAN deck's "save combo" is used, the toggle-derived command
+  // sequence is stashed here so the save modal persists THAT instead of the
+  // generic 12 diagnostic commands.
+  const [stagedCombo, setStagedCombo] = useState<string[] | null>(null);
   const [newProfileName, setNewProfileName] = useState("");
   const [newProfileDesc, setNewProfileDesc] = useState("");
   const [execMode, setExecMode] = useState<ExecMode>("mock");
@@ -1062,14 +1066,14 @@ export default function App() {
 
   const saveCurrentAsProfile = useCallback(async () => {
     if (!newProfileName.trim()) { Alert.alert("Name required"); return; }
-    const cmds = QUICK_COMMANDS.map((q) => q.cmd(ctxActive));
+    const cmds = stagedCombo ?? QUICK_COMMANDS.map((q) => q.cmd(ctxActive));
     await profilesLocal.create({
       name: newProfileName.trim(),
       description: newProfileDesc.trim(),
       commands: cmds,
     });
-    setSaveOpen(false); setNewProfileName(""); setNewProfileDesc(""); fetchAll();
-  }, [newProfileName, newProfileDesc, ctxActive, fetchAll]);
+    setSaveOpen(false); setNewProfileName(""); setNewProfileDesc(""); setStagedCombo(null); fetchAll();
+  }, [newProfileName, newProfileDesc, ctxActive, stagedCombo, fetchAll]);
 
   const exportJson = useMemo(() => JSON.stringify(
     profiles.map(({ id, created_at, ...rest }) => rest), null, 2
@@ -1179,6 +1183,12 @@ export default function App() {
         country={country}
         onIfaceChange={(i) => setIface(i)}
         disabled={running}
+        onSaveCombo={(cmds) => {
+          setStagedCombo(cmds);
+          setNewProfileName("");
+          setNewProfileDesc("");
+          setSaveOpen(true);
+        }}
         onExecCommand={async (cmd) => {
           // Reuse the existing exec pipeline so command_logs, exec_mode
           // wrapping, and the terminal jump-to-classic behavior all still
@@ -1380,7 +1390,6 @@ export default function App() {
         <KV k="device" v={rootInfo?.device || "..."} vColor={C.cyan} />
         <KV k="os" v={rootInfo?.android_version || "..."} vColor={C.cyan} />
         <KV k="active iface" v={activeIface === "ALL" ? `ALL (${activeIfaces.join(", ")})` : `${activeIface} · ${primaryIface}`} vColor={C.cyan} />
-        <KV k="api" v={API} vColor={C.textDim} />
       </View>
 
       {/* ─── Floating command toolbar arm/disarm. The global SDR-style
@@ -1889,15 +1898,17 @@ export default function App() {
           <View style={s.overlay}>
             <View style={s.sheet}>
               <View style={s.sheetHeader}>
-                <Text style={s.sheetTitle}>// save profile</Text>
-                <TouchableOpacity onPress={() => setSaveOpen(false)} testID="btn-close-save">
+                <Text style={s.sheetTitle}>{stagedCombo ? "// save wlan combo" : "// save profile"}</Text>
+                <TouchableOpacity onPress={() => { setSaveOpen(false); setStagedCombo(null); }} testID="btn-close-save">
                   <Ionicons name="close" size={22} color={C.green} />
                 </TouchableOpacity>
               </View>
               <Text style={s.helper}>
-                snapshot all 12 quick-action commands using active iface=
-                <Text style={{ color: C.cyan }}>{primaryIface}</Text> $CC=
-                <Text style={{ color: C.cyan }}>{country}</Text>
+                {stagedCombo
+                  ? `snapshot ${stagedCombo.length} staged wlan command${stagedCombo.length === 1 ? "" : "s"} (iface=`
+                  : "snapshot all 12 quick-action commands using active iface="}
+                <Text style={{ color: C.cyan }}>{primaryIface}</Text>
+                {stagedCombo ? ")" : <> $CC=<Text style={{ color: C.cyan }}>{country}</Text></>}
               </Text>
               <View style={[s.field, { marginTop: 12 }]}>
                 <Text style={s.fieldLabel}>name</Text>

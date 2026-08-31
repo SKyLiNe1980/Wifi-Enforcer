@@ -758,3 +758,30 @@ base. App data is local SQLite now, so it's mostly used by the // data status
 Phase 1 testing: web preview can't render (expo-sqlite web crash) so testing_agent
 browser flows N/A — verify on APK. Remaining P2/P3 + 2 MCP bugs (tool-scan flicker/
 multi-scan, audit log missing source/IP) still queued.
+
+### 🎨 UI Phase 2 — WLAN landing rework (done)
+User deferred toggle-behavior choice to agent. DECISIONS made:
+- Toggles stay LIVE (flip real hardware + reflect state, as before) — NOT pure-staging.
+- Added one-tap PRESET combos (sniff/inject/reset) that fire a chained sequence via
+  the existing exec pipeline + re-probe (WlanControl PRESETS memo, testID preset-<key>).
+- Added "save combo" (testID btn-save-combo): snapshots current toggle states into an
+  ordered command sequence (buildComboFromState) → parent (index.tsx) opens the existing
+  save-profile sheet with stagedCombo, persists as a Profile (Settings → Profiles) via
+  profilesLocal.create. Save sheet title/helper switch to "// save wlan combo" when
+  stagedCombo set. saveCurrentAsProfile uses stagedCombo ?? QUICK_COMMANDS.
+- OPEN QUESTION (user musing, NOT decided): where WLAN presets should ultimately live —
+  local Profiles (current) vs a dedicated on-screen list vs a Redis-synced spot. Left as
+  Profiles for now; Redis sync = clean future toggle when user decides.
+- Android WiFi svc → its own "// host interop" master-kill at top (red glow when ON =
+  still fighting Kali). Pulled out of // controls (now iface/reg/monitor only).
+- // live telemetry → compact 2-col HUD card (HudCell) hoisted ABOVE controls.
+- // channel grid → compact "Ch ▼ / Tx ▼" readout (btn-channel-readout) opening a
+  bottom-sheet picker (chips moved inside). Full retirement waits on Enforcer Toolbar wheels.
+- Removed leftover Settings "api" KV row (kept API const — still used as apiBase).
+JS-only, lint clean, android bundle HTTP 200. Verify on APK.
+
+DEFERRED to later phase (user OK): $CC tappable badge + Multi-Interface Hub (merge the
+3 iface areas: $IFACE_A/B/C inputs + active-adapter chips + // interface selector).
+STILL QUEUED: Phase 3 (terminal Connect/Kill dynamic btn, keyboard accessory strip,
+A-/A+ font + horiz scroll) + 2 MCP bugs (tool-scan flicker/multi-scan; audit missing
+source/IP) + MCP "make-it-feel-like-a-menu" rethink.
