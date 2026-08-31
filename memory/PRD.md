@@ -690,3 +690,38 @@ Fix (app/index.tsx):
   changes, so roster JOIN/PART + initial NAMES left the notification/badge stuck
   at the last count. Now fires busUpdate on status OR roster change → live count.
 - Both JS-only, lint clean, android bundle compiles. Verify on APK.
+
+### ✅ User-confirmed working (this session, on real APK build)
+- SWAT "N online" notification/badge now updates correctly (roster busUpdate fix).
+- (Other 3 fixes built into same APK: MCP RESYNC fan-out, quick-scans over SSH,
+  Redis token auto-save — assume in build; user didn't flag issues.)
+
+### 📋 NEXT SESSION BACKLOG
+
+#### 1. Live-view attack-profile / tool EDITOR (deferred feature — the REAL "add" the user meant)
+- NOT the pcap-endpoint add (that was a misread — pcap inline add is already done).
+- User wants to ADD/EDIT their own Live tools (attack profiles) shown in the
+  preset drawer. Storage already supports it: attackProfilesLocal.upsert/.delete
+  (localDb.ts ~535). LiveTab.tsx line ~506 has literal "TODO: add attack-profile
+  editor". Build an editor modal in LiveTab:
+  fields = name, description, command_template (placeholder hints
+  {iface}/{host}/{port}/{file}), category (recon|attack|trace|pcap), icon picker,
+  view_mode (scrollback|xterm), needs_iface/needs_endpoint/needs_file toggles.
+  Entry: "+ new" button in drawer + long-press tile to edit. DELETE hidden for
+  builtins. (Pending user confirm on entry-point + builtin-edit choices — 2 Qs
+  were asked, unanswered; user built and left. Re-ask next sesh.)
+
+#### 2. UI declutter pass (user request — "less cluttered, smaller, more space")
+- LIVE tab: the big GREEN diagnostic blocks at top (bridgeBar — the per-method
+  isRoot/exec/executeStream chips) were for TERM troubleshooting → remove/hide
+  now that it's stable. Also drop stale text blocks: "tip: you need monitor
+  mode" and the "diag has moved" note.
+- MCP tab: shorten a few verbose helper/notes text blocks.
+- SETTINGS tab:
+  * // data status — keep it, but redesign as 5 compact "bulbs" with keyword
+    labels laid out HORIZONTALLY (saves a lot of vertical space) instead of the
+    current stacked rows.
+  * chroot helper block — relocate slightly + reduce its long explanatory text.
+  * REMOVE the bottom text block about mock mode (no longer needed).
+- Goal: tighter, cleaner, more breathing room. Keep the rugged design_guidelines
+  aesthetic. All JS-only; verify on APK.
