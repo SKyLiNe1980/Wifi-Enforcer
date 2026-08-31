@@ -663,3 +663,18 @@ Two operator-reported bugs (JS-only; land on next rebuild):
 - Verification: web preview can't run these (expo-sqlite web worker crash =
   known blank screen). Both files compile clean (metro bundle OK, lint clean).
   Must be verified on a real APK build.
+
+### Phase 3b — Quick-scans routed through SSH backend selector
+Dashboard quick-tab commands (execute + runProfile) previously called
+rootShell.execReal / RootShell.execBatch DIRECTLY and gated on HAS_NATIVE_ROOT,
+so on a rootless SSH target (Kalidroid) they silently fell back to preview/mock.
+Fix (app/index.tsx):
+- execute(): isReal now = SSH-active ? (HAS_NATIVE_SSH && backendHasStreaming())
+  : (real/kali && HAS_NATIVE_ROOT). Actual call routes via backend.execReal
+  (SSH or su→chroot). wrapForMode already returns raw cmd for SSH (no chroot
+  prefix — we're already inside Kali).
+- runProfile(): when SSH active, runs each command SEQUENTIALLY via
+  backend.execReal (SSH has no execBatch); root/chroot path keeps execBatch.
+- Header badge now shows "SSH"/"SSH…" (cyan) when the SSH backend is active so
+  the operator knows quick-scans land on the VM, not the Android host.
+- JS-only; native bundle compiles (android bundle HTTP 200). Verify on APK.

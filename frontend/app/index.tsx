@@ -32,7 +32,7 @@ import SwatTab from "../src/components/SwatTab";
 import TerminalShell from "../src/components/TerminalShell";
 import WlanControl from "../src/components/WlanControl";
 import SshBackendPanel, { type SshStatus } from "../src/components/SshBackendPanel";
-import { setActiveBackend } from "../src/lib/backend";
+import { setActiveBackend, execReal as backendExecReal, hasStreaming as backendHasStreaming } from "../src/lib/backend";
 import {
   loadSshConfig, saveSshConfig, readSshSecrets, writeSshPassword, writeSshKey,
   type SshBackendConfig,
@@ -915,7 +915,13 @@ export default function App() {
   const execute = useCallback(async (command: string) => {
     if (!command.trim() || running) return;
     setRunning(true);
-    const isReal = (execMode === "real" || execMode === "kali") && HAS_NATIVE_ROOT;
+    const sshActive = backendKind === "ssh";
+    // Real exec is possible when SSH backend is live (rootless Kalidroid, etc.)
+    // OR when a local root bridge is present in real/kali mode. Quick-scans now
+    // route through the backend selector so they work over SSH too.
+    const isReal = sshActive
+      ? (HAS_NATIVE_SSH && backendHasStreaming())
+      : ((execMode === "real" || execMode === "kali") && HAS_NATIVE_ROOT);
     // Fan out across all active ifaces if ALL is selected
     const targets = activeIface === "ALL" ? activeIfaces : [primaryIface];
     try {
@@ -925,7 +931,8 @@ export default function App() {
         let newLog: Log;
         if (isReal) {
           const t0 = Date.now();
-          const r = await execReal(wrapped);
+          // backendExecReal routes to SSH or su→chroot per active backend.
+          const r = await backendExecReal(wrapped);
           newLog = {
             id: String(Date.now()) + Math.random(),
             timestamp: new Date().toISOString(),
@@ -943,7 +950,7 @@ export default function App() {
             id: String(Date.now()) + Math.random(),
             timestamp: new Date().toISOString(),
             command: cmd,
-            output: `[preview] ${cmd}\n(no native bridge — switch to KALI/REAL after installing APK)`,
+            output: `[preview] ${cmd}\n(no live backend — switch to KALI/REAL after installing APK, or enable SSH backend in Settings)`,
             exit_code: 0,
             duration_ms: 0,
             mocked: true,
@@ -961,15 +968,38 @@ export default function App() {
       setLogs((p) => [...p, errLog]);
       commandLogsLocal.append(errLog).catch(() => {});
     } finally { setRunning(false); }
-  }, [running, execMode, activeIface, activeIfaces, primaryIface, iface, wrapForMode]);
+  }, [running, execMode, activeIface, activeIfaces, primaryIface, iface, wrapForMode, backendKind]);
 
   const runProfile = useCallback(async (p: Profile) => {
     setRunning(true);
-    const isReal = (execMode === "real" || execMode === "kali") && HAS_NATIVE_ROOT;
+    const sshActive = backendKind === "ssh";
+    const isReal = sshActive
+      ? (HAS_NATIVE_SSH && backendHasStreaming())
+      : ((execMode === "real" || execMode === "kali") && HAS_NATIVE_ROOT);
     const targets = activeIface === "ALL" ? activeIfaces : [primaryIface];
     try {
       const newLogs: Log[] = [];
-      if (isReal && RootShell) {
+      if (isReal && sshActive) {
+        // SSH backend has no batch primitive — run each command sequentially
+        // through the selector's one-shot exec. wrapForMode returns the raw
+        // command for SSH (we're already inside Kali), so no chroot prefix.
+        for (const ifname of targets) {
+          for (const c of p.commands) {
+            const subbed = targets.length > 1 ? substIface(c, ifname) : c;
+            const t0 = Date.now();
+            const r = await backendExecReal(wrapForMode(subbed));
+            newLogs.push({
+              id: String(Date.now()) + Math.random(),
+              command: subbed,
+              output: r.output,
+              exit_code: r.exit_code,
+              duration_ms: r.duration_ms || (Date.now() - t0),
+              mocked: false,
+              timestamp: new Date().toISOString(),
+            });
+          }
+        }
+      } else if (isReal && RootShell) {
         // Fan out commands across target ifaces, all wrapped for chroot if needed
         const flatCmds: { display: string; wrapped: string }[] = [];
         for (const ifname of targets) {
@@ -1017,7 +1047,7 @@ export default function App() {
       setTab("terminal");
     } catch (e) { console.warn(e); }
     finally { setRunning(false); }
-  }, [execMode, activeIface, activeIfaces, primaryIface, iface, wrapForMode]);
+  }, [execMode, activeIface, activeIfaces, primaryIface, iface, wrapForMode, backendKind]);
 
   const deleteProfile = useCallback(async (id: string) => {
     await profilesLocal.delete(id);
@@ -1802,11 +1832,19 @@ export default function App() {
           </View>
           <View style={{ flexDirection: "row", alignItems: "center" }}>
             {running && <ActivityIndicator size="small" color={C.green} style={{ marginRight: 8 }} />}
-            <View style={[s.badge, { borderColor: execMode === "kali" ? C.magenta : execMode === "real" ? C.green : C.yellow }]}>
-              <Text style={[s.badgeText, { color: execMode === "kali" ? C.magenta : execMode === "real" ? C.green : C.yellow }]}>
-                {execMode === "kali" ? "KALI" : execMode === "real" ? "ANDROID" : "PREVIEW"}
-              </Text>
-            </View>
+            {backendKind === "ssh" ? (
+              <View style={[s.badge, { borderColor: C.cyan }]}>
+                <Text style={[s.badgeText, { color: C.cyan }]}>
+                  {sshStatus === "connected" ? "SSH" : "SSH…"}
+                </Text>
+              </View>
+            ) : (
+              <View style={[s.badge, { borderColor: execMode === "kali" ? C.magenta : execMode === "real" ? C.green : C.yellow }]}>
+                <Text style={[s.badgeText, { color: execMode === "kali" ? C.magenta : execMode === "real" ? C.green : C.yellow }]}>
+                  {execMode === "kali" ? "KALI" : execMode === "real" ? "ANDROID" : "PREVIEW"}
+                </Text>
+              </View>
+            )}
           </View>
         </View>
 
