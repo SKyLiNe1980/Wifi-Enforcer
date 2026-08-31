@@ -229,9 +229,12 @@ export default function MCPTab() {
 
   // ─── Tool sync helper (callable from health probe + manual button) ──
   const syncToolsNow = useCallback(async (
-    base: string, token: string, opts: { silent?: boolean } = {},
+    base: string, token: string, opts: { silent?: boolean; skipStatus?: boolean } = {},
   ) => {
-    setToolSyncStatus("syncing");
+    // skipStatus: caller (batch RESYNC) manages the status pill + tool-list
+    // refresh ONCE at the end, so per-source calls don't flicker the UI or
+    // look like it's "scanning lots of times".
+    if (!opts.skipStatus) setToolSyncStatus("syncing");
     try {
       const ctl = new AbortController();
       const timer = setTimeout(() => ctl.abort(), 5000);
@@ -245,29 +248,35 @@ export default function MCPTab() {
         clearTimeout(timer);
       }
       if (!r.ok) {
-        setToolSyncStatus("failed");
-        setToolSyncMsg(`HTTP ${r.status}`);
+        if (!opts.skipStatus) {
+          setToolSyncStatus("failed");
+          setToolSyncMsg(`HTTP ${r.status}`);
+        }
         return null;
       }
       const data = await r.json();
       const serverTools = Array.isArray(data?.tools) ? data.tools : [];
       const res = await mcpLocal.syncToolsFromServer(serverTools);
-      setToolSyncStatus("synced");
-      const msg = `+${res.inserted} new · ${res.updated} updated · ${res.total} total`;
-      setToolSyncMsg(msg);
       lastToolSyncRef.current = Date.now();
-      // Refresh visible tool list
-      const newTools = await mcpLocal.listTools();
-      setTools(newTools);
-      if (!opts.silent) {
-        Alert.alert("Tools synced", msg);
+      if (!opts.skipStatus) {
+        setToolSyncStatus("synced");
+        const msg = `+${res.inserted} new · ${res.updated} updated · ${res.total} total`;
+        setToolSyncMsg(msg);
+        // Refresh visible tool list
+        const newTools = await mcpLocal.listTools();
+        setTools(newTools);
+        if (!opts.silent) {
+          Alert.alert("Tools synced", msg);
+        }
       }
       return res;
     } catch (e: any) {
-      setToolSyncStatus("failed");
-      setToolSyncMsg(e?.message || "fetch failed");
-      if (!opts.silent) {
-        Alert.alert("Tool sync failed", e?.message || "network error");
+      if (!opts.skipStatus) {
+        setToolSyncStatus("failed");
+        setToolSyncMsg(e?.message || "fetch failed");
+        if (!opts.silent) {
+          Alert.alert("Tool sync failed", e?.message || "network error");
+        }
       }
       return null;
     }
@@ -529,7 +538,7 @@ export default function MCPTab() {
         if (cancelled) return;
         const events = (data?.events || []) as any[];
         if (events.length === 0) return;
-        const inserted = await mcpLocal.syncAuditFromServer(events);
+        const inserted = await mcpLocal.syncAuditFromServer(events, probeHost);
         if (inserted > 0) {
           setAuditSyncCount((c) => c + inserted);
           // Refresh the visible audit list
@@ -708,7 +717,7 @@ export default function MCPTab() {
     let okCount = 0;
     let failCount = 0;
     for (const src of sources) {
-      const res = await syncToolsNow(src.base, src.token, { silent: true });
+      const res = await syncToolsNow(src.base, src.token, { silent: true, skipStatus: true });
       if (res) {
         totalInserted += res.inserted;
         totalUpdated += res.updated;
@@ -2311,11 +2320,8 @@ export default function MCPTab() {
             )}
           </View>
 
-          <Text style={[s.sectionTitle, { marginTop: 20 }]}>{"// notes"}</Text>
-          <Text style={s.helper}>
-            primary node toggle in <Text style={{ color: C.cyan }}>{"// nodes"}</Text> sets where
-            shorthand calls (e.g. autospawn) land. health / tool roster auto-syncs every 60s
-            for enabled nodes.
+          <Text style={[s.helperFine, { marginTop: 16, color: C.textDim }]}>
+            primary node (// nodes) = where shorthand calls land · roster auto-syncs 60s.
           </Text>
         </ScrollView>
       )}
@@ -2761,7 +2767,7 @@ export default function MCPTab() {
                   <Text style={s.auditTs}>{formatTs(e.ts)}</Text>
                 </View>
                 <Text style={s.auditMeta}>
-                  client=<Text style={{ color: C.cyan }}>{e.client_id || "(unknown)"}</Text>
+                  src=<Text style={{ color: C.cyan }}>{e.client_id || "(unknown)"}</Text>
                   {"  "}dur=<Text style={{ color: C.cyan }}>{e.duration_ms}ms</Text>
                   {"  "}exit=<Text style={{ color: e.exit_code === 0 ? C.green : C.red }}>{e.exit_code}</Text>
                 </Text>

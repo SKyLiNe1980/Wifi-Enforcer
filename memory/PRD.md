@@ -690,3 +690,130 @@ Fix (app/index.tsx):
   changes, so roster JOIN/PART + initial NAMES left the notification/badge stuck
   at the last count. Now fires busUpdate on status OR roster change → live count.
 - Both JS-only, lint clean, android bundle compiles. Verify on APK.
+
+### ✅ User-confirmed working (this session, on real APK build)
+- SWAT "N online" notification/badge now updates correctly (roster busUpdate fix).
+- (Other 3 fixes built into same APK: MCP RESYNC fan-out, quick-scans over SSH,
+  Redis token auto-save — assume in build; user didn't flag issues.)
+
+### 📋 NEXT SESSION BACKLOG
+
+#### 1. Live-view attack-profile / tool EDITOR (deferred feature — the REAL "add" the user meant)
+- NOT the pcap-endpoint add (that was a misread — pcap inline add is already done).
+- User wants to ADD/EDIT their own Live tools (attack profiles) shown in the
+  preset drawer. Storage already supports it: attackProfilesLocal.upsert/.delete
+  (localDb.ts ~535). LiveTab.tsx line ~506 has literal "TODO: add attack-profile
+  editor". Build an editor modal in LiveTab:
+  fields = name, description, command_template (placeholder hints
+  {iface}/{host}/{port}/{file}), category (recon|attack|trace|pcap), icon picker,
+  view_mode (scrollback|xterm), needs_iface/needs_endpoint/needs_file toggles.
+  Entry: "+ new" button in drawer + long-press tile to edit. DELETE hidden for
+  builtins. (Pending user confirm on entry-point + builtin-edit choices — 2 Qs
+  were asked, unanswered; user built and left. Re-ask next sesh.)
+
+#### 2. UI declutter pass (user request — "less cluttered, smaller, more space")
+- LIVE tab: the big GREEN diagnostic blocks at top (bridgeBar — the per-method
+  isRoot/exec/executeStream chips) were for TERM troubleshooting → remove/hide
+  now that it's stable. Also drop stale text blocks: "tip: you need monitor
+  mode" and the "diag has moved" note.
+- MCP tab: shorten a few verbose helper/notes text blocks.
+- SETTINGS tab:
+  * // data status — keep it, but redesign as 5 compact "bulbs" with keyword
+    labels laid out HORIZONTALLY (saves a lot of vertical space) instead of the
+    current stacked rows.
+  * chroot helper block — relocate slightly + reduce its long explanatory text.
+  * REMOVE the bottom text block about mock mode (no longer needed).
+- Goal: tighter, cleaner, more breathing room. Keep the rugged design_guidelines
+  aesthetic. All JS-only; verify on APK.
+
+### 🎨 UI DECLUTTER — Phase 1 (done, per UIpoets.docx + Enforcer-Design-v2.md review)
+User uploaded 2 design docs (screen-by-screen Gemini teardown + established design
+system). Agreed phasing: P1 = safe declutter/renames/v0.9; P2 = WLAN landing rework;
+P3 = terminal upgrades + 2 MCP bugs; later = Multi-Interface Hub + AI-chat patterns.
+Agent objections user AGREED to: (1) keep WLAN toggles as staged-profile model (do
+NOT collapse to Managed/Monitor/Injection mode switch); (2) keep channel grid but
+collapse to compact Ch▼/Tx▼ readout only AFTER Enforcer Toolbar wheels are real
+(they're still placeholders); (3) Multi-Interface Hub = its own later phase.
+
+Phase 1 shipped (JS-only, bundle compiles HTTP 200, lint clean):
+- Tab "quick" → "WLAN" (icon wifi). Tab id stays "quick" internally.
+- Terminal mode labels: "classic·N"/"shell·zsh -l" → "Host·N" (android icon) /
+  "Kali·zsh" (linux icon).
+- v0.7 → v0.9 (header badge + settings footer). Only 2 spots existed.
+- Removed text blocks: WLAN "diag moved" note; Settings "// real root" mock/README
+  essay; WlanControl channel "tip: monitor mode…" explainer; chroot-helper
+  alternatives essay (kept field + 1-line wrap preview); "ℹ persists across
+  restarts" line; trimmed command-overlay + over-other-apps helper paragraphs.
+- LIVE tab: removed the big green bridge-diagnostic chip block (bridgeBar) +
+  probeMethod + probeResult state + now-unused RootShell/HAS_NATIVE_ROOT import.
+- Settings "// data status": stacked KV list → compact HORIZONTAL bulb strip
+  (dot + keyword cfg/logs/prof/agents/pcap + count). testID data-bulb-<key>.
+- MCP tab: trimmed "// notes" section to one helperFine line.
+
+NOTE for user Q "what is the api url at top of settings?": it's
+`${EXPO_PUBLIC_BACKEND_URL}/api` (const API, index.tsx:57) — the resolved backend
+base. App data is local SQLite now, so it's mostly used by the // data status
+"ping" diagnostic + passed to tabs as apiBase. Candidate to hide/relocate in P2.
+
+Phase 1 testing: web preview can't render (expo-sqlite web crash) so testing_agent
+browser flows N/A — verify on APK. Remaining P2/P3 + 2 MCP bugs (tool-scan flicker/
+multi-scan, audit log missing source/IP) still queued.
+
+### 🎨 UI Phase 2 — WLAN landing rework (done)
+User deferred toggle-behavior choice to agent. DECISIONS made:
+- Toggles stay LIVE (flip real hardware + reflect state, as before) — NOT pure-staging.
+- Added one-tap PRESET combos (sniff/inject/reset) that fire a chained sequence via
+  the existing exec pipeline + re-probe (WlanControl PRESETS memo, testID preset-<key>).
+- Added "save combo" (testID btn-save-combo): snapshots current toggle states into an
+  ordered command sequence (buildComboFromState) → parent (index.tsx) opens the existing
+  save-profile sheet with stagedCombo, persists as a Profile (Settings → Profiles) via
+  profilesLocal.create. Save sheet title/helper switch to "// save wlan combo" when
+  stagedCombo set. saveCurrentAsProfile uses stagedCombo ?? QUICK_COMMANDS.
+- OPEN QUESTION (user musing, NOT decided): where WLAN presets should ultimately live —
+  local Profiles (current) vs a dedicated on-screen list vs a Redis-synced spot. Left as
+  Profiles for now; Redis sync = clean future toggle when user decides.
+- Android WiFi svc → its own "// host interop" master-kill at top (red glow when ON =
+  still fighting Kali). Pulled out of // controls (now iface/reg/monitor only).
+- // live telemetry → compact 2-col HUD card (HudCell) hoisted ABOVE controls.
+- // channel grid → compact "Ch ▼ / Tx ▼" readout (btn-channel-readout) opening a
+  bottom-sheet picker (chips moved inside). Full retirement waits on Enforcer Toolbar wheels.
+- Removed leftover Settings "api" KV row (kept API const — still used as apiBase).
+JS-only, lint clean, android bundle HTTP 200. Verify on APK.
+
+DEFERRED to later phase (user OK): $CC tappable badge + Multi-Interface Hub (merge the
+3 iface areas: $IFACE_A/B/C inputs + active-adapter chips + // interface selector).
+STILL QUEUED: Phase 3 (terminal Connect/Kill dynamic btn, keyboard accessory strip,
+A-/A+ font + horiz scroll) + 2 MCP bugs (tool-scan flicker/multi-scan; audit missing
+source/IP) + MCP "make-it-feel-like-a-menu" rethink.
+
+### 🎨 UI Phase 3 — terminal upgrades + 2 MCP bugs (done)
+MCP BUGS FIXED:
+- Tool-scan flicker / "scans lots of times": root cause = the RESYNC fan-out (added
+  earlier) called syncToolsNow per node, and each call flipped toolSyncStatus
+  syncing→synced AND setTools → visible flicker + repeated "scanning". Fix: added
+  `skipStatus` opt to syncToolsNow; batch RESYNC passes {silent:true,skipStatus:true}
+  so per-source calls do NO UI writes; handleManualResync sets status + setTools ONCE
+  at the end.
+- Audit log "no source/IP": renderer showed client= but it was always "(unknown)"
+  because server client_id came through empty/under another key. Fix (localDb
+  syncAuditFromServer): map source from client_id|client|source|remote_addr|peer|ip,
+  and FALL BACK to the host the audit was polled from (new sourceHost param, passed
+  as probeHost from MCPTab). Relabeled render "client=" → "src=". Now always shows a
+  host/IP.
+
+TERMINAL (TerminalShell.tsx):
+- Added keyboard accessory strip (horizontal, only while a live PTY exists):
+  esc/tab/^C/^D/^Z/|/~///-/↑↓←→ — sends raw control seqs to the PTY via writeStdin.
+  testID termkey-<label>.
+- Added a STATIC status dot in the pill (green/yellow/red) — deliberately NOT animated
+  (JNI weak-global-ref overflow lesson: avoid continuous RN animations).
+- Dynamic OPEN SHELL ↔ CLOSE button already existed (kept).
+- DEFERRED: A-/A+ font-size toggle + horizontal output scroll — lives inside the xterm
+  WebView (XTermView), needs postMessage plumbing; parked to keep phase contained.
+
+All JS-only, lint clean, android bundle HTTP 200. Verify on APK.
+
+REMAINING BACKLOG: MCP "make-it-feel-like-a-menu" rethink (vague, needs direction);
+terminal A-/A+ + horiz scroll; $CC badge + Multi-Interface Hub; WLAN presets Redis-sync
+decision; AI-tab chat-UI patterns from Enforcer-Design-v2.md (thought blocks, host-chips,
+slide-to-authorize) — hold until AI tab revisit.

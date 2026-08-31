@@ -1278,8 +1278,9 @@ export const mcpLocal = {
     id: number; ts: string; tool_name: string;
     args?: any; args_json?: string;
     result_summary?: string; client_id?: string;
+    client?: string; source?: string; remote_addr?: string; peer?: string; ip?: string;
     duration_ms?: number; exit_code?: number; success?: boolean;
-  }[]): Promise<number> {
+  }[], sourceHost?: string): Promise<number> {
     if (!events.length) return 0;
     const db = await openLocalDb();
     // Pre-fetch already-known server_ids to skip duplicates without
@@ -1296,12 +1297,18 @@ export const mcpLocal = {
     for (const e of events) {
       if (knownSet.has(e.id)) continue;
       const args_json = e.args_json ?? JSON.stringify(e.args ?? {});
+      // Source resolution: prefer any of the field names the server may use;
+      // fall back to the host we polled the audit from so the log ALWAYS
+      // shows a source/IP instead of "(unknown)".
+      const src =
+        (e.client_id || e.client || e.source || e.remote_addr || e.peer || e.ip || "").trim() ||
+        (sourceHost || "");
       await db.runAsync(
         `INSERT INTO mcp_audit_log (id, ts, tool_name, args_json, result_summary, client_id, duration_ms, exit_code, success, server_id)
          VALUES (?,?,?,?,?,?,?,?,?,?)`,
         [
           uuid(), e.ts, e.tool_name, args_json,
-          e.result_summary || "", e.client_id || "",
+          e.result_summary || "", src,
           e.duration_ms ?? 0, e.exit_code ?? 0,
           e.success === false ? 0 : 1, e.id,
         ],
