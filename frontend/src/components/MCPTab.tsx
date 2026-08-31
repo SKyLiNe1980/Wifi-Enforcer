@@ -1321,10 +1321,17 @@ export default function MCPTab() {
     setCloudSyncBusy(true);
     setCloudSyncStatus("");
     try {
-      const url = (await loadUpstashUrl()) || cloudSyncUrl.trim();
-      const tok = cloudSyncToken.trim() || (await loadUpstashToken()) || "";
+      const typedUrl = cloudSyncUrl.trim();
+      const typedTok = cloudSyncToken.trim();
+      const url = (await loadUpstashUrl()) || typedUrl;
+      const tok = typedTok || (await loadUpstashToken()) || "";
       const r = await upstashTest(url, tok);
-      setCloudSyncStatus(`ok: PING → ${r}`);
+      // Auto-persist freshly-typed creds the moment a successful TEST proves
+      // they work — stops the token field silently resetting to "not saved"
+      // on the next tab remount (the recurring "token keeps unsaving" gripe).
+      if (typedUrl) await saveUpstashUrl(typedUrl);
+      if (typedTok) { await saveUpstashToken(typedTok); setCloudSyncTokenSaved(true); }
+      setCloudSyncStatus(`ok: PING → ${r}` + (typedTok ? " · creds saved" : ""));
     } catch (e: any) {
       setCloudSyncStatus(`err: ${e?.message || e}`);
     } finally { setCloudSyncBusy(false); }
@@ -1342,9 +1349,15 @@ export default function MCPTab() {
     setCloudSyncBusy(true);
     setCloudSyncStatus("");
     try {
-      const url = (await loadUpstashUrl()) || cloudSyncUrl.trim();
-      const tok = (await loadUpstashToken()) || cloudSyncToken.trim();
+      const typedUrl = cloudSyncUrl.trim();
+      const typedTok = cloudSyncToken.trim();
+      const url = (await loadUpstashUrl()) || typedUrl;
+      const tok = (await loadUpstashToken()) || typedTok;
       if (!url || !tok) throw new Error("save + set creds first (URL + R/W token)");
+      // Auto-persist freshly-typed creds used for RESTORE so they survive the
+      // next remount instead of resetting to "not saved".
+      if (typedUrl) await saveUpstashUrl(typedUrl);
+      if (typedTok) { await saveUpstashToken(typedTok); setCloudSyncTokenSaved(true); }
 
       // Pull tailnet peers AND the Redis roster in parallel. We'll merge:
       //   • tailnet gives us live IPs + which peers are actually online now

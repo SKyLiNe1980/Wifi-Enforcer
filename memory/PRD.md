@@ -678,3 +678,15 @@ Fix (app/index.tsx):
 - Header badge now shows "SSH"/"SSH…" (cyan) when the SSH backend is active so
   the operator knows quick-scans land on the VM, not the Android host.
 - JS-only; native bundle compiles (android bundle HTTP 200). Verify on APK.
+
+### Two quick fixes (build-and-sleep batch)
+- Redis Cloud-sync token now auto-persists on TEST + RESTORE (MCPTab.tsx):
+  handleTestCloudSync / handleDiscoverFromTailnet previously USED a freshly
+  typed token/URL without saving it, so the "•• saved ••" flag reset to unsaved
+  on the next tab remount (recurring gripe). Both now saveUpstashToken/Url +
+  setCloudSyncTokenSaved(true) the moment they use typed creds. TEST appends
+  "· creds saved" to the status line.
+- SWAT "0 online" badge fix (swatIrc.ts): set() only called busUpdate on STATUS
+  changes, so roster JOIN/PART + initial NAMES left the notification/badge stuck
+  at the last count. Now fires busUpdate on status OR roster change → live count.
+- Both JS-only, lint clean, android bundle compiles. Verify on APK.
