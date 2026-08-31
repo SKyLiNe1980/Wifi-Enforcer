@@ -14,6 +14,7 @@ export type SshBackendConfig = {
   user: string;
   authMode: "password" | "key";
   fingerprint: string; // TOFU: stored on first connect, compared thereafter
+  chrootBootstrap: boolean; // helper preflight: start sshd in NetHunter chroot
 };
 
 const KEY = "ssh_backend";
@@ -21,7 +22,7 @@ const PW_KEY = "ssh_backend_password";
 const KEYPEM_KEY = "ssh_backend_key";
 
 export function defaultSshConfig(): SshBackendConfig {
-  return { enabled: false, host: "", port: 9922, user: "kali", authMode: "password", fingerprint: "" };
+  return { enabled: false, host: "", port: 9922, user: "kali", authMode: "password", fingerprint: "", chrootBootstrap: false };
 }
 
 export async function loadSshConfig(): Promise<SshBackendConfig> {
