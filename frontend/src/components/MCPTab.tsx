@@ -2311,11 +2311,8 @@ export default function MCPTab() {
             )}
           </View>
 
-          <Text style={[s.sectionTitle, { marginTop: 20 }]}>{"// notes"}</Text>
-          <Text style={s.helper}>
-            primary node toggle in <Text style={{ color: C.cyan }}>{"// nodes"}</Text> sets where
-            shorthand calls (e.g. autospawn) land. health / tool roster auto-syncs every 60s
-            for enabled nodes.
+          <Text style={[s.helperFine, { marginTop: 16, color: C.textDim }]}>
+            primary node (// nodes) = where shorthand calls land · roster auto-syncs 60s.
           </Text>
         </ScrollView>
       )}

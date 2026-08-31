@@ -1189,11 +1189,6 @@ export default function App() {
           setTab("terminal");
         }}
       />
-
-      <Text style={[s.helper, { marginTop: 18, color: C.textDim }]}>
-        diagnostics (iw reg get, iwconfig, wifi status) moved to{" "}
-        <Text style={{ color: C.cyan }}>set → // diagnostics</Text>.
-      </Text>
     </ScrollView>
   );
 
@@ -1206,8 +1201,8 @@ export default function App() {
       <View style={s.subTabBar}>
         {(["classic", "shell"] as const).map((m) => {
           const active = terminalMode === m;
-          const label = m === "classic" ? `classic · ${logs.length}` : "shell · zsh -l";
-          const icon: any = m === "classic" ? "console-network" : "console";
+          const label = m === "classic" ? `Host · ${logs.length}` : "Kali · zsh";
+          const icon: any = m === "classic" ? "android" : "linux";
           return (
             <TouchableOpacity
               key={m}
@@ -1410,8 +1405,7 @@ export default function App() {
         <MaterialCommunityIcons name="radar" size={16} color={toolbarEnabled ? C.green : C.textDim} />
       </TouchableOpacity>
       <Text style={s.helper}>
-        a draggable, edge-snapping HUD for quick MCP/app actions. drag to reposition,
-        tap the gear inside to add or edit tactical buttons.
+        draggable HUD for quick MCP/app actions · tap its gear to edit buttons.
       </Text>
 
       {/* ─── Over-other-apps system overlay. This is the *native* floating
@@ -1437,15 +1431,14 @@ export default function App() {
       </TouchableOpacity>
       {!HAS_OVERLAY ? (
         <Text style={[s.helper, { color: C.yellow }]}>
-          ⚠ available only in the installed APK — not Expo Go or the web preview.
+          ⚠ installed APK only — not Expo Go / web preview.
         </Text>
       ) : (
         <Text style={s.helper}>
-          floats over every app. permission:{" "}
+          floats over every app · perm:{" "}
           <Text style={{ color: overlayPerm ? C.green : C.red }}>
             {overlayPerm ? "granted" : "not granted"}
           </Text>
-          . MCP buttons fire silently; SNAP/PULL/REVIVE bring Enforcer forward.
         </Text>
       )}
 
@@ -1507,32 +1500,40 @@ export default function App() {
           </Text>
         </View>
       )}
-      <View style={s.kvBlock}>
+      <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6, marginTop: 2 }}>
         {(["settings", "logs", "profiles", "aiProfiles", "pcapEndpoints"] as const).map((key) => {
           const st = dataState[key];
-          const label =
-            key === "settings" ? "settings (local)" :
-            key === "logs" ? "command logs (local)" :
-            key === "profiles" ? "profiles (local)" :
-            key === "aiProfiles" ? "ai-profiles (local)" :
-            "pcap-endpoints (local)";
-          let value: string;
-          let color: string;
-          if (st.kind === "loading") { value = "loading…"; color = C.yellow; }
-          else if (st.kind === "ok") {
-            value = st.count !== undefined ? `OK · ${st.count} item${st.count === 1 ? "" : "s"}` : "OK";
-            color = C.green;
-          }
-          else { value = `ERR · ${st.message}`; color = C.red; }
-          return <KV key={key} k={label} v={value} vColor={color} />;
+          const kw =
+            key === "settings" ? "cfg" :
+            key === "logs" ? "logs" :
+            key === "profiles" ? "prof" :
+            key === "aiProfiles" ? "agents" : "pcap";
+          let dot: string; let count: string;
+          if (st.kind === "loading") { dot = C.yellow; count = "…"; }
+          else if (st.kind === "ok") { dot = C.green; count = st.count !== undefined ? String(st.count) : "✓"; }
+          else { dot = C.red; count = "!"; }
+          return (
+            <View
+              key={key}
+              testID={`data-bulb-${key}`}
+              style={{
+                flexDirection: "row", alignItems: "center",
+                borderWidth: 1, borderColor: C.border, borderRadius: 3,
+                paddingHorizontal: 7, paddingVertical: 4, backgroundColor: C.panel,
+              }}
+            >
+              <View style={{ width: 7, height: 7, borderRadius: 4, backgroundColor: dot, marginRight: 5 }} />
+              <Text style={{ fontFamily: MONO, fontSize: 10, color: C.textDim }}>{kw} </Text>
+              <Text style={{ fontFamily: MONO, fontSize: 10, color: dot }}>{count}</Text>
+            </View>
+          );
         })}
-        {!settingsLoaded.current && dataState.settings.kind === "error" && (
-          <Text style={[s.helper, { color: C.red, marginTop: 6 }]}>
-            ⚠ settings not loaded — writes BLOCKED to prevent clobbering backend.
-            Tap reload to retry; toggling exec mode won&apos;t persist until settings load.
-          </Text>
-        )}
       </View>
+      {!settingsLoaded.current && dataState.settings.kind === "error" && (
+        <Text style={[s.helper, { color: C.red, marginTop: 6 }]}>
+          ⚠ settings not loaded — writes BLOCKED. tap reload to retry.
+        </Text>
+      )}
 
       <Text style={[s.sectionTitle, { marginTop: 24 }]}>// execution mode</Text>
       <View style={s.segGroup}>
@@ -1619,9 +1620,6 @@ export default function App() {
           REAL/KALI are only available in the built APK.
         </Text>
       )}
-      <Text style={[s.helper, { marginTop: 4, color: C.cyan }]}>
-        ℹ this selection persists across app restarts.
-      </Text>
 
       {execMode === "kali" && (
         <View style={[s.field, { marginTop: 10 }]}>
@@ -1636,15 +1634,8 @@ export default function App() {
             autoCapitalize="none"
             autoCorrect={false}
           />
-          <Text style={[s.helper, { marginTop: 4 }]}>
-            Default (OffSec NetHunter, data_mirror bypass) is set — works through Android data isolation.{"\n"}
-            Alternatives if your chroot lives elsewhere:{"\n"}
-            • <Text style={{ color: C.cyan }}>bootkali custom_cmd</Text> (if accessible from app context){"\n"}
-            • <Text style={{ color: C.cyan }}>sh /system/bin/bootkali custom_cmd</Text>{"\n"}
-            • Direct chroot to your own kalifs path
-          </Text>
           <Text style={s.helper}>
-            wrap: <Text style={{ color: C.magenta }}>{chrootPath.length > 80 ? chrootPath.slice(0, 77) + "…" : chrootPath}</Text>{" "}<Text style={{ color: C.green }}>&lt;cmd&gt;</Text>
+            wrap: <Text style={{ color: C.magenta }}>{chrootPath.length > 60 ? chrootPath.slice(0, 57) + "…" : chrootPath}</Text>{" "}<Text style={{ color: C.green }}>&lt;cmd&gt;</Text>
           </Text>
         </View>
       )}
@@ -1737,18 +1728,7 @@ export default function App() {
         <Text style={[s.rowText, { color: C.red }]}>clear all terminal logs</Text>
       </TouchableOpacity>
 
-      <Text style={[s.sectionTitle, { marginTop: 24 }]}>// real root</Text>
-      <View style={s.infoBox}>
-        <Text style={s.infoText}>
-          {`Preview executes commands via mock. To run real \`su -c\` on your S10+:\n\n`}
-          <Text style={{ color: C.cyan }}>1.</Text>{` See /app/root-bridge/README.md\n`}
-          <Text style={{ color: C.cyan }}>2.</Text>{` Build APK: \`eas build -p android --profile preview\`\n`}
-          <Text style={{ color: C.cyan }}>3.</Text>{` Sideload + grant root in Magisk\n\n`}
-          <Text style={{ color: C.yellow }}>{`The Kotlin native module (RootShellModule.kt) is already scaffolded.`}</Text>
-        </Text>
-      </View>
-
-      <Text style={[s.helper, { marginTop: 24, textAlign: "center" }]}>Enforcer Framework · v0.7</Text>
+      <Text style={[s.helper, { marginTop: 24, textAlign: "center" }]}>Enforcer Framework · v0.9</Text>
     </ScrollView>
   );
 
@@ -1828,7 +1808,7 @@ export default function App() {
           <View style={{ flexDirection: "row", alignItems: "center" }}>
             <MaterialCommunityIcons name="shield-lock" size={20} color={C.green} />
             <Text style={[s.headerTitle, { marginLeft: 8 }]}>Enforcer Framework</Text>
-            <Text style={s.headerVer}>v0.7</Text>
+            <Text style={s.headerVer}>v0.9</Text>
           </View>
           <View style={{ flexDirection: "row", alignItems: "center" }}>
             {running && <ActivityIndicator size="small" color={C.green} style={{ marginRight: 8 }} />}
@@ -1889,7 +1869,7 @@ export default function App() {
             Profiles + AI agents stay nested under Settings sub-tabs so we
             don't blow past the comfortable tap-target width on the S10+. */}
         <View style={s.tabbar}>
-          <TabBtn t="quick" cur={tab} icon="flash" label="quick" onPress={setTab} />
+          <TabBtn t="quick" cur={tab} icon="wifi" label="WLAN" onPress={setTab} />
           {/* term tab badge intentionally removed — it used to show
               logs.length (classic terminal command count), which had
               nothing to do with the persistent shell session and was

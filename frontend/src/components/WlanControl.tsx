@@ -333,10 +333,6 @@ export default function WlanControl({
           />
         ))}
       </View>
-      <Text style={[s.helperFine, { marginTop: 8, color: C.textDim }]}>
-        tip: setting a channel requires monitor mode or an unassociated managed iface.
-        driver may reject if the channel is outside the current reg domain.
-      </Text>
     </View>
   );
 }

@@ -725,3 +725,36 @@ Fix (app/index.tsx):
   * REMOVE the bottom text block about mock mode (no longer needed).
 - Goal: tighter, cleaner, more breathing room. Keep the rugged design_guidelines
   aesthetic. All JS-only; verify on APK.
+
+### 🎨 UI DECLUTTER — Phase 1 (done, per UIpoets.docx + Enforcer-Design-v2.md review)
+User uploaded 2 design docs (screen-by-screen Gemini teardown + established design
+system). Agreed phasing: P1 = safe declutter/renames/v0.9; P2 = WLAN landing rework;
+P3 = terminal upgrades + 2 MCP bugs; later = Multi-Interface Hub + AI-chat patterns.
+Agent objections user AGREED to: (1) keep WLAN toggles as staged-profile model (do
+NOT collapse to Managed/Monitor/Injection mode switch); (2) keep channel grid but
+collapse to compact Ch▼/Tx▼ readout only AFTER Enforcer Toolbar wheels are real
+(they're still placeholders); (3) Multi-Interface Hub = its own later phase.
+
+Phase 1 shipped (JS-only, bundle compiles HTTP 200, lint clean):
+- Tab "quick" → "WLAN" (icon wifi). Tab id stays "quick" internally.
+- Terminal mode labels: "classic·N"/"shell·zsh -l" → "Host·N" (android icon) /
+  "Kali·zsh" (linux icon).
+- v0.7 → v0.9 (header badge + settings footer). Only 2 spots existed.
+- Removed text blocks: WLAN "diag moved" note; Settings "// real root" mock/README
+  essay; WlanControl channel "tip: monitor mode…" explainer; chroot-helper
+  alternatives essay (kept field + 1-line wrap preview); "ℹ persists across
+  restarts" line; trimmed command-overlay + over-other-apps helper paragraphs.
+- LIVE tab: removed the big green bridge-diagnostic chip block (bridgeBar) +
+  probeMethod + probeResult state + now-unused RootShell/HAS_NATIVE_ROOT import.
+- Settings "// data status": stacked KV list → compact HORIZONTAL bulb strip
+  (dot + keyword cfg/logs/prof/agents/pcap + count). testID data-bulb-<key>.
+- MCP tab: trimmed "// notes" section to one helperFine line.
+
+NOTE for user Q "what is the api url at top of settings?": it's
+`${EXPO_PUBLIC_BACKEND_URL}/api` (const API, index.tsx:57) — the resolved backend
+base. App data is local SQLite now, so it's mostly used by the // data status
+"ping" diagnostic + passed to tabs as apiBase. Candidate to hide/relocate in P2.
+
+Phase 1 testing: web preview can't render (expo-sqlite web crash) so testing_agent
+browser flows N/A — verify on APK. Remaining P2/P3 + 2 MCP bugs (tool-scan flicker/
+multi-scan, audit log missing source/IP) still queued.
