@@ -785,3 +785,35 @@ DEFERRED to later phase (user OK): $CC tappable badge + Multi-Interface Hub (mer
 STILL QUEUED: Phase 3 (terminal Connect/Kill dynamic btn, keyboard accessory strip,
 A-/A+ font + horiz scroll) + 2 MCP bugs (tool-scan flicker/multi-scan; audit missing
 source/IP) + MCP "make-it-feel-like-a-menu" rethink.
+
+### 🎨 UI Phase 3 — terminal upgrades + 2 MCP bugs (done)
+MCP BUGS FIXED:
+- Tool-scan flicker / "scans lots of times": root cause = the RESYNC fan-out (added
+  earlier) called syncToolsNow per node, and each call flipped toolSyncStatus
+  syncing→synced AND setTools → visible flicker + repeated "scanning". Fix: added
+  `skipStatus` opt to syncToolsNow; batch RESYNC passes {silent:true,skipStatus:true}
+  so per-source calls do NO UI writes; handleManualResync sets status + setTools ONCE
+  at the end.
+- Audit log "no source/IP": renderer showed client= but it was always "(unknown)"
+  because server client_id came through empty/under another key. Fix (localDb
+  syncAuditFromServer): map source from client_id|client|source|remote_addr|peer|ip,
+  and FALL BACK to the host the audit was polled from (new sourceHost param, passed
+  as probeHost from MCPTab). Relabeled render "client=" → "src=". Now always shows a
+  host/IP.
+
+TERMINAL (TerminalShell.tsx):
+- Added keyboard accessory strip (horizontal, only while a live PTY exists):
+  esc/tab/^C/^D/^Z/|/~///-/↑↓←→ — sends raw control seqs to the PTY via writeStdin.
+  testID termkey-<label>.
+- Added a STATIC status dot in the pill (green/yellow/red) — deliberately NOT animated
+  (JNI weak-global-ref overflow lesson: avoid continuous RN animations).
+- Dynamic OPEN SHELL ↔ CLOSE button already existed (kept).
+- DEFERRED: A-/A+ font-size toggle + horizontal output scroll — lives inside the xterm
+  WebView (XTermView), needs postMessage plumbing; parked to keep phase contained.
+
+All JS-only, lint clean, android bundle HTTP 200. Verify on APK.
+
+REMAINING BACKLOG: MCP "make-it-feel-like-a-menu" rethink (vague, needs direction);
+terminal A-/A+ + horiz scroll; $CC badge + Multi-Interface Hub; WLAN presets Redis-sync
+decision; AI-tab chat-UI patterns from Enforcer-Design-v2.md (thought blocks, host-chips,
+slide-to-authorize) — hold until AI tab revisit.

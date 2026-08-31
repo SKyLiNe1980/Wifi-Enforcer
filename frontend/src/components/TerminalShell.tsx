@@ -18,7 +18,7 @@
  *     and find their shell still alive with command history intact.
  */
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import { Alert, Platform, StyleSheet, Text, TouchableOpacity, View } from "react-native";
+import { Alert, Platform, ScrollView, StyleSheet, Text, TouchableOpacity, View } from "react-native";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import * as Clipboard from "expo-clipboard";
 import { sessionManager, SessionState } from "../lib/sessionManager";
@@ -207,6 +207,31 @@ export default function TerminalShell({ execMode, wrap, sshMode = false, pending
     [sessionId],
   );
 
+  // ─── Keyboard accessory strip ────────────────────────────────────────
+  // Soft keyboards on Android lack the keys that make a shell usable
+  // (Tab-completion, Ctrl-C, pipe, history arrows, Esc for vi). This strip
+  // sends the raw control sequences straight to the PTY over stdin.
+  const sendKey = useCallback((seq: string) => {
+    if (!sessionId) return;
+    writeStdin(sessionId, seq, false).catch(() => {});
+  }, [sessionId]);
+
+  const QUICK_KEYS: { label: string; seq: string; color?: string }[] = [
+    { label: "esc", seq: "\x1b" },
+    { label: "tab", seq: "\t" },
+    { label: "^C", seq: "\x03", color: C.red },
+    { label: "^D", seq: "\x04", color: C.red },
+    { label: "^Z", seq: "\x1a", color: C.red },
+    { label: "|", seq: "|" },
+    { label: "~", seq: "~" },
+    { label: "/", seq: "/" },
+    { label: "-", seq: "-" },
+    { label: "↑", seq: "\x1b[A", color: C.cyan },
+    { label: "↓", seq: "\x1b[B", color: C.cyan },
+    { label: "←", seq: "\x1b[D", color: C.cyan },
+    { label: "→", seq: "\x1b[C", color: C.cyan },
+  ];
+
   // ─── Quick-command injection from parent ─────────────────────────────
   // The parent's quick action buttons can push a one-shot command into
   // the shell via the `pendingInjection` prop. We dedupe by .id so the
@@ -275,6 +300,13 @@ export default function TerminalShell({ execMode, wrap, sshMode = false, pending
 
         {session && (
           <View style={s.statusPill}>
+            <View style={[s.statusDot, {
+              backgroundColor:
+                session.status === "running" ? C.green
+                : session.status === "starting" ? C.yellow
+                : session.status === "ended" ? C.textDim
+                : C.red,
+            }]} />
             <Text
               style={[
                 s.statusText,
@@ -293,6 +325,26 @@ export default function TerminalShell({ execMode, wrap, sshMode = false, pending
           </View>
         )}
       </View>
+
+      {/* Keyboard accessory strip — only useful while a live PTY exists */}
+      {running && (
+        <View style={s.keyStrip}>
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} keyboardShouldPersistTaps="always"
+            contentContainerStyle={{ paddingHorizontal: 8, gap: 6, alignItems: "center" }}>
+            {QUICK_KEYS.map((k) => (
+              <TouchableOpacity
+                key={k.label}
+                testID={`termkey-${k.label}`}
+                onPress={() => sendKey(k.seq)}
+                style={s.keyBtn}
+                activeOpacity={0.7}
+              >
+                <Text style={[s.keyBtnText, k.color && { color: k.color }]}>{k.label}</Text>
+              </TouchableOpacity>
+            ))}
+          </ScrollView>
+        </View>
+      )}
 
       {/* xterm transcript */}
       {session ? (
@@ -341,8 +393,19 @@ const s = StyleSheet.create({
     borderRadius: 4, borderWidth: 1, borderColor: C.border, backgroundColor: C.panel2,
   },
   miniBtnText: { fontFamily: MONO, fontSize: 11, color: C.textDim },
-  statusPill: { marginLeft: "auto", paddingHorizontal: 8, paddingVertical: 4 },
+  statusPill: { marginLeft: "auto", flexDirection: "row", alignItems: "center", gap: 5, paddingHorizontal: 8, paddingVertical: 4 },
+  statusDot: { width: 8, height: 8, borderRadius: 4 },
   statusText: { fontFamily: MONO, fontSize: 10 },
+  keyStrip: {
+    backgroundColor: C.panel2, borderBottomWidth: 1, borderBottomColor: C.border,
+    paddingVertical: 6,
+  },
+  keyBtn: {
+    minWidth: 40, alignItems: "center", justifyContent: "center",
+    paddingHorizontal: 10, paddingVertical: 7,
+    borderRadius: 4, borderWidth: 1, borderColor: C.border, backgroundColor: C.panel,
+  },
+  keyBtnText: { fontFamily: MONO, fontSize: 13, color: C.text, fontWeight: "700" },
   idle: { flex: 1, alignItems: "center", justifyContent: "center", padding: 30 },
   idleText: { color: C.text, fontFamily: MONO, fontSize: 12, textAlign: "center", marginTop: 12, lineHeight: 18 },
   idleHint: { color: C.yellow, fontFamily: MONO, fontSize: 11, marginTop: 18, textAlign: "center" },
