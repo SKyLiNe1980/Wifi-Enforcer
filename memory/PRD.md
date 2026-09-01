@@ -817,3 +817,15 @@ REMAINING BACKLOG: MCP "make-it-feel-like-a-menu" rethink (vague, needs directio
 terminal A-/A+ + horiz scroll; $CC badge + Multi-Interface Hub; WLAN presets Redis-sync
 decision; AI-tab chat-UI patterns from Enforcer-Design-v2.md (thought blocks, host-chips,
 slide-to-authorize) — hold until AI tab revisit.
+
+### Post-build tweaks (user feedback on APK)
+- WLAN "save combo" button misaligned with "// presets" title: Android mono-text
+  includeFontPadding was offsetting the title from the vertically-centered chip. Fix:
+  added includeFontPadding:false + textAlignVertical:center to WlanControl sectionTitle
+  and includeFontPadding:false to chipText; removed the button's paddingVertical:4
+  override so it matches sibling chips. (verify on next build)
+- MCP //server Transport http+sse helper: "client endpoint (Postman/Hermes use this):"
+  → "client endpoint:" (dropped the postman/hermes bit).
+- SSH backend defaults (sshConfig.defaultSshConfig): port 9922→22, user kali→root
+  (typical over-tailnet root SSH). NOTE: only affects FRESH/unset config — existing
+  SAVED ssh configs are preserved (loadSshConfig merges saved over defaults).

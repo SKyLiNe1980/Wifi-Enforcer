@@ -22,7 +22,7 @@ const PW_KEY = "ssh_backend_password";
 const KEYPEM_KEY = "ssh_backend_key";
 
 export function defaultSshConfig(): SshBackendConfig {
-  return { enabled: false, host: "", port: 9922, user: "kali", authMode: "password", fingerprint: "", chrootBootstrap: false };
+  return { enabled: false, host: "", port: 22, user: "root", authMode: "password", fingerprint: "", chrootBootstrap: false };
 }
 
 export async function loadSshConfig(): Promise<SshBackendConfig> {

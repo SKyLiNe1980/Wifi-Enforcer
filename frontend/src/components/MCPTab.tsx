@@ -1869,7 +1869,7 @@ export default function MCPTab() {
               {"Transport: "}<Text style={{ color: C.cyan }}>HTTP + SSE</Text>
             </Text>
             <Text style={[s.helperFine, { marginTop: 4 }]}>
-              {"client endpoint (Postman/Hermes use this):"}
+              {"client endpoint:"}
             </Text>
             <Text style={[s.helperFine, { marginTop: 2 }]}>
               <Text style={{ color: C.cyan }}>http://{config.bind_host}:{config.port}/mcp</Text>
