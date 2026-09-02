@@ -1452,33 +1452,6 @@ export default function App() {
       )}
 
 
-      {/* ─── Diagnostics — read-only wlan queries relocated from the
-          Quick tab when the toggle-based redesign landed. These don't
-          fit the toggle pattern (no on/off state, just print info) so
-          they live here as one-shot introspection cards. ─── */}
-      <Text style={[s.sectionTitle, { marginTop: 18 }]}>{"// diagnostics"}</Text>
-      <View style={s.grid}>
-        {QUICK_COMMANDS.map((q, i) => {
-          const cmd = q.cmd(ctxActive);
-          return (
-            <TouchableOpacity
-              key={i}
-              testID={`diag-${i}`}
-              style={s.gridItem}
-              onPress={() => { execute(cmd); setTerminalMode("classic"); setTab("terminal"); }}
-              disabled={running}
-              activeOpacity={0.7}
-            >
-              <View style={{ flexDirection: "row", alignItems: "center", marginBottom: 4 }}>
-                <MaterialCommunityIcons name={q.icon} size={16} color={C.green} />
-                <Text style={[s.gridLabel, { marginLeft: 6 }]}>{q.label}</Text>
-              </View>
-              <Text style={s.gridCmd} numberOfLines={1}>{cmd}</Text>
-            </TouchableOpacity>
-          );
-        })}
-      </View>
-
       {/* ─── Data load status — visibility into the previously-silent
           fetch-failure mode that caused "exec_mode stuck on mock" + "AI
           tab empty" etc. Each row shows OK/loading/error + a count or

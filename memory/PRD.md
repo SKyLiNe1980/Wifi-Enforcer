@@ -829,3 +829,18 @@ slide-to-authorize) — hold until AI tab revisit.
 - SSH backend defaults (sshConfig.defaultSshConfig): port 9922→22, user kali→root
   (typical over-tailnet root SSH). NOTE: only affects FRESH/unset config — existing
   SAVED ssh configs are preserved (loadSshConfig merges saved over defaults).
+
+### Removed Settings // diagnostics section (user call)
+The 3 relocated diag buttons were: `iw reg get`, `iwconfig`, `cmd wifi status`.
+Verdict (with user): iw reg get = redundant (regdom box+switch own it); iwconfig
+belongs on the Live tab (part of the OLD lost live-telemetry set); wifi status
+(Android host wifi state) = low value. Removed the whole // diagnostics section from
+renderGeneralSettings.
+- QUICK_COMMANDS const kept (still the fallback payload for saveCurrentAsProfile, i.e.
+  the top "// wlan control → save as profile" + terminal "save as profile-tab" buttons).
+  ⚠ THOSE BUTTONS ARE NOW SEMI-ORPHANED — their only payload is the 3 removed diag cmds.
+  Candidate to remove or repoint at the WLAN combo next (flagged to user, not yet done).
+- Couldn't recover the OLD Live-tab telemetry items: git history for LiveTab only goes
+  back to this session (pre-fork / pre-local-sqlite history not in this repo). User just
+  wanted to remember what they were — not available. Recreate from scratch when we
+  rebuild Live telemetry (iwconfig-based mode/channel/tx/mac + whatever else).
