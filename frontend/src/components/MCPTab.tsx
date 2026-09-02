@@ -1833,27 +1833,37 @@ export default function MCPTab() {
     <View style={s.container}>
       {/* SUB-TAB BAR */}
       <View style={s.subTabBar}>
-        {(["status", "tools", "nodes", "audit"] as SubTab[]).map((st) => (
-          <TouchableOpacity
-            key={st}
-            onPress={() => setSubTab(st)}
-            style={[s.subTabBtn, subTab === st && s.subTabBtnActive]}
-            activeOpacity={0.7}
-          >
-            <Text
-              style={[s.subTabText, subTab === st && { color: C.mcpAccent }]}
-              numberOfLines={1}
-              adjustsFontSizeToFit
-              minimumFontScale={0.7}
-              allowFontScaling={false}
+        {([
+          { key: "status", label: "status", icon: "heart-pulse", count: null as number | null },
+          { key: "tools", label: "tools", icon: "hammer-wrench", count: tools.length },
+          { key: "nodes", label: "nodes", icon: "server-network", count: nodes.length },
+          { key: "audit", label: "audit", icon: "clipboard-text-clock", count: audit.length },
+        ] as { key: SubTab; label: string; icon: any; count: number | null }[]).map((it) => {
+          const active = subTab === it.key;
+          return (
+            <TouchableOpacity
+              key={it.key}
+              testID={`mcp-subtab-${it.key}`}
+              onPress={() => setSubTab(it.key)}
+              style={[s.subTabBtn, active && s.subTabBtnActive]}
+              activeOpacity={0.7}
             >
-              {st === "status" ? "// status"
-                : st === "tools" ? `// tools (${tools.length})`
-                : st === "nodes" ? `// nodes (${nodes.length})`
-                : `// audit (${audit.length})`}
-            </Text>
-          </TouchableOpacity>
-        ))}
+              <MaterialCommunityIcons name={it.icon} size={15} color={active ? C.mcpAccent : C.textDim} />
+              <Text
+                style={[s.subTabText, active && { color: C.mcpAccent }]}
+                numberOfLines={1}
+                allowFontScaling={false}
+              >
+                {it.label}
+              </Text>
+              {it.count !== null && (
+                <View style={[s.subTabBadge, active && s.subTabBadgeActive]}>
+                  <Text style={[s.subTabBadgeText, active && { color: C.bg }]}>{it.count}</Text>
+                </View>
+              )}
+            </TouchableOpacity>
+          );
+        })}
       </View>
 
       {/* STATUS PANE */}
@@ -3593,11 +3603,21 @@ const s = StyleSheet.create({
   container: { flex: 1, backgroundColor: C.bg },
   subTabBar: {
     flexDirection: "row", borderBottomWidth: 1, borderColor: C.border,
-    backgroundColor: C.panel,
+    backgroundColor: C.panel, paddingHorizontal: 8, paddingVertical: 8, gap: 6,
   },
-  subTabBtn: { flex: 1, paddingVertical: 12, alignItems: "center" },
-  subTabBtnActive: { borderBottomWidth: 2, borderColor: C.mcpAccent },
-  subTabText: { fontFamily: MONO, color: C.textDim, fontSize: 12, letterSpacing: 0.5, width: "100%", textAlign: "center" },
+  subTabBtn: {
+    flex: 1, flexDirection: "row", alignItems: "center", justifyContent: "center",
+    gap: 4, paddingVertical: 8, paddingHorizontal: 4,
+    borderWidth: 1, borderColor: C.border, borderRadius: 4, backgroundColor: C.panel2,
+  },
+  subTabBtnActive: { borderColor: C.mcpAccent, backgroundColor: "#0d2733" },
+  subTabText: { fontFamily: MONO, color: C.textDim, fontSize: 11, fontWeight: "700", letterSpacing: 0.5, includeFontPadding: false },
+  subTabBadge: {
+    minWidth: 18, paddingHorizontal: 5, paddingVertical: 1, borderRadius: 8,
+    backgroundColor: C.border, alignItems: "center", justifyContent: "center",
+  },
+  subTabBadgeActive: { backgroundColor: C.mcpAccent },
+  subTabBadgeText: { fontFamily: MONO, fontSize: 9, fontWeight: "800", color: C.textDim, includeFontPadding: false },
   sectionTitle: { fontFamily: MONO, color: C.textDim, fontSize: 12, letterSpacing: 0.5, marginBottom: 6 },
   card: {
     backgroundColor: C.panel, borderWidth: 1, borderColor: C.border,
