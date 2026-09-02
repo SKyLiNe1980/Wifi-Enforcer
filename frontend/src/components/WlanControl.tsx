@@ -322,7 +322,7 @@ export default function WlanControl({
             testID="btn-save-combo"
             onPress={() => onSaveCombo(buildComboFromState())}
             disabled={disabled || !state}
-            style={[s.chip, { borderColor: C.green, paddingVertical: 4 }]}
+            style={[s.chip, { borderColor: C.green }]}
           >
             <MaterialCommunityIcons name="content-save" size={12} color={C.green} />
             <Text style={[s.chipText, { color: C.green, marginLeft: 4, fontSize: 11 }]}>save combo</Text>
@@ -509,7 +509,7 @@ function ChannelChip({ ch, active, busy, onPress, disabled }: {
 
 const s = StyleSheet.create({
   root: { paddingVertical: 4 },
-  sectionTitle: { color: C.green, fontFamily: MONO, fontSize: 12, fontWeight: "700", letterSpacing: 1 },
+  sectionTitle: { color: C.green, fontFamily: MONO, fontSize: 12, fontWeight: "700", letterSpacing: 1, includeFontPadding: false, textAlignVertical: "center" },
   sectionRow: {
     flexDirection: "row", justifyContent: "space-between", alignItems: "center",
     marginTop: 16,
@@ -522,7 +522,7 @@ const s = StyleSheet.create({
     backgroundColor: C.panel, alignItems: "center", justifyContent: "center",
     flexDirection: "row",
   },
-  chipText: { color: C.green, fontFamily: MONO, fontSize: 12, fontWeight: "600" },
+  chipText: { color: C.green, fontFamily: MONO, fontSize: 12, fontWeight: "600", includeFontPadding: false },
   card: {
     padding: 12, borderWidth: 1, borderColor: C.border, borderRadius: 4,
     backgroundColor: C.panel, marginTop: 6,

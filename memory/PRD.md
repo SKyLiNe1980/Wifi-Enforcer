@@ -817,3 +817,50 @@ REMAINING BACKLOG: MCP "make-it-feel-like-a-menu" rethink (vague, needs directio
 terminal A-/A+ + horiz scroll; $CC badge + Multi-Interface Hub; WLAN presets Redis-sync
 decision; AI-tab chat-UI patterns from Enforcer-Design-v2.md (thought blocks, host-chips,
 slide-to-authorize) — hold until AI tab revisit.
+
+### Post-build tweaks (user feedback on APK)
+- WLAN "save combo" button misaligned with "// presets" title: Android mono-text
+  includeFontPadding was offsetting the title from the vertically-centered chip. Fix:
+  added includeFontPadding:false + textAlignVertical:center to WlanControl sectionTitle
+  and includeFontPadding:false to chipText; removed the button's paddingVertical:4
+  override so it matches sibling chips. (verify on next build)
+- MCP //server Transport http+sse helper: "client endpoint (Postman/Hermes use this):"
+  → "client endpoint:" (dropped the postman/hermes bit).
+- SSH backend defaults (sshConfig.defaultSshConfig): port 9922→22, user kali→root
+  (typical over-tailnet root SSH). NOTE: only affects FRESH/unset config — existing
+  SAVED ssh configs are preserved (loadSshConfig merges saved over defaults).
+
+### Removed Settings // diagnostics section (user call)
+The 3 relocated diag buttons were: `iw reg get`, `iwconfig`, `cmd wifi status`.
+Verdict (with user): iw reg get = redundant (regdom box+switch own it); iwconfig
+belongs on the Live tab (part of the OLD lost live-telemetry set); wifi status
+(Android host wifi state) = low value. Removed the whole // diagnostics section from
+renderGeneralSettings.
+- QUICK_COMMANDS const kept (still the fallback payload for saveCurrentAsProfile, i.e.
+  the top "// wlan control → save as profile" + terminal "save as profile-tab" buttons).
+  ⚠ THOSE BUTTONS ARE NOW SEMI-ORPHANED — their only payload is the 3 removed diag cmds.
+  Candidate to remove or repoint at the WLAN combo next (flagged to user, not yet done).
+- Couldn't recover the OLD Live-tab telemetry items: git history for LiveTab only goes
+  back to this session (pre-fork / pre-local-sqlite history not in this repo). User just
+  wanted to remember what they were — not available. Recreate from scratch when we
+  rebuild Live telemetry (iwconfig-based mode/channel/tx/mac + whatever else).
+
+### Fix: cron watchdog hardcoded 127.0.0.1 (server-side, enforcer-mcp .deb)
+/app/enforcer-mcp/scripts/enforcer-mcp-watchdog probed http://127.0.0.1:$PORT/health.
+On tailnet nodes server.host binds to a Tailscale IP, so loopback missed it → the
+watchdog false-declared "wedged" and restarted the service every 2 min. Fix: parse
+server.host from config.yaml (same awk as PORT), map 0.0.0.0→127.0.0.1, probe the
+configured host FIRST then fall back to loopback; only restart if BOTH fail. sh -n OK.
+⚠ SERVER-SIDE: ships in the enforcer-mcp .deb — takes effect after rebuilding the .deb
+and nodes pulling/installing it (app's node deploy/update flow), not via the mobile build.
+
+### Live-tab items — status
+Old Live-tab telemetry items are LOST (no git/chat history to recover; fork = clean
+context). Plan: brainstorm fresh out-of-the-box Live items + bring back add/edit Live
+items editor (still on TODO). iwconfig-driven readout (mode/channel/tx/mac) is the
+obvious anchor since iwconfig belongs on Live.
+
+### Save-as-profile — DEFERRED rethink (user)
+Leave the "save as profile" buttons as-is for now. Rethink ENTIRELY what a useful
+profile save looks like (regdom-only has little value). Likely: a full named staged
+combo (regdom + iface + monitor + channel + preset) that re-applies in one tap.
