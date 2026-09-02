@@ -25,11 +25,23 @@ if ! "$INITD" status >/dev/null 2>&1; then
 fi
 
 # 2) Alive but wedged → verify it actually answers /health, else restart.
-#    Pull the port straight out of the server: block in config.yaml.
+#    Pull the port AND bind host straight out of the server: block in
+#    config.yaml. On tailnet nodes server.host is a Tailscale IP, so a
+#    hardcoded 127.0.0.1 probe would miss it and false-restart every cycle.
 PORT=$(awk '/^server:/{f=1; next} /^[^[:space:]]/{f=0} f && /port:/{print $2; exit}' "$CONFIG" 2>/dev/null | tr -d '"')
 [ -z "$PORT" ] && PORT=8765
+HOST=$(awk '/^server:/{f=1; next} /^[^[:space:]]/{f=0} f && /host:/{print $2; exit}' "$CONFIG" 2>/dev/null | tr -d '"')
+[ -z "$HOST" ] && HOST=127.0.0.1
+# 0.0.0.0 is a bind-all wildcard, not a routable client target → loopback.
+[ "$HOST" = "0.0.0.0" ] && HOST=127.0.0.1
 
 if command -v curl >/dev/null 2>&1; then
-    curl -fsS -m 5 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 || "$INITD" restart
+    # Probe the configured bind host first (tailnet IP on most nodes), then
+    # fall back to loopback before declaring the server wedged — so an IP
+    # change or a bind-all config never triggers a false-positive restart.
+    if ! curl -fsS -m 5 "http://$HOST:$PORT/health" >/dev/null 2>&1 \
+       && ! curl -fsS -m 5 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
+        "$INITD" restart
+    fi
 fi
 exit 0

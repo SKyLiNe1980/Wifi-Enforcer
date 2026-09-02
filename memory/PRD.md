@@ -844,3 +844,23 @@ renderGeneralSettings.
   back to this session (pre-fork / pre-local-sqlite history not in this repo). User just
   wanted to remember what they were — not available. Recreate from scratch when we
   rebuild Live telemetry (iwconfig-based mode/channel/tx/mac + whatever else).
+
+### Fix: cron watchdog hardcoded 127.0.0.1 (server-side, enforcer-mcp .deb)
+/app/enforcer-mcp/scripts/enforcer-mcp-watchdog probed http://127.0.0.1:$PORT/health.
+On tailnet nodes server.host binds to a Tailscale IP, so loopback missed it → the
+watchdog false-declared "wedged" and restarted the service every 2 min. Fix: parse
+server.host from config.yaml (same awk as PORT), map 0.0.0.0→127.0.0.1, probe the
+configured host FIRST then fall back to loopback; only restart if BOTH fail. sh -n OK.
+⚠ SERVER-SIDE: ships in the enforcer-mcp .deb — takes effect after rebuilding the .deb
+and nodes pulling/installing it (app's node deploy/update flow), not via the mobile build.
+
+### Live-tab items — status
+Old Live-tab telemetry items are LOST (no git/chat history to recover; fork = clean
+context). Plan: brainstorm fresh out-of-the-box Live items + bring back add/edit Live
+items editor (still on TODO). iwconfig-driven readout (mode/channel/tx/mac) is the
+obvious anchor since iwconfig belongs on Live.
+
+### Save-as-profile — DEFERRED rethink (user)
+Leave the "save as profile" buttons as-is for now. Rethink ENTIRELY what a useful
+profile save looks like (regdom-only has little value). Likely: a full named staged
+combo (regdom + iface + monitor + channel + preset) that re-applies in one tap.
