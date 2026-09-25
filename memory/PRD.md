@@ -924,3 +924,32 @@ the termRef scroll effect. runProfile no longer jumps to the (gone) classic view
 to command_logs and shows an Alert summary. `logs` state now write-only (persists to SQLite;
 in-memory array vestigial, harmless warning).
 JS-only, android bundle HTTP 200, lint clean. VERIFY ON APK (web preview = SQLite crash).
+
+### 🎨 UI RESTRUCTURE — Live tab (tab-by-tab pass 3, user notes)
+Design rule sharpened (applies app-wide): one-and-done config → Settings tab; frequently-used
+OPERATIONAL controls → grouped with what they control on their own tab. Live follows it.
+
+Fixes/changes:
+- **No more empty void**: drawer (`presetOpen`) now defaults OPEN so the tool list shows the
+  moment you land on Live — no need to hit the +. The round button became a chevron (show/hide
+  drawer) instead of add.
+- **In-tab tool editor** (replaces the old "add in Settings" dead-end / TODO): `+ new tool`
+  button in the drawer header + **long-press any tile to edit**, tap still launches. Editor
+  modal (animationType none) = name / description / command (with `&&` for pre-cmd +
+  {iface}{host}{port}{file} hints) / category chips / view-mode / icon picker / needs-
+  iface·endpoint·file toggles / SAVE + DELETE (delete hidden for builtins; builtins editable).
+  Persists via attackProfilesLocal.upsert/.delete. Kept the existing color-coded grouping.
+- **New builtin tools** (schema v14 migration removes `dmesg -w` + `iw event` builtins — they're
+  terminal cmds not live tools — and inserts, name-guarded so no dupes):
+  * Enforcer UEF (attack, xterm) — `cd /root/tools/Enforcer-UEF && python3 enforcer-console.py`
+  * Vigolium (audit, scrollback) — `vigolium server --host 0.0.0.0 --service-port 9002`
+  * Semgrep (audit, scrollback) — `semgrep scan --config auto .` (edit path via editor)
+  * EMBA (audit, xterm) — `cd /root/tools/emba && ./emba -l ~/log -f ~/firmware -p ./scan-profiles/default-scan.emba`
+  * Burp DAST (audit, scrollback) — `cd /root/tools/burp/burp-cli && ./burp-cli -s url -k apikey`
+  Added a 5th category **audit** (violet #b08aff) for appsec/code/firmware tools; recon/attack/
+  trace/pcap unchanged. seedDefaultsIfEmpty (fresh installs) mirrors the same final set.
+- **Live xterm is now interactive**: xterm-view sessions forward keystrokes to the PTY
+  (`backendWriteStdin`) so consoles like Enforcer UEF accept input (was one-way).
+- precmd folded into command_template via `&&` (no schema change; the editor edits the whole
+  line). Semgrep/others with a target default to a sane value, editable in the editor.
+JS-only, android bundle HTTP 200, lint clean. VERIFY ON APK (web preview = SQLite crash).

@@ -33,6 +33,7 @@ import {
 import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
 import { sessionManager, SessionState } from "../lib/sessionManager";
 import { hasNativeStreaming } from "../lib/rootShell";
+import { writeStdin as backendWriteStdin } from "../lib/backend";
 import { attackProfilesLocal, pcapEndpointsLocal } from "../lib/localDb";
 import { cleanAnsi } from "../lib/ansiUtils";
 import XTermView from "./XTermView";
@@ -48,6 +49,7 @@ const C = {
   catAttack: "#ff3860",
   catTrace: "#ffd400",
   catPcap: "#ff5cdb",
+  catAudit: "#b08aff",
 };
 const MONO = Platform.select({ ios: "Menlo", android: "monospace", default: "monospace" });
 
@@ -70,7 +72,7 @@ type AttackProfile = {
   name: string;
   description: string;
   icon: string;
-  category: "recon" | "attack" | "trace" | "pcap";
+  category: "recon" | "attack" | "trace" | "pcap" | "audit";
   command_template: string;
   needs_iface: boolean;
   needs_endpoint: boolean;
@@ -94,7 +96,15 @@ const CAT_COLOR: Record<AttackProfile["category"], string> = {
   attack: C.catAttack,
   trace: C.catTrace,
   pcap: C.catPcap,
+  audit: C.catAudit,
 };
+
+const CATEGORIES: AttackProfile["category"][] = ["recon", "attack", "trace", "pcap", "audit"];
+const ICON_CHOICES = [
+  "rocket-launch", "wifi-strength-4-alert", "key-variant", "shield-key", "database-export",
+  "content-save", "cloud-upload", "web", "code-tags", "chip", "bug", "sword-cross",
+  "radar", "target", "console-network", "file-search-outline", "spider", "magnify-scan",
+];
 
 /**
  * Substitute {iface}, {host}, {port}, {file} placeholders in a command_template.
@@ -118,8 +128,26 @@ export default function LiveTab(props: Props) {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [customCmd, setCustomCmd] = useState("");
   const [autoScroll, setAutoScroll] = useState(true);
-  const [presetOpen, setPresetOpen] = useState(false);
+  // Drawer shows the tool list by default so opening Live isn't an empty void.
+  const [presetOpen, setPresetOpen] = useState(true);
   const outRef = useRef<FlatList | null>(null);
+
+  // ─── Attack-profile editor modal ────────────────────────────────────────
+  // Add/edit a Live tool without leaving the tab (operational controls live
+  // with what they control). Tap a tile = launch; long-press = edit.
+  const [editorOpen, setEditorOpen] = useState(false);
+  const [editId, setEditId] = useState<string | null>(null);   // null = new
+  const [editIsBuiltin, setEditIsBuiltin] = useState(false);
+  const [edName, setEdName] = useState("");
+  const [edDesc, setEdDesc] = useState("");
+  const [edCmd, setEdCmd] = useState("");
+  const [edCat, setEdCat] = useState<AttackProfile["category"]>("recon");
+  const [edIcon, setEdIcon] = useState("rocket-launch");
+  const [edViewMode, setEdViewMode] = useState<"xterm" | "scrollback">("scrollback");
+  const [edNeedsIface, setEdNeedsIface] = useState(false);
+  const [edNeedsEndpoint, setEdNeedsEndpoint] = useState(false);
+  const [edNeedsFile, setEdNeedsFile] = useState(false);
+  const [edSaving, setEdSaving] = useState(false);
 
 
   // ─── Attack profiles (fetched from API, replaces hardcoded PRESETS) ────
@@ -302,6 +330,54 @@ export default function LiveTab(props: Props) {
     if (p) launchAttackProfile(p, ep);
   }, [pendingProfile, launchAttackProfile]);
 
+  // ─── Attack-profile editor ──────────────────────────────────────────────
+  const openNewProfile = useCallback(() => {
+    setEditId(null); setEditIsBuiltin(false);
+    setEdName(""); setEdDesc(""); setEdCmd("");
+    setEdCat("recon"); setEdIcon("rocket-launch"); setEdViewMode("scrollback");
+    setEdNeedsIface(false); setEdNeedsEndpoint(false); setEdNeedsFile(false);
+    setEditorOpen(true);
+  }, []);
+
+  const openEditProfile = useCallback((p: AttackProfile) => {
+    setEditId(p.id); setEditIsBuiltin(p.builtin);
+    setEdName(p.name); setEdDesc(p.description); setEdCmd(p.command_template);
+    setEdCat(p.category); setEdIcon(p.icon); setEdViewMode(p.view_mode);
+    setEdNeedsIface(p.needs_iface); setEdNeedsEndpoint(p.needs_endpoint); setEdNeedsFile(p.needs_file);
+    setEditorOpen(true);
+  }, []);
+
+  const saveProfile = useCallback(async () => {
+    const name = edName.trim();
+    const cmd = edCmd.trim();
+    if (!name || !cmd) { Alert.alert("Missing fields", "Name and command are both required."); return; }
+    setEdSaving(true);
+    try {
+      await attackProfilesLocal.upsert({
+        id: editId ?? undefined,
+        name, description: edDesc.trim(), command_template: cmd,
+        category: edCat, icon: edIcon, view_mode: edViewMode,
+        needs_iface: edNeedsIface, needs_endpoint: edNeedsEndpoint, needs_file: edNeedsFile,
+        builtin: editIsBuiltin,
+      });
+      await fetchAttackProfiles();
+      setEditorOpen(false);
+    } catch (e: any) {
+      Alert.alert("Save failed", e?.message || "sqlite write error");
+    } finally { setEdSaving(false); }
+  }, [editId, editIsBuiltin, edName, edDesc, edCmd, edCat, edIcon, edViewMode, edNeedsIface, edNeedsEndpoint, edNeedsFile, fetchAttackProfiles]);
+
+  const deleteProfile = useCallback((p: AttackProfile) => {
+    if (p.builtin) return; // builtins aren't deletable
+    Alert.alert("Delete tool?", p.name, [
+      { text: "Cancel" },
+      { text: "Delete", style: "destructive", onPress: async () => {
+        try { await attackProfilesLocal.delete(p.id); await fetchAttackProfiles(); setEditorOpen(false); }
+        catch (e: any) { Alert.alert("Delete failed", e?.message || "sqlite error"); }
+      } },
+    ]);
+  }, [fetchAttackProfiles]);
+
   const onStop = (s: SessionState) => sessionManager.kill(s.id, true);
   const onForceKill = (s: SessionState) =>
     Alert.alert("Force kill?", `SIGKILL ${s.label} (PID ${s.pid || "?"})\nFiles may not be flushed.`, [
@@ -359,7 +435,7 @@ export default function LiveTab(props: Props) {
           onPress={() => setPresetOpen((v) => !v)}
           style={s.newBtn}
         >
-          <Ionicons name={presetOpen ? "close" : "add"} size={16} color={C.bg} />
+          <Ionicons name={presetOpen ? "chevron-up" : "chevron-down"} size={18} color={C.bg} />
         </TouchableOpacity>
       </View>
 
@@ -375,7 +451,7 @@ export default function LiveTab(props: Props) {
             >
               <Text style={[s.catChipText, !catFilter && { color: C.green }]}>all · {attackProfiles.length}</Text>
             </TouchableOpacity>
-            {(["recon", "attack", "trace", "pcap"] as const).map((cat) => {
+            {CATEGORIES.map((cat) => {
               const n = attackProfiles.filter((p) => p.category === cat).length;
               if (n === 0) return null;
               const active = catFilter === cat;
@@ -396,13 +472,22 @@ export default function LiveTab(props: Props) {
             })}
           </View>
 
-          <Text style={s.presetTitle}>// {visibleProfiles.length} profiles · iface={props.primaryIface || "—"}</Text>
+          <View style={s.presetHeaderRow}>
+            <Text style={s.presetTitle}>// {visibleProfiles.length} tools · iface={props.primaryIface || "—"}</Text>
+            <TouchableOpacity testID="btn-profile-new" onPress={openNewProfile} style={s.addToolBtn}>
+              <Ionicons name="add" size={13} color={C.green} />
+              <Text style={s.addToolBtnText}>new tool</Text>
+            </TouchableOpacity>
+          </View>
+          <Text style={s.editHint}>tap to launch · long-press to edit</Text>
           <View style={s.presetGrid}>
             {visibleProfiles.map((p) => (
               <TouchableOpacity
                 key={p.id}
                 testID={`live-preset-${p.id}`}
                 onPress={() => launchAttackProfile(p)}
+                onLongPress={() => openEditProfile(p)}
+                delayLongPress={300}
                 style={[s.presetItem, { borderLeftColor: CAT_COLOR[p.category], borderLeftWidth: 3 }]}
               >
                 <View style={{ flexDirection: "row", alignItems: "center", marginBottom: 2 }}>
@@ -422,7 +507,7 @@ export default function LiveTab(props: Props) {
             ))}
             {visibleProfiles.length === 0 && (
               <Text style={[s.helper, { padding: 8 }]}>
-                no profiles in this category — add some in Settings → AI Agents (TODO: add attack-profile editor in Settings)
+                no tools in this category — tap &quot;new tool&quot; above to add one
               </Text>
             )}
           </View>
@@ -517,9 +602,9 @@ export default function LiveTab(props: Props) {
               <XTermView
                 key={selected.id}
                 sessionId={selected.id}
-                // Live tab is one-way for now (no stdin into airodump/wifite via
-                // xterm) — but the wiring is there for free. Ignore inputs.
-                onInput={() => {}}
+                // Interactive tools (Enforcer UEF console, etc.) need stdin —
+                // forward xterm keystrokes to the session's PTY.
+                onInput={(data) => { backendWriteStdin(selected.id, data, false).catch(() => {}); }}
                 resetToken={selected.id}
               />
             </View>
@@ -559,11 +644,10 @@ export default function LiveTab(props: Props) {
         <View style={{ flex: 1, alignItems: "center", justifyContent: "center", padding: 24 }}>
           <MaterialCommunityIcons name="satellite-uplink" size={48} color={C.greenDim} />
           <Text style={[s.helper, { marginTop: 12, textAlign: "center" }]}>
-            no active session — tap{" "}
-            <Text style={{ color: C.green }}>+</Text> to launch an attack profile
+            no active session — pick a tool above to launch
           </Text>
           <Text style={[s.helper, { marginTop: 4, textAlign: "center", color: C.textDim }]}>
-            airodump · wifite · tcpdump · hcxdumptool · pcap→remote · …
+            recon · attack · trace · pcap · audit
           </Text>
         </View>
       )}
@@ -690,6 +774,107 @@ export default function LiveTab(props: Props) {
           </View>
         </View>
       </Modal>
+
+      {/* ─── Attack-profile editor modal (add / edit a Live tool) ───────── */}
+      <Modal
+        visible={editorOpen}
+        animationType="none"
+        transparent
+        onRequestClose={() => setEditorOpen(false)}
+      >
+        <View style={s.modalBackdrop}>
+          <View style={s.modalSheet}>
+            <View style={s.modalHeader}>
+              <Text style={s.modalTitle}>
+                {editId ? (editIsBuiltin ? "// edit tool (builtin)" : "// edit tool") : "// new tool"}
+              </Text>
+              <TouchableOpacity onPress={() => setEditorOpen(false)} testID="btn-editor-close">
+                <Ionicons name="close" size={20} color={C.green} />
+              </TouchableOpacity>
+            </View>
+            <ScrollView style={{ maxHeight: 460 }} keyboardShouldPersistTaps="handled">
+              <Text style={s.fieldLabel}>name</Text>
+              <TextInput testID="input-ed-name" value={edName} onChangeText={setEdName}
+                placeholder="tool name" placeholderTextColor={C.textDim}
+                style={s.epInput} autoCapitalize="none" autoCorrect={false} />
+
+              <Text style={s.fieldLabel}>description</Text>
+              <TextInput testID="input-ed-desc" value={edDesc} onChangeText={setEdDesc}
+                placeholder="short description" placeholderTextColor={C.textDim}
+                style={s.epInput} autoCapitalize="none" autoCorrect={false} />
+
+              <Text style={s.fieldLabel}>command (use && for pre-cmd · {"{iface} {host} {port} {file}"} placeholders)</Text>
+              <TextInput testID="input-ed-cmd" value={edCmd} onChangeText={setEdCmd}
+                placeholder="cd /root/tools/x && ./run" placeholderTextColor={C.textDim}
+                style={[s.epInput, { minHeight: 60 }]} autoCapitalize="none" autoCorrect={false} multiline />
+
+              <Text style={s.fieldLabel}>category</Text>
+              <View style={s.catRow}>
+                {CATEGORIES.map((cat) => (
+                  <TouchableOpacity key={cat} testID={`ed-cat-${cat}`} onPress={() => setEdCat(cat)}
+                    style={[s.catChip, { borderColor: CAT_COLOR[cat] + (edCat === cat ? "" : "55") },
+                      edCat === cat && { backgroundColor: CAT_COLOR[cat] + "22" }]}>
+                    <Text style={[s.catChipText, { color: CAT_COLOR[cat] }]}>{cat}</Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+
+              <Text style={s.fieldLabel}>view mode</Text>
+              <View style={{ flexDirection: "row", gap: 6 }}>
+                {(["scrollback", "xterm"] as const).map((vm) => (
+                  <TouchableOpacity key={vm} testID={`ed-view-${vm}`} onPress={() => setEdViewMode(vm)}
+                    style={[s.epTransportChip, edViewMode === vm && { borderColor: C.green, backgroundColor: "#0a1f12" }]}>
+                    <Text style={[s.epHost, edViewMode === vm && { color: C.green }]}>{vm === "xterm" ? "xterm (TUI)" : "scrollback"}</Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+
+              <Text style={s.fieldLabel}>icon</Text>
+              <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginTop: 4 }}>
+                {ICON_CHOICES.map((ic) => (
+                  <TouchableOpacity key={ic} testID={`ed-icon-${ic}`} onPress={() => setEdIcon(ic)}
+                    style={[s.iconChip, edIcon === ic && { borderColor: C.green, backgroundColor: "#0a1f12" }]}>
+                    <MaterialCommunityIcons name={ic as any} size={18} color={edIcon === ic ? C.green : C.textDim} />
+                  </TouchableOpacity>
+                ))}
+              </ScrollView>
+
+              <Text style={s.fieldLabel}>requires</Text>
+              <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6 }}>
+                {([["iface", edNeedsIface, setEdNeedsIface], ["endpoint", edNeedsEndpoint, setEdNeedsEndpoint], ["file", edNeedsFile, setEdNeedsFile]] as const).map(([lbl, val, set]) => (
+                  <TouchableOpacity key={lbl} testID={`ed-needs-${lbl}`} onPress={() => set(!val)}
+                    style={[s.epTransportChip, val && { borderColor: C.green, backgroundColor: "#0a1f12" }]}>
+                    <Text style={[s.epHost, val && { color: C.green }]}>{val ? "✓ " : ""}{lbl}</Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+
+              <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginTop: 16 }}>
+                {editId && !editIsBuiltin ? (
+                  <TouchableOpacity testID="btn-ed-delete" onPress={() => {
+                    const p = attackProfiles.find((x) => x.id === editId);
+                    if (p) deleteProfile(p);
+                  }} style={[s.epActionBtn, { borderColor: C.red }]}>
+                    <Ionicons name="trash" size={13} color={C.red} />
+                    <Text style={[s.epHost, { color: C.red, marginLeft: 4 }]}>DELETE</Text>
+                  </TouchableOpacity>
+                ) : <View />}
+                <View style={{ flexDirection: "row" }}>
+                  <TouchableOpacity testID="btn-ed-cancel" onPress={() => setEditorOpen(false)}
+                    style={[s.epActionBtn, { borderColor: C.border, marginRight: 6 }]}>
+                    <Text style={[s.epHost, { color: C.textDim }]}>CANCEL</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity testID="btn-ed-save" onPress={saveProfile} disabled={edSaving}
+                    style={[s.epActionBtn, { borderColor: C.green, opacity: edSaving ? 0.5 : 1 }]}>
+                    <Ionicons name="save-outline" size={13} color={C.green} />
+                    <Text style={[s.epHost, { color: C.green, marginLeft: 4 }]}>{edSaving ? "SAVING…" : "SAVE"}</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+            </ScrollView>
+          </View>
+        </View>
+      </Modal>
     </View>
   );
 }
@@ -722,6 +907,19 @@ const s = StyleSheet.create({
     backgroundColor: C.panel, borderBottomWidth: 1, borderBottomColor: C.border, padding: 10,
   },
   presetTitle: { color: C.greenDim, fontFamily: MONO, fontSize: 10, marginBottom: 6 },
+  presetHeaderRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
+  addToolBtn: {
+    flexDirection: "row", alignItems: "center", gap: 3,
+    paddingHorizontal: 8, paddingVertical: 4, marginBottom: 4,
+    borderRadius: 3, borderWidth: 1, borderColor: C.greenDim, backgroundColor: "#0a2010",
+  },
+  addToolBtnText: { color: C.green, fontFamily: MONO, fontSize: 10, fontWeight: "700" },
+  editHint: { color: C.textDim, fontFamily: MONO, fontSize: 9, marginBottom: 6 },
+  fieldLabel: { color: C.greenDim, fontFamily: MONO, fontSize: 10, marginTop: 10, marginBottom: 2 },
+  iconChip: {
+    width: 40, height: 36, alignItems: "center", justifyContent: "center", marginRight: 6,
+    borderWidth: 1, borderColor: C.border, borderRadius: 4, backgroundColor: C.panel2,
+  },
   presetGrid: { flexDirection: "row", flexWrap: "wrap", justifyContent: "space-between" },
   presetItem: {
     width: "48.5%", backgroundColor: C.panel2, borderWidth: 1, borderColor: C.border,

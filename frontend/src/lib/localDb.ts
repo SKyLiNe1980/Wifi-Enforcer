@@ -22,7 +22,7 @@ let _db: SQLite.SQLiteDatabase | null = null;
 // pre-migration → re-run the seed → insert 9 attack + 5 AI profiles AGAIN.
 // With 8 concurrent callers that produced 72 attack profiles. Fun.
 let _dbPromise: Promise<SQLite.SQLiteDatabase> | null = null;
-const TARGET_VERSION = 13;
+const TARGET_VERSION = 14;
 
 export async function openLocalDb(): Promise<SQLite.SQLiteDatabase> {
   if (_db) return _db;
@@ -388,6 +388,34 @@ async function runMigrations(db: SQLite.SQLiteDatabase) {
           ALTER TABLE mcp_nodes ADD COLUMN ssh_port INTEGER DEFAULT 22;
         `);
         break;
+      case 14: {
+        // Live-tab profile refresh:
+        //  • drop `dmesg -w` / `iw event` — those are terminal commands, not
+        //    live capture/attack tools (moved conceptually to the Terminal).
+        //  • add appsec / firmware / exploitation live tools under the new
+        //    `audit` category (+ Enforcer UEF under attack).
+        await db.execAsync(
+          `DELETE FROM attack_profiles WHERE builtin = 1 AND name IN ('dmesg -w', 'iw event');`,
+        );
+        const v14Profiles: Omit<AttackProfile, "id" | "created_at">[] = [
+          { name: "Enforcer UEF", description: "metasploit-style exploitation console (interactive)", icon: "sword-cross", category: "attack", command_template: "cd /root/tools/Enforcer-UEF && python3 enforcer-console.py", needs_iface: false, needs_endpoint: false, needs_file: false, view_mode: "xterm", builtin: true, sort_order: 24 },
+          { name: "Vigolium", description: "web vuln scanner — API + WebUI workbench on :9002", icon: "web", category: "audit", command_template: "vigolium server --host 0.0.0.0 --service-port 9002", needs_iface: false, needs_endpoint: false, needs_file: false, view_mode: "scrollback", builtin: true, sort_order: 60 },
+          { name: "Semgrep", description: "SAST static code analysis (--config auto · edit path)", icon: "code-tags", category: "audit", command_template: "semgrep scan --config auto .", needs_iface: false, needs_endpoint: false, needs_file: false, view_mode: "scrollback", builtin: true, sort_order: 61 },
+          { name: "EMBA", description: "firmware security analyzer (default-scan profile)", icon: "chip", category: "audit", command_template: "cd /root/tools/emba && ./emba -l ~/log -f ~/firmware -p ./scan-profiles/default-scan.emba", needs_iface: false, needs_endpoint: false, needs_file: false, view_mode: "xterm", builtin: true, sort_order: 62 },
+          { name: "Burp DAST", description: "Burp Suite headless DAST scan via burp-cli", icon: "bug", category: "audit", command_template: "cd /root/tools/burp/burp-cli && ./burp-cli -s url -k apikey", needs_iface: false, needs_endpoint: false, needs_file: false, view_mode: "scrollback", builtin: true, sort_order: 63 },
+        ];
+        for (const p of v14Profiles) {
+          const ex = await db.getFirstAsync<{ id: string }>("SELECT id FROM attack_profiles WHERE name = ?", [p.name]);
+          if (ex) continue;
+          await db.runAsync(
+            `INSERT INTO attack_profiles (id, name, description, icon, category, command_template, needs_iface, needs_endpoint, needs_file, view_mode, builtin, sort_order, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+            [uuid(), p.name, p.description, p.icon, p.category, p.command_template,
+             p.needs_iface ? 1 : 0, p.needs_endpoint ? 1 : 0, p.needs_file ? 1 : 0,
+             p.view_mode, p.builtin ? 1 : 0, p.sort_order, nowIso()],
+          );
+        }
+        break;
+      }
       default:
         throw new Error(`[localDb] no migration for version ${next}`);
     }
@@ -526,7 +554,7 @@ export const aiProfilesLocal = {
 // ─── Attack Profiles ────────────────────────────────────────────────────
 export type AttackProfile = {
   id: string; name: string; description: string; icon: string;
-  category: "recon" | "attack" | "trace" | "pcap";
+  category: "recon" | "attack" | "trace" | "pcap" | "audit";
   command_template: string;
   needs_iface: boolean; needs_endpoint: boolean; needs_file: boolean;
   view_mode: "xterm" | "scrollback";
@@ -619,8 +647,11 @@ async function seedDefaultsIfEmpty(db: SQLite.SQLiteDatabase) {
       { name: "hcxdumptool", description: "PMKID + EAPOL capture (modern, faster than aircrack tools)", icon: "database-export", category: "attack", command_template: "hcxdumptool -i {iface} -o {file}.pcapng --enable_status=1", needs_iface: true, needs_endpoint: false, needs_file: true, view_mode: "scrollback", builtin: true, sort_order: 22 },
       { name: "tcpdump → file", description: "full packet capture to local /sdcard/tcpdump_<ts>.pcap", icon: "content-save", category: "trace", command_template: "tcpdump -i {iface} -w {file}.pcap -U", needs_iface: true, needs_endpoint: false, needs_file: true, view_mode: "scrollback", builtin: true, sort_order: 30 },
       { name: "PCAP → remote", description: "stream live packets to a remote Wireshark/NetworkMiner via nc", icon: "cloud-upload", category: "pcap", command_template: "tcpdump -i {iface} -U -w - | nc -w 3 {host} {port}", needs_iface: true, needs_endpoint: true, needs_file: false, view_mode: "scrollback", builtin: true, sort_order: 40 },
-      { name: "iw event", description: "kernel wireless events — assoc/disassoc/auth/scan", icon: "console-network", category: "trace", command_template: "iw event -t", needs_iface: false, needs_endpoint: false, needs_file: false, view_mode: "scrollback", builtin: true, sort_order: 50 },
-      { name: "dmesg -w", description: "follow kernel log — driver errors, firmware msgs", icon: "console-line", category: "trace", command_template: "dmesg -w", needs_iface: false, needs_endpoint: false, needs_file: false, view_mode: "scrollback", builtin: true, sort_order: 51 },
+      { name: "Enforcer UEF", description: "metasploit-style exploitation console (interactive)", icon: "sword-cross", category: "attack", command_template: "cd /root/tools/Enforcer-UEF && python3 enforcer-console.py", needs_iface: false, needs_endpoint: false, needs_file: false, view_mode: "xterm", builtin: true, sort_order: 24 },
+      { name: "Vigolium", description: "web vuln scanner — API + WebUI workbench on :9002", icon: "web", category: "audit", command_template: "vigolium server --host 0.0.0.0 --service-port 9002", needs_iface: false, needs_endpoint: false, needs_file: false, view_mode: "scrollback", builtin: true, sort_order: 60 },
+      { name: "Semgrep", description: "SAST static code analysis (--config auto · edit path)", icon: "code-tags", category: "audit", command_template: "semgrep scan --config auto .", needs_iface: false, needs_endpoint: false, needs_file: false, view_mode: "scrollback", builtin: true, sort_order: 61 },
+      { name: "EMBA", description: "firmware security analyzer (default-scan profile)", icon: "chip", category: "audit", command_template: "cd /root/tools/emba && ./emba -l ~/log -f ~/firmware -p ./scan-profiles/default-scan.emba", needs_iface: false, needs_endpoint: false, needs_file: false, view_mode: "xterm", builtin: true, sort_order: 62 },
+      { name: "Burp DAST", description: "Burp Suite headless DAST scan via burp-cli", icon: "bug", category: "audit", command_template: "cd /root/tools/burp/burp-cli && ./burp-cli -s url -k apikey", needs_iface: false, needs_endpoint: false, needs_file: false, view_mode: "scrollback", builtin: true, sort_order: 63 },
     ];
     for (const p of seeds) {
       await db.runAsync(
