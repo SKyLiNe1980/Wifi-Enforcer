@@ -864,3 +864,30 @@ obvious anchor since iwconfig belongs on Live.
 Leave the "save as profile" buttons as-is for now. Rethink ENTIRELY what a useful
 profile save looks like (regdom-only has little value). Likely: a full named staged
 combo (regdom + iface + monitor + channel + preset) that re-applies in one tap.
+
+### 🎨 UI RESTRUCTURE — WLAN/WiFi tab (tab-by-tab pass 1, from user notes + concept render)
+User-led big restructure (text leading, render = vibe). Decisions locked: retire A/B/C/ALL
+multi-adapter → single iface; 2s focused poll for live status (async, no blink).
+WlanControl.tsx near-total rewrite into 3 sections:
+- §1 `// radio profile` — bracketed menu bar [ iface ][ MON ][ CH n ][ regdom ][ txpwr ]
+  (MenuPill sub-comp). iface→picker sheet (auto-detected via `iw dev`); MON→toggle
+  monitor; CH→channel bottom-sheet; regdom & txpwr→fill-box modal (input+APPLY).
+  Green=set/active, dim=off. txpwr via `iw dev set txpower fixed <mBm>` (dBm*100).
+- §2 `// profiles` — 5 fixed slots ALPHA..ECHO + SAVE. Tap slot = select (+apply its
+  saved combo if set); SAVE = snapshot current §1 combo (iface/monitor/channel/country/
+  txpower) into selected slot. Persisted via kvGet/kvSet key "wlan_radio_profiles".
+- §3 `// status` — merged old //live+//channel. StatCell grid: mode/channel/band/freq/
+  txpwr/signal/quality/link(bitrate)/mac + live bar RX/TX (KB/s rates)/PKT/ERR. Parsed
+  from added `iwconfig` + `/proc/net/dev` probe commands. 2s focused poll (silentRefresh,
+  no spinner/blink; overlap-guarded); RX/TX rates = delta between samples (rateRef).
+REMOVED: Android WiFi svc control, sniff/inject presets, save-combo, old // context
+($IFACE_A/B/C + $CC inputs), active-adapter chips, old "// wlan control" save-as-profile
+button, ToggleRow/HudCell. index.tsx renderQuick now just renders <WlanControl>; regdom
+fill-box calls onCountryChange→setCountry to keep state synced; onExecCommand no longer
+jumps to terminal (stay on WLAN, watch status).
+CAVEATS / follow-ups: (1) probe still uses rootShell.execReal (root-only) — on pure-SSH
+rootless devices §3 status won't populate (actions DO go through backend selector via
+index.execute). (2) monitor toggle no longer does `svc wifi disable` first (Android WiFi
+svc control removed) — flag to user if monitor fights android wifi on device. (3) first
+~2s of RX/TX shows 0 (needs 2 samples). (4) ifaceB/C/activeIface state kept but UI gone.
+JS-only, bundle HTTP 200, lint clean. VERIFY ON APK (web preview = SQLite crash).

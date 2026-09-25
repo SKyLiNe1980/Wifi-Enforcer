@@ -1107,96 +1107,17 @@ export default function App() {
       keyboardShouldPersistTaps="handled"
       refreshControl={<RefreshControl refreshing={refreshing} onRefresh={async () => { setRefreshing(true); await fetchAll(); setRefreshing(false); }} tintColor={C.green} />}
     >
-      <Text style={s.sectionTitle}>// context</Text>
-      <View style={{ flexDirection: "row" }}>
-        <View style={[s.field, { flex: 1, marginRight: 10 }]}>
-          <Text style={s.fieldLabel}>$IFACE_A</Text>
-          <TextInput testID="input-iface-a" value={iface} onChangeText={setIface}
-            style={s.fieldInput} placeholder="wlan0" placeholderTextColor={C.textDim}
-            autoCapitalize="none" autoCorrect={false} />
-        </View>
-        <View style={[s.field, { width: 110 }]}>
-          <Text style={s.fieldLabel}>$CC</Text>
-          <TextInput testID="input-country" value={country}
-            onChangeText={(t) => setCountry(t.toUpperCase().slice(0, 2))}
-            style={s.fieldInput} placeholder="US" placeholderTextColor={C.textDim}
-            autoCapitalize="characters" maxLength={2} />
-        </View>
-      </View>
-      <View style={{ flexDirection: "row", marginTop: 8 }}>
-        <View style={[s.field, { flex: 1, marginRight: 10 }]}>
-          <Text style={s.fieldLabel}>$IFACE_B <Text style={{ color: C.textDim }}>(optional)</Text></Text>
-          <TextInput testID="input-iface-b" value={ifaceB} onChangeText={setIfaceB}
-            style={s.fieldInput} placeholder="wlan3" placeholderTextColor={C.textDim}
-            autoCapitalize="none" autoCorrect={false} />
-        </View>
-        <View style={[s.field, { flex: 1 }]}>
-          <Text style={s.fieldLabel}>$IFACE_C <Text style={{ color: C.textDim }}>(optional)</Text></Text>
-          <TextInput testID="input-iface-c" value={ifaceC} onChangeText={setIfaceC}
-            style={s.fieldInput} placeholder="wlan4" placeholderTextColor={C.textDim}
-            autoCapitalize="none" autoCorrect={false} />
-        </View>
-      </View>
-
-      {/* Active adapter chip selector */}
-      <View style={{ marginTop: 12 }}>
-        <Text style={s.fieldLabel}>active adapter</Text>
-        <View style={s.chipRow}>
-          {(["A", "B", "C", "ALL"] as const).map((k) => {
-            const enabled = k === "A" || (k === "B" && ifaceB) || (k === "C" && ifaceC) ||
-                            (k === "ALL" && (ifaceB || ifaceC));
-            const active = activeIface === k;
-            return (
-              <TouchableOpacity
-                key={k}
-                testID={`chip-${k}`}
-                disabled={!enabled}
-                onPress={() => setActiveIface(k)}
-                style={[
-                  s.chip,
-                  active && { backgroundColor: C.green, borderColor: C.green },
-                  !enabled && { opacity: 0.3 },
-                ]}
-              >
-                <Text style={[s.chipText, active && { color: C.bg, fontWeight: "800" }]}>{k}</Text>
-              </TouchableOpacity>
-            );
-          })}
-        </View>
-        {activeIface === "ALL" && activeIfaces.length > 1 && (
-          <Text style={[s.helper, { marginTop: 6 }]}>
-            quick actions will run on: <Text style={{ color: C.cyan }}>{activeIfaces.join(", ")}</Text>
-          </Text>
-        )}
-      </View>
-
-      <View style={[s.sectionRow, { marginTop: 24 }]}>
-        <Text style={s.sectionTitle}>// wlan control</Text>
-        <TouchableOpacity testID="btn-save-profile" onPress={() => setSaveOpen(true)} style={s.smallBtn}>
-          <Ionicons name="bookmark-outline" size={12} color={C.green} />
-          <Text style={s.smallBtnText}>save as profile</Text>
-        </TouchableOpacity>
-      </View>
-
       <WlanControl
         iface={primaryIface}
         country={country}
         onIfaceChange={(i) => setIface(i)}
+        onCountryChange={(cc) => setCountry(cc.toUpperCase().slice(0, 2))}
         disabled={running}
-        onSaveCombo={(cmds) => {
-          setStagedCombo(cmds);
-          setNewProfileName("");
-          setNewProfileDesc("");
-          setSaveOpen(true);
-        }}
         onExecCommand={async (cmd) => {
-          // Reuse the existing exec pipeline so command_logs, exec_mode
-          // wrapping, and the terminal jump-to-classic behavior all still
-          // apply. `wrap` is out of scope here (it's a closure in
-          // renderQuick's parent) — we invoke `execute` directly.
-          execute(cmd);
-          setTerminalMode("classic");
-          setTab("terminal");
+          // Run through the shared exec pipeline (command_logs + exec-mode
+          // wrapping + SSH/root backend). No tab-jump — you stay on WLAN and
+          // watch the // status card update live.
+          await execute(cmd);
         }}
       />
     </ScrollView>
