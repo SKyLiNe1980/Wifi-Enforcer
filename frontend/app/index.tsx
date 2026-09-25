@@ -182,14 +182,6 @@ const INITIAL_DATA_STATE: DataLoadState = {
   logs: { kind: "loading" },
 };
 
-const BANNER = `\
- _____ _   _ _____ ___  ____   ____ _____ ____  
-| ____| \\ | |  ___/ _ \\|  _ \\ / ___| ____|  _ \\ 
-|  _| |  \\| | |_ | | | | |_) | |   |  _| | |_) |
-| |___| |\\  |  _|| |_| |  _ <| |___| |___|  _ < 
-|_____|_| \\_|_|   \\___/|_| \\_\\____|_____|_| \\_\\
-`;
-
 type Log = {
   id: string;
   command: string;
@@ -263,7 +255,6 @@ export default function App() {
   const [country, setCountry] = useState("US");
   const [logs, setLogs] = useState<Log[]>([]);
   const [profiles, setProfiles] = useState<Profile[]>([]);
-  const [customCmd, setCustomCmd] = useState("");
   const [running, setRunning] = useState(false);
   const [rootInfo, setRootInfo] = useState<any>(null);
   const [refreshing, setRefreshing] = useState(false);
@@ -287,7 +278,6 @@ export default function App() {
   const [sshStatusDetail, setSshStatusDetail] = useState("");
   const [sshSavedPw, setSshSavedPw] = useState(false);
   const [sshSavedKey, setSshSavedKey] = useState(false);
-  const termRef = useRef<ScrollView>(null);
 
   // ─── Settings sub-tabs ───────────────────────────────────────────────────
   // The bottom tab bar was getting overcrowded (quick/term/live/ai/prof/set
@@ -297,13 +287,6 @@ export default function App() {
   const [settingsSubTab, setSettingsSubTab] = useState<"general" | "profiles" | "agents">("general");
 
   // ─── Terminal tab mode ───────────────────────────────────────────────────
-  // Classic = one-shot `su -c` per command (stateless, current behavior).
-  // Shell   = persistent `zsh -l` in a PTY, rendered via xterm.js so
-  //           `cd`, env vars, vim, htop, command history etc. all work.
-  // Stateless first-mount default = "classic" because users expect the
-  // existing quick-command card flow when they tap Terminal.
-  const [terminalMode, setTerminalMode] = useState<"classic" | "shell">("classic");
-
   // ─── AI profile editor state ─────────────────────────────────────────────
   // Inline edit sheet inside Settings > AI Agents. `aiEditing === null`
   // when the sheet is closed; an AIProfile (existing) when editing; or a
@@ -906,12 +889,6 @@ export default function App() {
     return () => clearTimeout(t);
   }, [execMode, iface, ifaceB, ifaceC, country, activeIface, chrootPath]);
 
-  useEffect(() => {
-    if (tab !== "terminal") return;
-    const t = setTimeout(() => termRef.current?.scrollToEnd({ animated: true }), 80);
-    return () => clearTimeout(t);
-  }, [logs, tab]);
-
   // Substitute $IFACE in a command for a specific iface (when fanning out to ALL)
   const substIface = (cmd: string, ifname: string) =>
     cmd.replace(new RegExp(`\\b${iface}\\b`, "g"), ifname);
@@ -1045,10 +1022,13 @@ export default function App() {
       for (const l of newLogs) {
         commandLogsLocal.append(l).catch(() => {});
       }
-      // Land on the classic terminal view so output is immediately visible —
-      // shell sub-tab would swallow these one-shot logs silently.
-      setTerminalMode("classic");
-      setTab("terminal");
+      // Profiles run as one-shots and land in the command log (Settings → data
+      // → logs). Surface a quick summary so the operator sees the outcome.
+      const oks = newLogs.filter((l) => l.exit_code === 0).length;
+      Alert.alert(
+        `Profile: ${p.name}`,
+        `${newLogs.length} command${newLogs.length === 1 ? "" : "s"} run · ${oks} ok · ${newLogs.length - oks} failed`,
+      );
     } catch (e) { console.warn(e); }
     finally { setRunning(false); }
   }, [execMode, activeIface, activeIfaces, primaryIface, iface, wrapForMode, backendKind]);
@@ -1125,100 +1105,11 @@ export default function App() {
 
   const renderTerminal = () => (
     <View style={{ flex: 1 }}>
-      {/* Mode toggle — classic (one-shot cards) vs shell (persistent zsh).
-          Defaults to classic so we don't break the existing quick-command
-          flow. Shell mode requires REAL or KALI execMode (won't work in
-          mock since there's no real shell to keep alive). */}
-      <View style={s.subTabBar}>
-        {(["classic", "shell"] as const).map((m) => {
-          const active = terminalMode === m;
-          const label = m === "classic" ? `Host · ${logs.length}` : "Kali · zsh";
-          const icon: any = m === "classic" ? "android" : "linux";
-          return (
-            <TouchableOpacity
-              key={m}
-              testID={`term-mode-${m}`}
-              onPress={() => setTerminalMode(m)}
-              style={[s.subTab, active && s.subTabActive]}
-            >
-              <MaterialCommunityIcons name={icon} size={14} color={active ? C.green : C.textDim} />
-              <Text style={[s.subTabText, active && { color: C.green }]}>{label}</Text>
-            </TouchableOpacity>
-          );
-        })}
-      </View>
-
-      {terminalMode === "shell" ? (
-        <TerminalShell
-          execMode={backendKind === "ssh" ? "kali" : execMode}
-          wrap={wrapForMode}
-          sshMode={backendKind === "ssh"}
-        />
-      ) : (
-        <>
-          <ScrollView ref={termRef} style={{ flex: 1, backgroundColor: "#02050a" }}
-            contentContainerStyle={{ padding: 12, paddingBottom: 24 }}>
-            <Text style={s.banner}>{BANNER}</Text>
-            <Text style={s.bannerSub}>
-              {`# session: ${rootInfo?.device || "..."} · ${rootInfo?.android_version || "..."}\n# entries: ${logs.length} · status: ${running ? "BUSY" : "idle"}\n`}
-            </Text>
-            {logs.map((l, idx) => {
-              const isHistorical = idx < historicalCountRef.current;
-              const isFirstCurrent = idx === historicalCountRef.current && historicalCountRef.current > 0;
-              return (
-                <React.Fragment key={l.id}>
-                  {isFirstCurrent && (
-                    <View style={{ flexDirection: "row", alignItems: "center", marginVertical: 8 }}>
-                      <View style={{ flex: 1, height: 1, backgroundColor: C.textDim, opacity: 0.4 }} />
-                      <Text style={{ color: C.cyan, fontFamily: MONO, fontSize: 10, marginHorizontal: 8, letterSpacing: 1 }}>
-                        ── CURRENT SESSION ──
-                      </Text>
-                      <View style={{ flex: 1, height: 1, backgroundColor: C.textDim, opacity: 0.4 }} />
-                    </View>
-                  )}
-                  <View style={{ marginBottom: 10, opacity: isHistorical ? 0.45 : 1 }}>
-                    <View style={{ flexDirection: "row", flexWrap: "wrap" }}>
-                      <Text style={{ color: C.prompt, fontFamily: MONO, fontSize: 12 }}>root@android</Text>
-                      <Text style={{ color: C.textDim, fontFamily: MONO, fontSize: 12 }}>:/ # </Text>
-                      <HighlightedCmd cmd={l.command} />
-                    </View>
-                    {!!l.output && (
-                      <Text style={[s.termOut, l.exit_code !== 0 && { color: C.red }]} selectable>
-                        {l.output}
-                      </Text>
-                    )}
-                    <Text style={s.termMeta}>
-                      <Text style={{ color: l.exit_code === 0 ? C.greenDim : C.red }}>exit={l.exit_code}</Text>
-                      <Text style={{ color: C.textDim }}> · {l.duration_ms}ms · {l.mocked ? "mock" : "real"}</Text>
-                    </Text>
-                  </View>
-                </React.Fragment>
-              );
-            })}
-            {logs.length === 0 && (
-              <Text style={{ color: C.textDim, fontFamily: MONO, fontSize: 12 }}>
-                (no commands yet — go to Quick or type below)
-              </Text>
-            )}
-          </ScrollView>
-
-          <View style={s.cmdRow}>
-            <Text style={{ color: C.prompt, fontFamily: MONO, fontSize: 13 }}># </Text>
-            <TextInput testID="input-custom-cmd" value={customCmd} onChangeText={setCustomCmd}
-              placeholder="su -c …" placeholderTextColor={C.textDim} style={s.cmdInput}
-              onSubmitEditing={() => { if (customCmd.trim()) { execute(customCmd); setCustomCmd(""); } }}
-              autoCapitalize="none" autoCorrect={false} returnKeyType="send" />
-            {running && <ActivityIndicator size="small" color={C.green} style={{ marginRight: 6 }} />}
-            <TouchableOpacity testID="btn-run-custom"
-              style={[s.runBtn, !customCmd.trim() && { opacity: 0.4 }]}
-              disabled={!customCmd.trim() || running}
-              onPress={() => { execute(customCmd); setCustomCmd(""); }}>
-              <Ionicons name="play" size={14} color={C.bg} />
-              <Text style={s.runBtnText}>RUN</Text>
-            </TouchableOpacity>
-          </View>
-        </>
-      )}
+      <TerminalShell
+        backendKind={backendKind}
+        execMode={execMode}
+        wrapKali={wrapForMode}
+      />
     </View>
   );
 

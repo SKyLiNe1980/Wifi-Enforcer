@@ -891,3 +891,36 @@ index.execute). (2) monitor toggle no longer does `svc wifi disable` first (Andr
 svc control removed) — flag to user if monitor fights android wifi on device. (3) first
 ~2s of RX/TX shows 0 (needs 2 samples). (4) ifaceB/C/activeIface state kept but UI gone.
 JS-only, bundle HTTP 200, lint clean. VERIFY ON APK (web preview = SQLite crash).
+
+### 🎨 UI RESTRUCTURE — Terminal tab (tab-by-tab pass 2, from user notes + concept render)
+User decisions locked: retire the one-shot "classic" terminal entirely ("only true terminals
+from here on" — pseudo-shells caused malformed output). Terminal is now a multi-target
+persistent PTY. Selector row order = [ kali ] [ node ▼ ] [ local ]. Identity header dropped.
+Keyboard accessory strip kept as-is. Bottom buttons = CLEAR · COPY · PASTE · CLOSE.
+
+TerminalShell.tsx — full rewrite:
+- §Targets: `kali` (the star — persistent login shell on the active backend: SSH ChannelShell
+  in ssh mode, or chroot `script` PTY on rooted NetHunter); `node ▼` (bottom-sheet picker of
+  ONLINE roster nodes only — `enabled && last_health_status==="running"` — jumps in by
+  injecting `ssh <ssh_user>@<host>[ -p <port>]` into the live Kali shell, `exit` drops back);
+  `local` (Android host root shell via su → best-effort host PTY, gated on HAS_NATIVE_ROOT;
+  de-emphasised, only for host things like `svc wifi disable`).
+- Kali/node SHARE one session (SSH transport); local is its OWN session (chroot transport).
+  Both stay alive across focus flips.
+- Node list auto-refreshes every 5s + on picker open (nodesLocal.list filter). testIDs:
+  term-target-{kali,node,local}, term-node-<id>, btn-term-{clear,copy,paste,close}, termkey-*.
+- PASTE = Clipboard.getStringAsync → writeStdin(focused, text, no-newline). COPY = scrollback
+  dump. CLEAR = Ctrl-L. CLOSE = graceful EOF / SIGKILL on the focused session.
+
+backend.ts — PER-SESSION transport routing (enabling change):
+- Added `sessionKind` map; `startStream(id,cmd,cb,kind?)` pins each session to the backend it
+  was started on; killStream/writeStdin/resizeSession route by `kindFor(id)` (not global
+  `active`). `hasStreaming(kind?)`. Lets a Kali/SSH shell + a local/root shell coexist with
+  correct I/O routing. sessionManager.start gained optional `backend` threaded through.
+
+index.tsx: renderTerminal → just <TerminalShell backendKind execMode wrapKali={wrapForMode} />.
+Removed the classic view + sub-tab toggle, terminalMode/customCmd/termRef state, BANNER const,
+the termRef scroll effect. runProfile no longer jumps to the (gone) classic view — it appends
+to command_logs and shows an Alert summary. `logs` state now write-only (persists to SQLite;
+in-memory array vestigial, harmless warning).
+JS-only, android bundle HTTP 200, lint clean. VERIFY ON APK (web preview = SQLite crash).

@@ -183,7 +183,7 @@ class SessionManager {
    * - Subscribes to native events and buffers lines
    * - Falls back to a "mock" mode if native streaming isn't available (preview)
    */
-  async start(opts: { command: string; iface?: string; label?: string; id?: string; owner?: "kali" | "live" | "ai"; forceMock?: boolean }): Promise<string> {
+  async start(opts: { command: string; iface?: string; label?: string; id?: string; owner?: "kali" | "live" | "ai"; forceMock?: boolean; backend?: "chroot" | "ssh" }): Promise<string> {
     const id = opts.id || `s${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
     const state: SessionState = {
       id,
@@ -208,7 +208,7 @@ class SessionManager {
     // hasn't built its method table yet when rootShell.ts is first evaluated.
     // forceMock=true also routes us into the mock branch (when user globally
     // chose MOCK exec mode in settings).
-    const streamingAvailable = !opts.forceMock && hasStreaming();
+    const streamingAvailable = !opts.forceMock && hasStreaming(opts.backend);
     state.mocked = !streamingAvailable;
 
     // Register with backend (best-effort)
@@ -261,7 +261,7 @@ class SessionManager {
         this.notify();
         this.endBackend(id, -1, Date.now() - s.startedAt, "error").catch(() => {});
       },
-    });
+    }, opts.backend);
     this.unsubscribers.set(id, unsub);
     return id;
   }
