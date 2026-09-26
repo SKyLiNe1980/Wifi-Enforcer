@@ -864,3 +864,182 @@ obvious anchor since iwconfig belongs on Live.
 Leave the "save as profile" buttons as-is for now. Rethink ENTIRELY what a useful
 profile save looks like (regdom-only has little value). Likely: a full named staged
 combo (regdom + iface + monitor + channel + preset) that re-applies in one tap.
+
+### 🎨 UI RESTRUCTURE — WLAN/WiFi tab (tab-by-tab pass 1, from user notes + concept render)
+User-led big restructure (text leading, render = vibe). Decisions locked: retire A/B/C/ALL
+multi-adapter → single iface; 2s focused poll for live status (async, no blink).
+WlanControl.tsx near-total rewrite into 3 sections:
+- §1 `// radio profile` — bracketed menu bar [ iface ][ MON ][ CH n ][ regdom ][ txpwr ]
+  (MenuPill sub-comp). iface→picker sheet (auto-detected via `iw dev`); MON→toggle
+  monitor; CH→channel bottom-sheet; regdom & txpwr→fill-box modal (input+APPLY).
+  Green=set/active, dim=off. txpwr via `iw dev set txpower fixed <mBm>` (dBm*100).
+- §2 `// profiles` — 5 fixed slots ALPHA..ECHO + SAVE. Tap slot = select (+apply its
+  saved combo if set); SAVE = snapshot current §1 combo (iface/monitor/channel/country/
+  txpower) into selected slot. Persisted via kvGet/kvSet key "wlan_radio_profiles".
+- §3 `// status` — merged old //live+//channel. StatCell grid: mode/channel/band/freq/
+  txpwr/signal/quality/link(bitrate)/mac + live bar RX/TX (KB/s rates)/PKT/ERR. Parsed
+  from added `iwconfig` + `/proc/net/dev` probe commands. 2s focused poll (silentRefresh,
+  no spinner/blink; overlap-guarded); RX/TX rates = delta between samples (rateRef).
+REMOVED: Android WiFi svc control, sniff/inject presets, save-combo, old // context
+($IFACE_A/B/C + $CC inputs), active-adapter chips, old "// wlan control" save-as-profile
+button, ToggleRow/HudCell. index.tsx renderQuick now just renders <WlanControl>; regdom
+fill-box calls onCountryChange→setCountry to keep state synced; onExecCommand no longer
+jumps to terminal (stay on WLAN, watch status).
+CAVEATS / follow-ups: (1) probe still uses rootShell.execReal (root-only) — on pure-SSH
+rootless devices §3 status won't populate (actions DO go through backend selector via
+index.execute). (2) monitor toggle no longer does `svc wifi disable` first (Android WiFi
+svc control removed) — flag to user if monitor fights android wifi on device. (3) first
+~2s of RX/TX shows 0 (needs 2 samples). (4) ifaceB/C/activeIface state kept but UI gone.
+JS-only, bundle HTTP 200, lint clean. VERIFY ON APK (web preview = SQLite crash).
+
+### 🎨 UI RESTRUCTURE — Terminal tab (tab-by-tab pass 2, from user notes + concept render)
+User decisions locked: retire the one-shot "classic" terminal entirely ("only true terminals
+from here on" — pseudo-shells caused malformed output). Terminal is now a multi-target
+persistent PTY. Selector row order = [ kali ] [ node ▼ ] [ local ]. Identity header dropped.
+Keyboard accessory strip kept as-is. Bottom buttons = CLEAR · COPY · PASTE · CLOSE.
+
+TerminalShell.tsx — full rewrite:
+- §Targets: `kali` (the star — persistent login shell on the active backend: SSH ChannelShell
+  in ssh mode, or chroot `script` PTY on rooted NetHunter); `node ▼` (bottom-sheet picker of
+  ONLINE roster nodes only — `enabled && last_health_status==="running"` — jumps in by
+  injecting `ssh <ssh_user>@<host>[ -p <port>]` into the live Kali shell, `exit` drops back);
+  `local` (Android host root shell via su → best-effort host PTY, gated on HAS_NATIVE_ROOT;
+  de-emphasised, only for host things like `svc wifi disable`).
+- Kali/node SHARE one session (SSH transport); local is its OWN session (chroot transport).
+  Both stay alive across focus flips.
+- Node list auto-refreshes every 5s + on picker open (nodesLocal.list filter). testIDs:
+  term-target-{kali,node,local}, term-node-<id>, btn-term-{clear,copy,paste,close}, termkey-*.
+- PASTE = Clipboard.getStringAsync → writeStdin(focused, text, no-newline). COPY = scrollback
+  dump. CLEAR = Ctrl-L. CLOSE = graceful EOF / SIGKILL on the focused session.
+
+backend.ts — PER-SESSION transport routing (enabling change):
+- Added `sessionKind` map; `startStream(id,cmd,cb,kind?)` pins each session to the backend it
+  was started on; killStream/writeStdin/resizeSession route by `kindFor(id)` (not global
+  `active`). `hasStreaming(kind?)`. Lets a Kali/SSH shell + a local/root shell coexist with
+  correct I/O routing. sessionManager.start gained optional `backend` threaded through.
+
+index.tsx: renderTerminal → just <TerminalShell backendKind execMode wrapKali={wrapForMode} />.
+Removed the classic view + sub-tab toggle, terminalMode/customCmd/termRef state, BANNER const,
+the termRef scroll effect. runProfile no longer jumps to the (gone) classic view — it appends
+to command_logs and shows an Alert summary. `logs` state now write-only (persists to SQLite;
+in-memory array vestigial, harmless warning).
+JS-only, android bundle HTTP 200, lint clean. VERIFY ON APK (web preview = SQLite crash).
+
+### 🎨 UI RESTRUCTURE — Live tab (tab-by-tab pass 3, user notes)
+Design rule sharpened (applies app-wide): one-and-done config → Settings tab; frequently-used
+OPERATIONAL controls → grouped with what they control on their own tab. Live follows it.
+
+Fixes/changes:
+- **No more empty void**: drawer (`presetOpen`) now defaults OPEN so the tool list shows the
+  moment you land on Live — no need to hit the +. The round button became a chevron (show/hide
+  drawer) instead of add.
+- **In-tab tool editor** (replaces the old "add in Settings" dead-end / TODO): `+ new tool`
+  button in the drawer header + **long-press any tile to edit**, tap still launches. Editor
+  modal (animationType none) = name / description / command (with `&&` for pre-cmd +
+  {iface}{host}{port}{file} hints) / category chips / view-mode / icon picker / needs-
+  iface·endpoint·file toggles / SAVE + DELETE (delete hidden for builtins; builtins editable).
+  Persists via attackProfilesLocal.upsert/.delete. Kept the existing color-coded grouping.
+- **New builtin tools** (schema v14 migration removes `dmesg -w` + `iw event` builtins — they're
+  terminal cmds not live tools — and inserts, name-guarded so no dupes):
+  * Enforcer UEF (attack, xterm) — `cd /root/tools/Enforcer-UEF && python3 enforcer-console.py`
+  * Vigolium (audit, scrollback) — `vigolium server --host 0.0.0.0 --service-port 9002`
+  * Semgrep (audit, scrollback) — `semgrep scan --config auto .` (edit path via editor)
+  * EMBA (audit, xterm) — `cd /root/tools/emba && ./emba -l ~/log -f ~/firmware -p ./scan-profiles/default-scan.emba`
+  * Burp DAST (audit, scrollback) — `cd /root/tools/burp/burp-cli && ./burp-cli -s url -k apikey`
+  Added a 5th category **audit** (violet #b08aff) for appsec/code/firmware tools; recon/attack/
+  trace/pcap unchanged. seedDefaultsIfEmpty (fresh installs) mirrors the same final set.
+- **Live xterm is now interactive**: xterm-view sessions forward keystrokes to the PTY
+  (`backendWriteStdin`) so consoles like Enforcer UEF accept input (was one-way).
+- precmd folded into command_template via `&&` (no schema change; the editor edits the whole
+  line). Semgrep/others with a target default to a sane value, editable in the editor.
+JS-only, android bundle HTTP 200, lint clean. VERIFY ON APK (web preview = SQLite crash).
+
+### 🎨 UI RESTRUCTURE — AI tab (tab-by-tab pass 4, user notes)
+Mostly a lineup swap + declutter. User decisions: kill the shell-wrap + render-mode toggles
+(chroothelper-era relics) — everything defaults to full PTY/TUI (xterm). Strip the inherited
+description line; keep the launch command line shown. WebUI/cloud agents open in the **OS
+default browser** (no browser-picker setting this session — may add in-app later).
+
+New roster (schema v15 migration swaps old builtins Hermes/CAI/HEAVEN/Pentagi/PentestAgent →):
+  [Hermes] [Pi] [Antigravity] [Agent Zero] [Strix] [Pentagi] [Heaven] [Xalgorix]
+  * Hermes (shell): cd /root && hermes --continue --yolo --tui
+  * Pi (shell): cd /root && export …KEYS… && pi --provider … --model … --thinking high --approve
+  * Antigravity (shell): cd /root && agy --continue --model gemini-3.8-flash-high --effort high
+  * Strix (shell): export LLM_API_KEY=… && export STRIX_LLM=… && strix --target …
+  * Agent Zero (webui/url): http://<tailip>:5080/
+  * Pentagi (webui/url): https://<tailnetip>:8443/dashboard
+  * Heaven (serve+url): pre `heaven serve --host <tailnetip> --port <port>` → opens http://<tailip>:<port>/
+  * Xalgorix (webui/url): https://www.xalgorix.com/dashboard
+
+Data model: added `launch_url TEXT` to ai_profiles (base CREATE + v15 ALTER in try/catch for
+existing installs). `aiDefaultProfiles()` (hoisted) is the single source for both v15 migration
+and fresh-install seed. AIProfile type + aiProfilesLocal.upsert now carry launch_url.
+`agentKind(p)` classifies: url (open browser only) · serve (PTY + open browser after 1.8s) ·
+shell (PTY only). URL placeholders `<…>` are guarded — START alerts "edit in Settings" instead
+of opening a broken URL.
+
+AITab.tsx: START reads OPEN for url agents (browser icon); serve agents launch the PTY then
+open the browser; every session is pty+xterm (removed view-mode toggle + handleToggleViewMode +
+wrap_mode display). descRow shows just the launch line (◈ webui tag for url/serve). url-only
+agents show a "runs in your browser" transcript placeholder. Launcher builder filters empty
+pre/cmd before `&&` join (fixes Heaven's empty-command case).
+
+index.tsx (Settings → agents editor): removed shell-wrap + render-mode segmented controls and
+the description field; added a **launch URL** field. saveAIProfile requires name + (command OR
+launch_url), forces wrap_mode=pty/view_mode=xterm. List rows drop wrap/view/desc badges, show a
+webui/serve+webui badge when launch_url is set.
+JS-only, android bundle HTTP 200, lint clean. VERIFY ON APK (web preview = SQLite crash).
+
+### 🎨 UI RESTRUCTURE — Mesh tab (ex-MCP, tab-by-tab pass 5, user notes)
+Biggest structural pass. Renamed the bottom-nav tab **MCP → mesh** (internal key stays "mcp").
+New subtab order + names: **[Map] [Nodes] [Tools] [Cockpit] [Audit]** (SubTab type =
+map|nodes|tools|cockpit|audit, default "map"). Target audience = pro secops → stripped the big
+explanatory text blocks throughout (an ops manual will cover the detail).
+
+- **Map** (new, primary/default view): full-screen NodesMap. NodesMap gained a `fill` prop —
+  measures its own height and fills the pane (was a fixed 300px canvas crammed under the list).
+  GRID_THRESHOLD 8→12 (radial→grid collapse point). Tap hub/node still opens sheets.
+- **Nodes** (new split-out): node-management action bar (deploy/provision/add/install .deb/push
+  .deb/update-all) + auto-revive toggle + node-list cards (unchanged actions). Removed the
+  embedded map + double titles + verbose trailing helper; compacted the empty state.
+- **Cockpit** (ex-Status, compacted): merged `// network` INTO `// server` (status dot + enable
+  switch + endpoint, divider, then bind host / port side-by-side + probe host, helpers stripped).
+  `// connectivity` kept. `// autospawn`: dropped "chroot" label word, removed the helper block
+  AND the spawn-cmd textbox; kept STATUS/LOG/STOP. `// cloud sync` untouched (user: good). `//
+  auth`: stripped "when off…" + yellow "token lives…" blocks, kept switch/token/buttons + Bearer
+  hint. `// auto-import from chroot yaml` → **// auto-import from yaml**, stripped both text
+  blocks + read-cmd textbox, button relabelled **SYNC YAML** (kept auto-sync toggle). Dropped
+  trailing "primary node…" helper.
+- **Tools**: removed **+NEW** (tools self-declare / discovered by RESYNC scan). RESYNC + per-tool
+  EDIT/DELETE/enable kept. Empty text → "no tools discovered — tap RESYNC to scan the mesh".
+- **Audit**: unchanged.
+JS-only, android bundle HTTP 200, lint clean. VERIFY ON APK (web preview = SQLite crash).
+
+### 🎨 UI RESTRUCTURE — Settings tab (tab-by-tab pass 6, user notes)
+New sub-nav (flexWrap row, spills to 2nd row automatically past 4): **[General] [Backup & Sync]
+[SWAT] [AI]** (settingsSubTab type general|backup|swat|ai). Renamed Profiles→"Backup & Sync",
+Agents→"AI". NEW deps: expo-document-picker, expo-sharing (expo-file-system already present;
+imported via `expo-file-system/legacy` for SAF + writeAsStringAsync).
+
+- **Execution mode STRIPPED from UI**: removed the PREVIEW/ANDROID/KALI selector + helper +
+  chroot-helper input + the "exec mode" status KV. `execMode` hardwired to "kali" internally
+  (initial state + load coerces stale "mock"→"kali") so real exec never blocks; wrapForMode
+  still returns identity on the SSH backend. chrootPath state kept (default), just no UI.
+- **Backup & Sync** (renderBackupSync, replaces renderProfiles):
+  * `// backup · local` (FUNCTIONAL): EXPORT → localDb.exportAllConfig() dumps every user table
+    (skips mcp_audit_log/command_logs) to JSON; Android uses StorageAccessFramework directory
+    picker → createFileAsync, iOS/decline falls back to Sharing.shareAsync. IMPORT →
+    DocumentPicker → importAllConfig() (INSERT OR REPLACE per row, table-agnostic) → reload.
+  * `// cloud sync · redis` (COSMETIC placeholders this session): "PUSH ALL → REDIS" button +
+    wifi/live/ai per-domain toggles → all show "coming next update" alert. Wiring next session.
+  * Kept the saved command-profiles list below (run/delete/new-from-quick) — still functional.
+  * FYI (user): redis extended with enforcer:probe:hub:{blob,latest,signal} (Enforcer Probe Hub
+    config/data + docker blob).
+- **SWAT submenu** (NEW): extracted the whole SWAT gear-cog panel into `SwatSettings.tsx`
+  (host/port/nick/channel · TLS · SASL acct+pw · autoconnect · alerts · notif/battery/wakelock
+  perms · SAVE & RECONNECT). SwatTab: removed the cog button + inline config panel + all its
+  state/handlers/imports; kept cfg load for the top-strip display + autoconnect. Connect/
+  disconnect still on the SWAT top strip.
+- **AI submenu**: unchanged content (renderAIProfiles), just relabelled the nav button "ai".
+JS-only, android bundle HTTP 200, lint clean. VERIFY ON APK (web preview = SQLite crash).
+SWAT tab itself: user says skip broader changes for now (v1, next SWAT session covers it).

@@ -21,9 +21,9 @@ const C = {
 };
 const MONO = Platform.select({ ios: "Menlo", android: "monospace", default: "monospace" });
 
-const H = 300;          // canvas height
+const H = 300;          // canvas height (non-fill / default)
 const NODE = 60;        // node touch box size
-const GRID_THRESHOLD = 8; // above this many nodes, radial → grid
+const GRID_THRESHOLD = 12; // above this many nodes, radial → grid
 
 function healthColor(h: string): string {
   switch (h) {
@@ -43,6 +43,8 @@ type Props = {
   nodeHealth: Record<string, string>;
   onPressLocal: () => void;
   onPressNode: (n: MCPNode) => void;
+  /** Fill the parent (dedicated Map tab) instead of the fixed 300px canvas. */
+  fill?: boolean;
 };
 
 function Edge({ x1, y1, x2, y2, color }: { x1: number; y1: number; x2: number; y2: number; color: string }) {
@@ -79,13 +81,15 @@ function NodeDot({ color }: { color: string }) {
 }
 
 export default function NodesMap({
-  localHealth, localEnabled, localLabel, nodes, nodeHealth, onPressLocal, onPressNode,
+  localHealth, localEnabled, localLabel, nodes, nodeHealth, onPressLocal, onPressNode, fill,
 }: Props) {
   const [w, setW] = useState(0);
+  const [h, setH] = useState(0);
+  const canvasH = fill ? (h || H) : H;
   const cx = w / 2;
-  const cy = H / 2;
+  const cy = canvasH / 2;
   const count = nodes.length;
-  const R = Math.max(70, Math.min(w, H) / 2 - NODE / 2 - 20);
+  const R = Math.max(80, Math.min(w, canvasH) / 2 - NODE / 2 - 24);
 
   const localColor = !localEnabled ? C.textDim : healthColor(localHealth);
 
@@ -95,7 +99,7 @@ export default function NodesMap({
   // grid = scale.
   if (count > GRID_THRESHOLD) {
     return (
-      <View style={styles.gridWrap}>
+      <View style={[styles.gridWrap, fill && { flex: 1 }]}>
         <View style={styles.gridHeader}>
           <View style={[styles.gridHubDot, { backgroundColor: localColor }]} />
           <TouchableOpacity onPress={onPressLocal} activeOpacity={0.7}>
@@ -138,7 +142,10 @@ export default function NodesMap({
   });
 
   return (
-    <View style={styles.wrap} onLayout={(e) => setW(e.nativeEvent.layout.width)}>
+    <View
+      style={[styles.wrap, fill && { flex: 1, height: undefined }]}
+      onLayout={(e) => { setW(e.nativeEvent.layout.width); setH(e.nativeEvent.layout.height); }}
+    >
       {w > 0 && (
         <>
           {/* edges under nodes */}
