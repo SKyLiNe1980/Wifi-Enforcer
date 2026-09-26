@@ -1690,3 +1690,52 @@ export const nodesLocal = {
   },
 };
 export { kvGet, kvSet };
+
+// ─── Full-config backup / restore (Settings → Backup & Sync) ─────────────
+// Generic dump/restore of every user table (skipping ephemeral logs). Used by
+// the local JSON export/import. Kept table-agnostic so new tables are picked
+// up automatically without touching this code.
+const BACKUP_SKIP = new Set(["mcp_audit_log", "command_logs"]);
+
+export async function exportAllConfig(): Promise<Record<string, any>> {
+  const db = await openLocalDb();
+  const tables = await db.getAllAsync<{ name: string }>(
+    "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+  );
+  const out: Record<string, any[]> = {};
+  for (const { name } of tables) {
+    if (BACKUP_SKIP.has(name)) continue;
+    out[name] = await db.getAllAsync(`SELECT * FROM ${name}`);
+  }
+  return { app: "enforcer-framework", schema: TARGET_VERSION, exported_at: nowIso(), tables: out };
+}
+
+export async function importAllConfig(blob: any): Promise<{ tables: number; rows: number }> {
+  const db = await openLocalDb();
+  const tables = (blob && blob.tables) || {};
+  let tCount = 0, rCount = 0;
+  for (const name of Object.keys(tables)) {
+    const rows = tables[name];
+    if (!Array.isArray(rows) || rows.length === 0) continue;
+    if (BACKUP_SKIP.has(name)) continue;
+    const exists = await db.getFirstAsync<{ name: string }>(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name = ?", [name],
+    );
+    if (!exists) continue;
+    for (const row of rows) {
+      if (!row || typeof row !== "object") continue;
+      const cols = Object.keys(row);
+      if (cols.length === 0) continue;
+      const placeholders = cols.map(() => "?").join(",");
+      try {
+        await db.runAsync(
+          `INSERT OR REPLACE INTO ${name} (${cols.join(",")}) VALUES (${placeholders})`,
+          cols.map((c) => (row as any)[c]),
+        );
+        rCount++;
+      } catch { /* skip incompatible row */ }
+    }
+    tCount++;
+  }
+  return { tables: tCount, rows: rCount };
+}

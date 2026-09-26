@@ -19,6 +19,7 @@ import {
   RefreshControl,
   AppState,
   ToastAndroid,
+  Switch,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { StatusBar } from "expo-status-bar";
@@ -29,6 +30,7 @@ import LiveTab from "../src/components/LiveTab";
 import AITab from "../src/components/AITab";
 import MCPTab from "../src/components/MCPTab";
 import SwatTab from "../src/components/SwatTab";
+import SwatSettings from "../src/components/SwatSettings";
 import TerminalShell from "../src/components/TerminalShell";
 import WlanControl from "../src/components/WlanControl";
 import SshBackendPanel, { type SshStatus } from "../src/components/SshBackendPanel";
@@ -46,7 +48,12 @@ import {
   aiProfilesLocal,
   pcapEndpointsLocal,
   commandLogsLocal,
+  exportAllConfig,
+  importAllConfig,
 } from "../src/lib/localDb";
+import * as FileSystem from "expo-file-system/legacy";
+import * as DocumentPicker from "expo-document-picker";
+import * as Sharing from "expo-sharing";
 import { loadToolbarConfig, saveToolbarConfig, subscribeToolbar } from "../src/lib/toolbarStore";
 import { executeSlot } from "../src/lib/toolbarActions";
 import {
@@ -268,7 +275,7 @@ export default function App() {
   const [stagedCombo, setStagedCombo] = useState<string[] | null>(null);
   const [newProfileName, setNewProfileName] = useState("");
   const [newProfileDesc, setNewProfileDesc] = useState("");
-  const [execMode, setExecMode] = useState<ExecMode>("mock");
+  const [execMode, setExecMode] = useState<ExecMode>("kali");
   const [bridgeRoot, setBridgeRoot] = useState<boolean | null>(null);
   const [chrootPath, setChrootPath] = useState(NETHUNTER_CHROOT);
   // ─── SSH backend mode ─────────────────────────────────────────────────────
@@ -284,7 +291,7 @@ export default function App() {
   // = 6 tabs, each ~16% of screen width — too cramped on the S10+ in
   // portrait). We nested "Profiles" + "AI Agents" under Settings as
   // sub-tabs so the bottom bar shrinks to a balanced 5 tabs.
-  const [settingsSubTab, setSettingsSubTab] = useState<"general" | "profiles" | "agents">("general");
+  const [settingsSubTab, setSettingsSubTab] = useState<"general" | "backup" | "swat" | "ai">("general");
 
   // ─── Terminal tab mode ───────────────────────────────────────────────────
   // ─── AI profile editor state ─────────────────────────────────────────────
@@ -837,7 +844,10 @@ export default function App() {
         const v = s.chroot_path.trim();
         setChrootPath(legacy.includes(v) ? NETHUNTER_CHROOT : v);
       }
-      setExecMode(s.exec_mode);
+      // Execution mode UI was retired — everything runs through the SSH
+      // backend (or chroot-wrapped Kali when on the chroot backend). Force
+      // "kali" so a stale saved "mock" can't block real exec.
+      setExecMode("kali");
       settingsLoaded.current = true;
       setResource("settings", { kind: "ok", at: Date.now() });
     } catch (e: any) {
@@ -1083,6 +1093,83 @@ export default function App() {
     }
   }, [importText, fetchAll]);
 
+  // ─── Backup & Sync: full-config JSON export / import ─────────────────────
+  const [backupBusy, setBackupBusy] = useState(false);
+
+  const handleExportConfig = useCallback(async () => {
+    setBackupBusy(true);
+    try {
+      const blob = await exportAllConfig();
+      const json = JSON.stringify(blob, null, 2);
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+      const filename = `enforcer-config-${stamp}.json`;
+
+      if (Platform.OS === "android" && FileSystem.StorageAccessFramework) {
+        // Let the operator pick a folder (SAF). Falls back to Share on cancel.
+        const perm = await FileSystem.StorageAccessFramework.requestDirectoryPermissionsAsync();
+        if (perm.granted) {
+          const uri = await FileSystem.StorageAccessFramework.createFileAsync(
+            perm.directoryUri, filename, "application/json",
+          );
+          await FileSystem.writeAsStringAsync(uri, json, { encoding: FileSystem.EncodingType.UTF8 });
+          const tableCount = Object.keys(blob.tables || {}).length;
+          Alert.alert("Exported", `${filename}\n${tableCount} tables saved to your chosen folder.`);
+          setBackupBusy(false);
+          return;
+        }
+      }
+      // iOS / SAF-declined fallback: write to cache + share sheet.
+      const tmp = `${FileSystem.cacheDirectory}${filename}`;
+      await FileSystem.writeAsStringAsync(tmp, json, { encoding: FileSystem.EncodingType.UTF8 });
+      if (await Sharing.isAvailableAsync()) {
+        await Sharing.shareAsync(tmp, { mimeType: "application/json", dialogTitle: "Save Enforcer config" });
+      } else {
+        Alert.alert("Exported to cache", tmp);
+      }
+    } catch (e: any) {
+      Alert.alert("Export failed", e?.message || "unknown error");
+    } finally {
+      setBackupBusy(false);
+    }
+  }, []);
+
+  const handleImportConfig = useCallback(async () => {
+    try {
+      const res = await DocumentPicker.getDocumentAsync({
+        type: ["application/json", "*/*"], copyToCacheDirectory: true,
+      });
+      if (res.canceled || !res.assets?.[0]) return;
+      setBackupBusy(true);
+      const uri = res.assets[0].uri;
+      const text = await FileSystem.readAsStringAsync(uri, { encoding: FileSystem.EncodingType.UTF8 });
+      const blob = JSON.parse(text);
+      if (!blob?.tables) throw new Error("not an Enforcer config backup (missing tables)");
+      Alert.alert(
+        "Restore config?",
+        "This merges the backup into your current config (overwrites matching rows). Continue?",
+        [
+          { text: "Cancel", style: "cancel", onPress: () => setBackupBusy(false) },
+          {
+            text: "Restore", style: "destructive", onPress: async () => {
+              try {
+                const r = await importAllConfig(blob);
+                await reloadSettings();
+                await fetchAll();
+                await fetchAIProfiles();
+                Alert.alert("Restored", `${r.rows} rows across ${r.tables} tables.\nRestart the app if something looks stale.`);
+              } catch (e: any) {
+                Alert.alert("Restore failed", e?.message || "import error");
+              } finally { setBackupBusy(false); }
+            },
+          },
+        ],
+      );
+    } catch (e: any) {
+      Alert.alert("Import failed", e?.message || "unknown error");
+      setBackupBusy(false);
+    }
+  }, [reloadSettings, fetchAll, fetchAIProfiles]);
+
   // ---------- TAB RENDERERS ----------
   const renderQuick = () => (
     <ScrollView
@@ -1116,10 +1203,68 @@ export default function App() {
     </View>
   );
 
-  const renderProfiles = () => (
+  const renderBackupSync = () => (
     <ScrollView contentContainerStyle={{ padding: 16, paddingBottom: 32 }}>
-      <View style={s.sectionRow}>
-        <Text style={s.sectionTitle}>// profiles ({profiles.length})</Text>
+      {/* ── Local backup (functional) ── */}
+      <Text style={s.sectionTitle}>{"// backup · local"}</Text>
+      <View style={s.kvBlock}>
+        <Text style={s.helper}>
+          export every setting, profile, agent, node &amp; tool to a JSON file in a folder you pick.
+        </Text>
+        <View style={{ flexDirection: "row", gap: 8, marginTop: 12 }}>
+          <TouchableOpacity
+            testID="btn-export-config"
+            onPress={handleExportConfig}
+            disabled={backupBusy}
+            style={[s.bsBtn, { borderColor: C.green }, backupBusy && { opacity: 0.5 }]}
+          >
+            <MaterialCommunityIcons name="export-variant" size={16} color={C.green} />
+            <Text style={[s.bsBtnText, { color: C.green }]}>EXPORT</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            testID="btn-import-config"
+            onPress={handleImportConfig}
+            disabled={backupBusy}
+            style={[s.bsBtn, { borderColor: C.cyan }, backupBusy && { opacity: 0.5 }]}
+          >
+            <MaterialCommunityIcons name="import" size={16} color={C.cyan} />
+            <Text style={[s.bsBtnText, { color: C.cyan }]}>IMPORT</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+
+      {/* ── Cloud sync (cosmetic placeholders — wired next session) ── */}
+      <Text style={[s.sectionTitle, { marginTop: 20 }]}>{"// cloud sync · redis"}</Text>
+      <View style={s.kvBlock}>
+        <TouchableOpacity
+          testID="btn-redis-push"
+          onPress={() => Alert.alert("Coming next update", "Full-config push to Upstash Redis lands in the next sync pass.")}
+          style={[s.bsBtn, { borderColor: C.textDim, alignSelf: "flex-start" }]}
+        >
+          <MaterialCommunityIcons name="cloud-upload-outline" size={16} color={C.textDim} />
+          <Text style={[s.bsBtnText, { color: C.textDim }]}>PUSH ALL → REDIS</Text>
+        </TouchableOpacity>
+        <Text style={[s.helper, { marginTop: 10 }]}>{"// sync these to redis (wiring next session):"}</Text>
+        {([
+          ["wifi presets", "wifi"],
+          ["live tools", "live"],
+          ["ai agents", "ai"],
+        ] as const).map(([label, key]) => (
+          <View key={key} style={[s.row, { justifyContent: "space-between", marginTop: 8 }]}>
+            <Text style={s.rowText}>{label}</Text>
+            <Switch
+              value={false}
+              onValueChange={() => Alert.alert("Coming next update", "Per-domain Redis sync is cosmetic for now.")}
+              trackColor={{ false: C.border, true: C.greenDim }}
+              thumbColor={C.textDim}
+            />
+          </View>
+        ))}
+      </View>
+
+      {/* ── Saved command profiles (existing) ── */}
+      <View style={[s.sectionRow, { marginTop: 20 }]}>
+        <Text style={s.sectionTitle}>{`// profiles (${profiles.length})`}</Text>
         <TouchableOpacity testID="btn-save-profile-tab" onPress={() => setSaveOpen(true)} style={s.smallBtn}>
           <Ionicons name="add" size={14} color={C.green} />
           <Text style={s.smallBtnText}>new from quick</Text>
@@ -1159,38 +1304,40 @@ export default function App() {
         </View>
       ))}
       {profiles.length === 0 && (
-        <Text style={{ color: C.textDim, fontFamily: MONO, padding: 16, textAlign: "center" }}>no profiles yet</Text>
+        <Text style={{ color: C.textDim, fontFamily: MONO, padding: 16, textAlign: "center" }}>no saved profiles yet</Text>
       )}
     </ScrollView>
   );
 
   const renderSettings = () => (
     <View style={{ flex: 1 }}>
-      {/* Sub-tab bar — nested navigation inside Settings. We use a small
-          segmented control rather than the bottom tab bar to keep the
-          main bar simple. Profiles + AI Agents previously lived as
-          top-level tabs but the bar was getting overcrowded. */}
-      <View style={s.subTabBar}>
-        {(["general", "profiles", "agents"] as const).map((sub) => {
-          const active = settingsSubTab === sub;
-          const label = sub === "general" ? "general" : sub === "profiles" ? `profiles · ${profiles.length}` : `agents · ${aiProfilesList.length}`;
-          const icon: any = sub === "general" ? "cog" : sub === "profiles" ? "bookmark-multiple" : "robot-outline";
+      {/* Sub-tab bar — nested navigation inside Settings. flexWrap lets it
+          spill onto a 2nd row automatically if we add more submenus. */}
+      <View style={[s.subTabBar, { flexWrap: "wrap" }]}>
+        {([
+          { key: "general", label: "general", icon: "cog" },
+          { key: "backup", label: "backup & sync", icon: "cloud-sync-outline" },
+          { key: "swat", label: "swat", icon: "shield-account" },
+          { key: "ai", label: "ai", icon: "robot-outline" },
+        ] as { key: "general" | "backup" | "swat" | "ai"; label: string; icon: any }[]).map((it) => {
+          const active = settingsSubTab === it.key;
           return (
             <TouchableOpacity
-              key={sub}
-              testID={`settings-subtab-${sub}`}
-              onPress={() => setSettingsSubTab(sub)}
+              key={it.key}
+              testID={`settings-subtab-${it.key}`}
+              onPress={() => setSettingsSubTab(it.key)}
               style={[s.subTab, active && s.subTabActive]}
             >
-              <MaterialCommunityIcons name={icon} size={14} color={active ? C.green : C.textDim} />
-              <Text style={[s.subTabText, active && { color: C.green }]}>{label}</Text>
+              <MaterialCommunityIcons name={it.icon} size={14} color={active ? C.green : C.textDim} />
+              <Text style={[s.subTabText, active && { color: C.green }]}>{it.label}</Text>
             </TouchableOpacity>
           );
         })}
       </View>
 
-      {settingsSubTab === "profiles" ? renderProfiles()
-        : settingsSubTab === "agents" ? renderAIProfiles()
+      {settingsSubTab === "backup" ? renderBackupSync()
+        : settingsSubTab === "swat" ? <SwatSettings />
+        : settingsSubTab === "ai" ? renderAIProfiles()
         : renderGeneralSettings()}
     </View>
   );
@@ -1199,7 +1346,6 @@ export default function App() {
     <ScrollView contentContainerStyle={{ padding: 16, paddingBottom: 32 }}>
       <Text style={s.sectionTitle}>// system</Text>
       <View style={s.kvBlock}>
-        <KV k="exec mode" v={execMode === "kali" ? "KALI · chroot" : execMode === "real" ? "ANDROID · su -c" : "PREVIEW"} vColor={execMode === "mock" ? C.yellow : C.green} />
         <KV k="bridge" v={HAS_NATIVE_ROOT ? (bridgeRoot ? "loaded · root granted" : bridgeRoot === false ? "loaded · root denied" : "loaded · checking…") : "absent (Expo Go / web)"} vColor={HAS_NATIVE_ROOT ? (bridgeRoot ? C.green : C.red) : C.textDim} />
         <KV k="root" v={rootInfo?.root_granted ? "GRANTED" : "..."} vColor={rootInfo?.root_granted ? C.green : C.red} />
         <KV k="device" v={rootInfo?.device || "..."} vColor={C.cyan} />
@@ -1332,110 +1478,6 @@ export default function App() {
         </Text>
       )}
 
-      <Text style={[s.sectionTitle, { marginTop: 24 }]}>// execution mode</Text>
-      <View style={s.segGroup}>
-        {(["mock", "real", "kali"] as ExecMode[]).map((m) => {
-          const active = execMode === m;
-          const disabled = m !== "mock" && !HAS_NATIVE_ROOT;
-          // Hide "Preview" once the native bridge is confirmed present —
-          // it becomes a silent auto-fallback for Expo Go / web preview
-          // / cold boots before checkRoot() resolves. Operators on a real
-          // build never need to see a "MOCK" button cluttering the UI.
-          if (m === "mock" && HAS_NATIVE_ROOT && bridgeRoot === true) return null;
-          const color = m === "mock" ? C.yellow : m === "real" ? C.green : C.magenta;
-          // Operator-brain labels: mock → Preview (auto-fallback),
-          // real → Android (raw su -c), kali → Kali (chroot wrap).
-          const label = m === "mock" ? "PREVIEW" : m === "real" ? "ANDROID" : "KALI";
-          return (
-            <TouchableOpacity
-              key={m}
-              testID={`btn-mode-${m}`}
-              onPress={() => {
-                if (disabled) {
-                  Alert.alert("Bridge not present", "Build the APK first. See /app/root-bridge/README.md.");
-                  return;
-                }
-                // Only block if root has been EXPLICITLY checked and denied.
-                // `bridgeRoot === null` means the async checkRoot() probe hasn't
-                // resolved yet — historically we bailed here, which silently
-                // dropped KALI taps during the first ~hundred ms of cold boot
-                // and was the root cause of "MOCK keeps sticking on reopen".
-                // Now we proceed optimistically; if root is truly absent, the
-                // actual command exec will fail loudly with a useful error.
-                if (m !== "mock" && bridgeRoot === false) {
-                  Alert.alert("Root not granted", "Open Magisk and grant root for WiFi Enforcer, then try again.");
-                  return;
-                }
-                // If still probing, kick off a background re-check so the UI
-                // catches up to reality without blocking this tap.
-                if (m !== "mock" && bridgeRoot === null && HAS_NATIVE_ROOT) {
-                  checkRoot().then(setBridgeRoot).catch(() => setBridgeRoot(false));
-                }
-                setExecMode(m);
-                // Fire-and-forget IMMEDIATE local SQLite write — bypasses
-                // the debounced useEffect so the mode change is durably
-                // persisted even if the user instantly kills the app. The
-                // debounced effect still saves other settings (iface,
-                // country, etc).
-                settingsLocal.update({
-                  exec_mode: m,
-                  iface_a: iface,
-                  iface_b: ifaceB,
-                  iface_c: ifaceC,
-                  country,
-                  active_iface: activeIface,
-                  chroot_path: chrootPath,
-                }).catch((e) => console.warn("[settings] mode write failed:", e?.message));
-              }}
-              style={[
-                s.segBtn,
-                active && { backgroundColor: color, borderColor: color },
-                disabled && { opacity: 0.4 },
-              ]}
-            >
-              <MaterialCommunityIcons
-                name={m === "mock" ? "shield-outline" : m === "real" ? "android" : "linux"}
-                size={14}
-                color={active ? C.bg : color}
-              />
-              <Text style={[s.segBtnText, { color: active ? C.bg : color }]}>
-                {label}
-              </Text>
-            </TouchableOpacity>
-          );
-        })}
-      </View>
-      <Text style={s.helper}>
-        {execMode === "kali"
-          ? "commands wrapped via NetHunter chroot — runs inside Kali Linux"
-          : execMode === "real"
-          ? "commands hit `su -c` directly on the Android host"
-          : "preview mode — no real exec, used when native bridge is unavailable"}
-      </Text>
-      {!HAS_NATIVE_ROOT && (
-        <Text style={[s.helper, { marginTop: 4 }]}>
-          REAL/KALI are only available in the built APK.
-        </Text>
-      )}
-
-      {execMode === "kali" && (
-        <View style={[s.field, { marginTop: 10 }]}>
-          <Text style={s.fieldLabel}>chroot helper</Text>
-          <TextInput
-            testID="input-chroot-path"
-            value={chrootPath}
-            onChangeText={setChrootPath}
-            style={s.fieldInput}
-            placeholder="bootkali"
-            placeholderTextColor={C.textDim}
-            autoCapitalize="none"
-            autoCorrect={false}
-          />
-          <Text style={s.helper}>
-            wrap: <Text style={{ color: C.magenta }}>{chrootPath.length > 60 ? chrootPath.slice(0, 57) + "…" : chrootPath}</Text>{" "}<Text style={{ color: C.green }}>&lt;cmd&gt;</Text>
-          </Text>
-        </View>
-      )}
 
       {sshCfg ? (
         <SshBackendPanel
@@ -2001,6 +2043,11 @@ const s = StyleSheet.create({
     borderWidth: 1, borderColor: C.border, borderRadius: 3,
   },
   smallBtnText: { color: C.green, fontFamily: MONO, fontSize: 10, marginLeft: 4 },
+  bsBtn: {
+    flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 6,
+    flex: 1, paddingVertical: 11, borderRadius: 5, borderWidth: 1, backgroundColor: C.panel2,
+  },
+  bsBtnText: { fontFamily: MONO, fontSize: 12, fontWeight: "700" },
 
   grid: { flexDirection: "row", flexWrap: "wrap", justifyContent: "space-between" },
   gridItem: {

@@ -1014,3 +1014,32 @@ explanatory text blocks throughout (an ops manual will cover the detail).
   EDIT/DELETE/enable kept. Empty text → "no tools discovered — tap RESYNC to scan the mesh".
 - **Audit**: unchanged.
 JS-only, android bundle HTTP 200, lint clean. VERIFY ON APK (web preview = SQLite crash).
+
+### 🎨 UI RESTRUCTURE — Settings tab (tab-by-tab pass 6, user notes)
+New sub-nav (flexWrap row, spills to 2nd row automatically past 4): **[General] [Backup & Sync]
+[SWAT] [AI]** (settingsSubTab type general|backup|swat|ai). Renamed Profiles→"Backup & Sync",
+Agents→"AI". NEW deps: expo-document-picker, expo-sharing (expo-file-system already present;
+imported via `expo-file-system/legacy` for SAF + writeAsStringAsync).
+
+- **Execution mode STRIPPED from UI**: removed the PREVIEW/ANDROID/KALI selector + helper +
+  chroot-helper input + the "exec mode" status KV. `execMode` hardwired to "kali" internally
+  (initial state + load coerces stale "mock"→"kali") so real exec never blocks; wrapForMode
+  still returns identity on the SSH backend. chrootPath state kept (default), just no UI.
+- **Backup & Sync** (renderBackupSync, replaces renderProfiles):
+  * `// backup · local` (FUNCTIONAL): EXPORT → localDb.exportAllConfig() dumps every user table
+    (skips mcp_audit_log/command_logs) to JSON; Android uses StorageAccessFramework directory
+    picker → createFileAsync, iOS/decline falls back to Sharing.shareAsync. IMPORT →
+    DocumentPicker → importAllConfig() (INSERT OR REPLACE per row, table-agnostic) → reload.
+  * `// cloud sync · redis` (COSMETIC placeholders this session): "PUSH ALL → REDIS" button +
+    wifi/live/ai per-domain toggles → all show "coming next update" alert. Wiring next session.
+  * Kept the saved command-profiles list below (run/delete/new-from-quick) — still functional.
+  * FYI (user): redis extended with enforcer:probe:hub:{blob,latest,signal} (Enforcer Probe Hub
+    config/data + docker blob).
+- **SWAT submenu** (NEW): extracted the whole SWAT gear-cog panel into `SwatSettings.tsx`
+  (host/port/nick/channel · TLS · SASL acct+pw · autoconnect · alerts · notif/battery/wakelock
+  perms · SAVE & RECONNECT). SwatTab: removed the cog button + inline config panel + all its
+  state/handlers/imports; kept cfg load for the top-strip display + autoconnect. Connect/
+  disconnect still on the SWAT top strip.
+- **AI submenu**: unchanged content (renderAIProfiles), just relabelled the nav button "ai".
+JS-only, android bundle HTTP 200, lint clean. VERIFY ON APK (web preview = SQLite crash).
+SWAT tab itself: user says skip broader changes for now (v1, next SWAT session covers it).
