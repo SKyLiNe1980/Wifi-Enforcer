@@ -953,3 +953,39 @@ Fixes/changes:
 - precmd folded into command_template via `&&` (no schema change; the editor edits the whole
   line). Semgrep/others with a target default to a sane value, editable in the editor.
 JS-only, android bundle HTTP 200, lint clean. VERIFY ON APK (web preview = SQLite crash).
+
+### 🎨 UI RESTRUCTURE — AI tab (tab-by-tab pass 4, user notes)
+Mostly a lineup swap + declutter. User decisions: kill the shell-wrap + render-mode toggles
+(chroothelper-era relics) — everything defaults to full PTY/TUI (xterm). Strip the inherited
+description line; keep the launch command line shown. WebUI/cloud agents open in the **OS
+default browser** (no browser-picker setting this session — may add in-app later).
+
+New roster (schema v15 migration swaps old builtins Hermes/CAI/HEAVEN/Pentagi/PentestAgent →):
+  [Hermes] [Pi] [Antigravity] [Agent Zero] [Strix] [Pentagi] [Heaven] [Xalgorix]
+  * Hermes (shell): cd /root && hermes --continue --yolo --tui
+  * Pi (shell): cd /root && export …KEYS… && pi --provider … --model … --thinking high --approve
+  * Antigravity (shell): cd /root && agy --continue --model gemini-3.8-flash-high --effort high
+  * Strix (shell): export LLM_API_KEY=… && export STRIX_LLM=… && strix --target …
+  * Agent Zero (webui/url): http://<tailip>:5080/
+  * Pentagi (webui/url): https://<tailnetip>:8443/dashboard
+  * Heaven (serve+url): pre `heaven serve --host <tailnetip> --port <port>` → opens http://<tailip>:<port>/
+  * Xalgorix (webui/url): https://www.xalgorix.com/dashboard
+
+Data model: added `launch_url TEXT` to ai_profiles (base CREATE + v15 ALTER in try/catch for
+existing installs). `aiDefaultProfiles()` (hoisted) is the single source for both v15 migration
+and fresh-install seed. AIProfile type + aiProfilesLocal.upsert now carry launch_url.
+`agentKind(p)` classifies: url (open browser only) · serve (PTY + open browser after 1.8s) ·
+shell (PTY only). URL placeholders `<…>` are guarded — START alerts "edit in Settings" instead
+of opening a broken URL.
+
+AITab.tsx: START reads OPEN for url agents (browser icon); serve agents launch the PTY then
+open the browser; every session is pty+xterm (removed view-mode toggle + handleToggleViewMode +
+wrap_mode display). descRow shows just the launch line (◈ webui tag for url/serve). url-only
+agents show a "runs in your browser" transcript placeholder. Launcher builder filters empty
+pre/cmd before `&&` join (fixes Heaven's empty-command case).
+
+index.tsx (Settings → agents editor): removed shell-wrap + render-mode segmented controls and
+the description field; added a **launch URL** field. saveAIProfile requires name + (command OR
+launch_url), forces wrap_mode=pty/view_mode=xterm. List rows drop wrap/view/desc badges, show a
+webui/serve+webui badge when launch_url is set.
+JS-only, android bundle HTTP 200, lint clean. VERIFY ON APK (web preview = SQLite crash).

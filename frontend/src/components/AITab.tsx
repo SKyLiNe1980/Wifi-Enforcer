@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import {
   View, Text, StyleSheet, ScrollView, FlatList, TouchableOpacity, TextInput, Alert, Platform,
-  KeyboardAvoidingView,
+  KeyboardAvoidingView, Linking,
 } from "react-native";
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { sessionManager, SessionState } from "../lib/sessionManager";
@@ -45,8 +45,22 @@ export type AIProfile = {
    * Older profiles in Mongo may not have this field; we default to "xterm".
    */
   view_mode?: "xterm" | "scrollback";
+  /** WebUI/cloud agents (Pentagi/Heaven/Xalgorix/Agent Zero) open this in the
+   *  OS browser on START. If a shell command exists too (Heaven serve), the
+   *  PTY launches first then the browser opens. */
+  launch_url?: string | null;
   created_at: string;
 };
+
+/** Classify an agent by how START should behave. */
+function agentKind(p: AIProfile | null): "shell" | "url" | "serve" {
+  if (!p) return "shell";
+  const url = (p.launch_url || "").trim();
+  const shell = [p.pre_command, p.command].map((x) => (x || "").trim()).filter(Boolean).join(" && ");
+  if (url && !shell) return "url";
+  if (url && shell) return "serve";
+  return "shell";
+}
 
 type Props = {
   execMode: "mock" | "real" | "kali";
@@ -228,18 +242,46 @@ export default function AITab(props: Props) {
     [profiles, selectedId],
   );
 
-  // Default to "xterm" when a profile from Mongo predates the view_mode field.
-  const viewMode: "xterm" | "scrollback" =
-    (selectedProfile?.view_mode as any) || "xterm";
+  // Everything renders as a full TUI now — the old xterm/scrollback toggle
+  // and shell-wrap modes were chroothelper-era relics. Force xterm + pty.
+  const viewMode: "xterm" | "scrollback" = "xterm";
+
+  const kind = agentKind(selectedProfile);
+  const launchLine = selectedProfile
+    ? (kind === "url"
+        ? (selectedProfile.launch_url || "")
+        : ([selectedProfile.pre_command, selectedProfile.command].map((x) => (x || "").trim()).filter(Boolean).join(" && ") || selectedProfile.command))
+    : "";
 
   const isRunning = activeSession && (activeSession.status === "running" || activeSession.status === "starting");
   const canStart = !!selectedProfile && !isRunning;
   const canStop = !!activeSession && isRunning;
   const canSend = !!isRunning && !sending;
 
+  // ─── Open a WebUI/cloud agent's dashboard in the OS default browser ──────
+  const openLaunchUrl = useCallback((url: string, name: string): boolean => {
+    const u = (url || "").trim();
+    if (!u) return false;
+    if (/[<>]/.test(u)) {
+      Alert.alert(
+        "Set the launch URL first",
+        `${name}'s launch URL still has placeholders:\n\n${u}\n\nEdit it in Settings → agents and drop in your tailnet IP / port.`,
+      );
+      return false;
+    }
+    Linking.openURL(u).catch((e) => Alert.alert("Couldn't open browser", e?.message || u));
+    return true;
+  }, []);
+
   // ─── Start / Stop ────────────────────────────────────────────────────────
   const handleStart = useCallback(async () => {
     if (!selectedProfile) return;
+    const k = agentKind(selectedProfile);
+    // Pure WebUI / cloud agent → no shell, just open the dashboard.
+    if (k === "url") {
+      openLaunchUrl(selectedProfile.launch_url || "", selectedProfile.name);
+      return;
+    }
     if (props.sshMode) {
       if (!HAS_NATIVE_SSH) {
         Alert.alert("Native build required", "SSH backend needs the native APK build.");
@@ -252,11 +294,8 @@ export default function AITab(props: Props) {
       );
       return;
     }
-    // Step 1: launch a login shell (bash -l) wrapped by the chosen pty/unbuffer
-    // mode and the outer exec-mode chroot prefix. This shell will source rc
-    // files (/etc/profile, /etc/bash.bashrc, ~/.bashrc) before reading stdin,
-    // so the hermes/cai/etc launcher gets a fully-bootstrapped environment.
-    const shellInvocation = applyAIWrap(selectedProfile.wrap_mode);
+    // Every agent runs as a full PTY/TUI now (pty wrap is the only mode).
+    const shellInvocation = applyAIWrap("pty");
     const wrappedShell = props.wrap(shellInvocation);
     try {
       const id = await sessionManager.start({
@@ -326,16 +365,22 @@ export default function AITab(props: Props) {
         console.log(`[AITab] injected MCP env: primary=${primaryName}, total nodes=${nodeCount}`);
       }
 
-      // Step 2: send the launcher command (and optional pre_command) into the
-      // login shell's stdin. Wait ~800ms so bash has time to source its rc
-      // files before our line lands in its input queue (otherwise our line
-      // might race ahead of rc execution and run in a half-bootstrapped env).
-      const launcher = selectedProfile.pre_command
-        ? `${selectedProfile.pre_command} && ${selectedProfile.command}`
-        : selectedProfile.command;
-      setTimeout(() => {
-        sessionManager.sendInput(id, launcher, true).catch(() => {});
-      }, 800);
+      // Step 2: send the launcher command (pre_command + command, joined with
+      // && and skipping empties) into the login shell's stdin. Wait ~800ms so
+      // the shell has sourced its rc files before our line lands.
+      const launcher = [selectedProfile.pre_command, selectedProfile.command]
+        .map((x) => (x || "").trim()).filter(Boolean).join(" && ");
+      if (launcher) {
+        setTimeout(() => {
+          sessionManager.sendInput(id, launcher, true).catch(() => {});
+        }, 800);
+      }
+
+      // serve+url agent (e.g. Heaven `heaven serve …`): once the server has
+      // had a moment to bind, open its dashboard in the OS browser.
+      if (k === "serve" && selectedProfile.launch_url) {
+        setTimeout(() => { openLaunchUrl(selectedProfile.launch_url || "", selectedProfile.name); }, 1800);
+      }
 
       // Step 3: optional send_initial — auto-sent ~1.5s after the launcher
       // boots so the agent has time to print its banner before we feed it.
@@ -347,7 +392,7 @@ export default function AITab(props: Props) {
     } catch (e: any) {
       Alert.alert("Failed to start", e?.message || "Unknown error");
     }
-  }, [selectedProfile, props.wrap, props.apiBase]);
+  }, [selectedProfile, props.wrap, props.apiBase, props.sshMode, openLaunchUrl]);
 
   const handleStop = useCallback(async () => {
     if (!activeSessionId) return;
@@ -406,28 +451,6 @@ export default function AITab(props: Props) {
     [activeSessionId],
   );
 
-  // ─── Toggle view_mode for the currently-selected profile ────────────────
-  // PATCHes Mongo and optimistically updates the local profiles list so the
-  // UI flips immediately. We re-key the XTermView (via the session id) so
-  // it remounts cleanly when the user switches mid-session.
-  const handleToggleViewMode = useCallback(async () => {
-    if (!selectedProfile) return;
-    const next: "xterm" | "scrollback" = viewMode === "xterm" ? "scrollback" : "xterm";
-    // Optimistic local update — UI flips instantly
-    setProfiles((prev) => prev.map((p) => (p.id === selectedProfile.id ? { ...p, view_mode: next } : p)));
-    try {
-      await aiProfilesLocal.upsert({
-        id: selectedProfile.id,
-        name: selectedProfile.name,
-        command: selectedProfile.command,
-        view_mode: next,
-      });
-    } catch {
-      // On failure, refetch to reconcile.
-      fetchProfiles();
-    }
-  }, [selectedProfile, viewMode, fetchProfiles]);
-
   // ─── Clear current session output (local only) ───────────────────────────
   const handleClear = useCallback(() => {
     if (!activeSessionId) return;
@@ -482,18 +505,12 @@ export default function AITab(props: Props) {
         </ScrollView>
       </View>
 
-      {/* Description / status row */}
+      {/* Launch line — the command (or WebUI URL) this agent fires. */}
       {selectedProfile && (
         <View style={s.descRow}>
           <Text style={s.descText} numberOfLines={2}>
-            <Text style={{ color: C.aiAccent }}>{selectedProfile.command}</Text>
-            {selectedProfile.wrap_mode !== "none" && (
-              <Text style={{ color: C.yellow }}>  · wrap={selectedProfile.wrap_mode}</Text>
-            )}
-            <Text style={{ color: C.cyan }}>  · view={viewMode}</Text>
-            {selectedProfile.description ? (
-              <Text style={{ color: C.textDim }}>  · {selectedProfile.description}</Text>
-            ) : null}
+            {kind !== "shell" && <Text style={{ color: C.cyan }}>◈ webui · </Text>}
+            <Text style={{ color: C.aiAccent }}>{launchLine || "(no command)"}</Text>
           </Text>
         </View>
       )}
@@ -507,42 +524,18 @@ export default function AITab(props: Props) {
           activeOpacity={0.8}
         >
           <MaterialCommunityIcons
-            name={canStop ? "stop-circle" : "play-circle"}
+            name={canStop ? "stop-circle" : kind === "url" ? "open-in-new" : "play-circle"}
             size={22}
             color={canStop ? C.red : C.green}
           />
           <Text style={[s.bigBtnText, { color: canStop ? C.red : C.green }]}>
-            {canStop ? "STOP" : isRunning ? "starting…" : "START"}
+            {canStop ? "STOP" : isRunning ? "starting…" : kind === "url" ? "OPEN" : "START"}
           </Text>
         </TouchableOpacity>
 
         <TouchableOpacity onPress={handleClear} disabled={!activeSession} style={[s.miniBtn, !activeSession && { opacity: 0.4 }]}>
           <MaterialCommunityIcons name="broom" size={16} color={C.textDim} />
           <Text style={s.miniBtnText}>clear</Text>
-        </TouchableOpacity>
-
-        {/* view-mode toggle: TUI (xterm.js) ↔ SCRL (flat ANSI-stripped list).
-            Disabled while no profile is selected; enabled even mid-session so
-            users can flip on the fly if a TUI agent is misbehaving. The
-            XTermView remounts (via key={sessionId+viewMode}) on flip and
-            replays the session ring buffer into the fresh terminal. */}
-        <TouchableOpacity
-          onPress={handleToggleViewMode}
-          disabled={!selectedProfile}
-          style={[
-            s.miniBtn,
-            viewMode === "xterm" && { borderColor: C.aiAccent, backgroundColor: "#1a1428" },
-            !selectedProfile && { opacity: 0.4 },
-          ]}
-        >
-          <MaterialCommunityIcons
-            name={viewMode === "xterm" ? "console-line" : "format-list-text"}
-            size={16}
-            color={viewMode === "xterm" ? C.aiAccent : C.textDim}
-          />
-          <Text style={[s.miniBtnText, viewMode === "xterm" && { color: C.aiAccent }]}>
-            {viewMode === "xterm" ? "tui" : "scrl"}
-          </Text>
         </TouchableOpacity>
 
         {activeSession && (
@@ -561,8 +554,15 @@ export default function AITab(props: Props) {
         )}
       </View>
 
-      {/* Transcript pane — xterm.js for TUI mode, FlatList for scrollback */}
-      {viewMode === "xterm" ? (
+      {/* Transcript pane — WebUI agents show a browser hint; everything else
+          renders as a full xterm.js TUI. */}
+      {kind === "url" && !activeSession ? (
+        <ScrollView style={s.transcript} contentContainerStyle={{ padding: 16 }}>
+          <Text style={s.placeholder}>
+            {`// ${selectedProfile?.name} runs in your browser\n// tap OPEN to launch:\n${launchLine || "(set a launch URL in Settings → agents)"}`}
+          </Text>
+        </ScrollView>
+      ) : viewMode === "xterm" ? (
         // key includes both session id + mode so flipping the toggle (or
         // switching session) cleanly remounts the WebView and replays the
         // ring buffer into a fresh xterm. Without the key, swapping a

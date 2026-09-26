@@ -583,11 +583,12 @@ export default function App() {
             name: "",
             command: "",
             description: "",
-            wrap_mode: "none",
+            wrap_mode: "pty",
             view_mode: "xterm",
             send_newline: true,
             send_initial: null,
             pre_command: null,
+            launch_url: null,
             icon: "🤖",
           },
     );
@@ -604,8 +605,9 @@ export default function App() {
     if (!aiEditing) return;
     const name = (aiEditing.name || "").trim();
     const command = (aiEditing.command || "").trim();
-    if (!name || !command) {
-      Alert.alert("Required fields", "Both name and command are required.");
+    const launchUrl = (aiEditing.launch_url || "").trim();
+    if (!name || (!command && !launchUrl)) {
+      Alert.alert("Required fields", "Name is required, plus a launcher command or a launch URL.");
       return;
     }
     setAiSaving(true);
@@ -617,11 +619,12 @@ export default function App() {
         name,
         command,
         description: aiEditing.description || "",
-        wrap_mode: aiEditing.wrap_mode || "none",
-        view_mode: aiEditing.view_mode || "xterm",
+        wrap_mode: "pty",
+        view_mode: "xterm",
         send_newline: aiEditing.send_newline !== false,
         send_initial: aiEditing.send_initial && aiEditing.send_initial.trim() ? aiEditing.send_initial.trim() : null,
         pre_command: aiEditing.pre_command && aiEditing.pre_command.trim() ? aiEditing.pre_command.trim() : null,
+        launch_url: launchUrl || null,
         icon: aiEditing.icon || "🤖",
       };
       await aiProfilesLocal.upsert(payload);
@@ -1548,24 +1551,19 @@ export default function App() {
             <View style={{ flex: 1 }}>
               <Text style={s.aiProfileName}>{p.name}</Text>
               <Text style={s.aiProfileCmd} numberOfLines={1}>
-                {p.pre_command ? `${p.pre_command} && ` : ""}{p.command}
+                {p.launch_url
+                  ? p.launch_url
+                  : `${p.pre_command ? `${p.pre_command} && ` : ""}${p.command}`}
               </Text>
-              {!!p.description && <Text style={s.aiProfileDesc} numberOfLines={2}>{p.description}</Text>}
-              <View style={{ flexDirection: "row", flexWrap: "wrap", marginTop: 4 }}>
-                <View style={[s.aiBadge, { borderColor: C.aiAccent }]}>
-                  <Text style={[s.aiBadgeText, { color: C.aiAccent }]}>view={p.view_mode || "xterm"}</Text>
-                </View>
-                <View style={[s.aiBadge, { borderColor: p.wrap_mode === "none" ? C.textDim : C.yellow }]}>
-                  <Text style={[s.aiBadgeText, { color: p.wrap_mode === "none" ? C.textDim : C.yellow }]}>
-                    wrap={p.wrap_mode || "none"}
-                  </Text>
-                </View>
-                {p.send_newline === false && (
-                  <View style={[s.aiBadge, { borderColor: C.magenta }]}>
-                    <Text style={[s.aiBadgeText, { color: C.magenta }]}>no-newline</Text>
+              {!!p.launch_url && (
+                <View style={{ flexDirection: "row", flexWrap: "wrap", marginTop: 4 }}>
+                  <View style={[s.aiBadge, { borderColor: C.cyan }]}>
+                    <Text style={[s.aiBadgeText, { color: C.cyan }]}>
+                      {p.command || p.pre_command ? "serve + webui" : "webui"}
+                    </Text>
                   </View>
-                )}
-              </View>
+                </View>
+              )}
             </View>
             <View style={{ flexDirection: "row" }}>
               <TouchableOpacity testID={`btn-ai-edit-${p.id}`} onPress={() => openAIEditor(p)}
@@ -1756,30 +1754,30 @@ export default function App() {
                   />
                 </View>
                 <View style={[s.field, { marginTop: 8 }]}>
-                  <Text style={s.fieldLabel}>launcher command *</Text>
+                  <Text style={s.fieldLabel}>launcher command</Text>
                   <TextInput
                     testID="input-ai-command"
                     value={aiEditing.command}
                     onChangeText={(t) => setAiEditing({ ...aiEditing, command: t })}
                     style={s.fieldInput}
-                    placeholder="hermes --cli"
+                    placeholder="hermes --continue --yolo --tui"
                     placeholderTextColor={C.textDim}
                     autoCapitalize="none"
                     autoCorrect={false}
                   />
                 </View>
                 <View style={[s.field, { marginTop: 8 }]}>
-                  <Text style={s.fieldLabel}>description</Text>
+                  <Text style={s.fieldLabel}>launch URL (WebUI/cloud agents — opens in browser)</Text>
                   <TextInput
-                    testID="input-ai-desc"
-                    value={aiEditing.description || ""}
-                    onChangeText={(t) => setAiEditing({ ...aiEditing, description: t })}
-                    style={[s.fieldInput, { minHeight: 56, textAlignVertical: "top", paddingTop: 8 }]}
-                    placeholder="optional"
+                    testID="input-ai-url"
+                    value={aiEditing.launch_url || ""}
+                    onChangeText={(t) => setAiEditing({ ...aiEditing, launch_url: t })}
+                    style={s.fieldInput}
+                    placeholder="https://100.x.y.z:8443/dashboard"
                     placeholderTextColor={C.textDim}
-                    multiline
-                    numberOfLines={2}
-                    scrollEnabled
+                    autoCapitalize="none"
+                    autoCorrect={false}
+                    keyboardType="url"
                   />
                 </View>
                 <View style={[s.field, { marginTop: 8 }]}>
@@ -1789,7 +1787,7 @@ export default function App() {
                     value={aiEditing.pre_command || ""}
                     onChangeText={(t) => setAiEditing({ ...aiEditing, pre_command: t })}
                     style={[s.fieldInput, { minHeight: 70, textAlignVertical: "top", paddingTop: 8 }]}
-                    placeholder="source ~/.hermes/.env && cd ~/.hermes"
+                    placeholder="cd /root && export API_KEY=…"
                     placeholderTextColor={C.textDim}
                     autoCapitalize="none"
                     autoCorrect={false}
@@ -1797,46 +1795,6 @@ export default function App() {
                     numberOfLines={3}
                     scrollEnabled
                   />
-                </View>
-
-                {/* wrap_mode segmented */}
-                <Text style={[s.fieldLabel, { marginTop: 14 }]}>shell wrap</Text>
-                <View style={[s.segGroup, { marginTop: 4 }]}>
-                  {(["none", "pty", "unbuffered"] as const).map((m) => {
-                    const active = (aiEditing.wrap_mode || "none") === m;
-                    const color = m === "none" ? C.textDim : m === "pty" ? C.yellow : C.cyan;
-                    return (
-                      <TouchableOpacity
-                        key={m}
-                        testID={`btn-ai-wrap-${m}`}
-                        onPress={() => setAiEditing({ ...aiEditing, wrap_mode: m })}
-                        style={[s.segBtn, active && { backgroundColor: color, borderColor: color }]}
-                      >
-                        <Text style={[s.segBtnText, { color: active ? C.bg : color }]}>{m}</Text>
-                      </TouchableOpacity>
-                    );
-                  })}
-                </View>
-
-                {/* view_mode segmented */}
-                <Text style={[s.fieldLabel, { marginTop: 14 }]}>render mode</Text>
-                <View style={[s.segGroup, { marginTop: 4 }]}>
-                  {(["xterm", "scrollback"] as const).map((m) => {
-                    const active = (aiEditing.view_mode || "xterm") === m;
-                    const color = m === "xterm" ? C.aiAccent : C.textDim;
-                    return (
-                      <TouchableOpacity
-                        key={m}
-                        testID={`btn-ai-view-${m}`}
-                        onPress={() => setAiEditing({ ...aiEditing, view_mode: m })}
-                        style={[s.segBtn, active && { backgroundColor: color, borderColor: color }]}
-                      >
-                        <Text style={[s.segBtnText, { color: active ? C.bg : color }]}>
-                          {m === "xterm" ? "TUI (xterm.js)" : "scrollback"}
-                        </Text>
-                      </TouchableOpacity>
-                    );
-                  })}
                 </View>
 
                 {/* send_newline toggle */}

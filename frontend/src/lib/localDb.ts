@@ -22,7 +22,7 @@ let _db: SQLite.SQLiteDatabase | null = null;
 // pre-migration → re-run the seed → insert 9 attack + 5 AI profiles AGAIN.
 // With 8 concurrent callers that produced 72 attack profiles. Fun.
 let _dbPromise: Promise<SQLite.SQLiteDatabase> | null = null;
-const TARGET_VERSION = 14;
+const TARGET_VERSION = 15;
 
 export async function openLocalDb(): Promise<SQLite.SQLiteDatabase> {
   if (_db) return _db;
@@ -82,6 +82,7 @@ async function runMigrations(db: SQLite.SQLiteDatabase) {
             pre_command TEXT,
             icon TEXT DEFAULT '🤖',
             view_mode TEXT DEFAULT 'xterm',
+            launch_url TEXT,
             created_at TEXT NOT NULL
           );
           CREATE TABLE IF NOT EXISTS attack_profiles (
@@ -416,6 +417,32 @@ async function runMigrations(db: SQLite.SQLiteDatabase) {
         }
         break;
       }
+      case 15: {
+        // AI-tab lineup refresh. New out-of-box roster (Hermes, Pi,
+        // Antigravity, Agent Zero, Strix, Pentagi, Heaven, Xalgorix) +
+        // per-agent launch_url so WebUI/cloud agents open in the browser.
+        try {
+          await db.execAsync(`ALTER TABLE ai_profiles ADD COLUMN launch_url TEXT;`);
+        } catch { /* column already exists (fresh install) — ignore */ }
+        // Drop the previous built-in agents so the new lineup replaces them.
+        // User-added agents (any other name) are left untouched.
+        await db.execAsync(
+          `DELETE FROM ai_profiles WHERE name IN ('Hermes','CAI Framework','HEAVEN','Pentagi','PentestAgent');`,
+        );
+        const defs = aiDefaultProfiles();
+        for (let i = 0; i < defs.length; i++) {
+          const p = defs[i];
+          const ex = await db.getFirstAsync<{ id: string }>("SELECT id FROM ai_profiles WHERE name = ?", [p.name]);
+          if (ex) continue;
+          await db.runAsync(
+            `INSERT INTO ai_profiles (id, name, command, description, wrap_mode, send_newline, send_initial, pre_command, icon, view_mode, launch_url, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+            [uuid(), p.name, p.command, p.description, p.wrap_mode, p.send_newline ? 1 : 0,
+             p.send_initial, p.pre_command, p.icon, p.view_mode, p.launch_url,
+             new Date(Date.now() + i * 1000).toISOString()],
+          );
+        }
+        break;
+      }
       default:
         throw new Error(`[localDb] no migration for version ${next}`);
     }
@@ -511,8 +538,32 @@ export type AIProfile = {
   id: string; name: string; command: string; description: string;
   wrap_mode: "none" | "pty" | "unbuffered"; send_newline: boolean;
   send_initial: string | null; pre_command: string | null;
-  icon: string; view_mode: "xterm" | "scrollback"; created_at: string;
+  icon: string; view_mode: "xterm" | "scrollback";
+  /**
+   * For WebUI / cloud agents (Pentagi, Heaven, Xalgorix, Agent Zero): the URL
+   * their dashboard lives at. When set, the AI-tab START button opens this in
+   * the OS default browser. If the agent ALSO has a shell command/pre-command
+   * (e.g. Heaven's `heaven serve …`), that is launched in a PTY first, then
+   * the browser opens. Pure-shell agents (Hermes, Pi, …) leave this null.
+   */
+  launch_url: string | null;
+  created_at: string;
 };
+
+/** Out-of-the-box AI agent roster (fresh installs + v15 lineup swap). */
+function aiDefaultProfiles(): Omit<AIProfile, "id" | "created_at">[] {
+  const base = { description: "", wrap_mode: "pty" as const, send_newline: true, send_initial: null, view_mode: "xterm" as const };
+  return [
+    { ...base, name: "Hermes", icon: "🜲", pre_command: "cd /root", command: "hermes --continue --yolo --tui", launch_url: null },
+    { ...base, name: "Pi", icon: "π", pre_command: "cd /root && export OPENROUTER_API_KEY= && export DEEPSEEK_API_KEY= && export GEMINI_API_KEY= && export MEM0_API_KEY= && export HF_TOKEN=", command: "pi --provider providername --model modelname --thinking high --approve", launch_url: null },
+    { ...base, name: "Antigravity", icon: "🛸", pre_command: "cd /root", command: "agy --continue --model gemini-3.8-flash-high --effort high", launch_url: null },
+    { ...base, name: "Agent Zero", icon: "🕶", pre_command: null, command: "", launch_url: "http://<tailip>:5080/" },
+    { ...base, name: "Strix", icon: "🦉", pre_command: `export LLM_API_KEY="key" && export STRIX_LLM="provider/type/model"`, command: "strix --target url/ip/local foldername to audit", launch_url: null },
+    { ...base, name: "Pentagi", icon: "🐉", pre_command: null, command: "", launch_url: "https://<tailnetip>:8443/dashboard" },
+    { ...base, name: "Heaven", icon: "👁", pre_command: "/usr/local/bin/heaven serve --host <tailnetip> --port <port>", command: "", launch_url: "http://<tailip>:<port>/" },
+    { ...base, name: "Xalgorix", icon: "🔮", pre_command: null, command: "", launch_url: "https://www.xalgorix.com/dashboard" },
+  ];
+}
 export const aiProfilesLocal = {
   async list(): Promise<AIProfile[]> {
     const db = await openLocalDb();
@@ -534,14 +585,15 @@ export const aiProfilesLocal = {
       pre_command: p.pre_command ?? existing?.pre_command ?? null,
       icon: p.icon ?? existing?.icon ?? "🤖",
       view_mode: (p.view_mode ?? existing?.view_mode ?? "xterm") as any,
+      launch_url: p.launch_url ?? existing?.launch_url ?? null,
       created_at: existing?.created_at ?? nowIso(),
     };
     await db.runAsync(
       `INSERT OR REPLACE INTO ai_profiles
-       (id, name, command, description, wrap_mode, send_newline, send_initial, pre_command, icon, view_mode, created_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+       (id, name, command, description, wrap_mode, send_newline, send_initial, pre_command, icon, view_mode, launch_url, created_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
       [row.id, row.name, row.command, row.description, row.wrap_mode, row.send_newline ? 1 : 0,
-       row.send_initial, row.pre_command, row.icon, row.view_mode, row.created_at],
+       row.send_initial, row.pre_command, row.icon, row.view_mode, row.launch_url, row.created_at],
     );
     return row;
   },
@@ -666,18 +718,14 @@ async function seedDefaultsIfEmpty(db: SQLite.SQLiteDatabase) {
 
   const aiCount = await db.getFirstAsync<{ c: number }>("SELECT COUNT(*) as c FROM ai_profiles");
   if ((aiCount?.c ?? 0) === 0) {
-    const seeds: Omit<AIProfile, "id" | "created_at">[] = [
-      { name: "Hermes", command: "hermes", description: "Nous Hermes (DeepSeek V4 Pro) — local agent with Textual TUI", wrap_mode: "pty", send_newline: true, send_initial: null, pre_command: "cd /root/.hermes && set -a && source ./.env 2>/dev/null; set +a", icon: "🜲", view_mode: "xterm" },
-      { name: "CAI Framework", command: "cai", description: "Cybersecurity AI agent framework", wrap_mode: "pty", send_newline: true, send_initial: null, pre_command: null, icon: "🛡", view_mode: "xterm" },
-      { name: "HEAVEN", command: "heaven", description: "HEAVEN multi-agent orchestrator", wrap_mode: "pty", send_newline: true, send_initial: null, pre_command: null, icon: "👁", view_mode: "xterm" },
-      { name: "Pentagi", command: "pentagi", description: "Pentest agent (Pentagi)", wrap_mode: "pty", send_newline: true, send_initial: null, pre_command: null, icon: "🐉", view_mode: "xterm" },
-      { name: "PentestAgent", command: "pentestagent", description: "Standalone pentest agent", wrap_mode: "pty", send_newline: true, send_initial: null, pre_command: null, icon: "🤖", view_mode: "xterm" },
-    ];
-    for (const p of seeds) {
+    const seeds = aiDefaultProfiles();
+    for (let i = 0; i < seeds.length; i++) {
+      const p = seeds[i];
       await db.runAsync(
-        `INSERT INTO ai_profiles (id, name, command, description, wrap_mode, send_newline, send_initial, pre_command, icon, view_mode, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+        `INSERT INTO ai_profiles (id, name, command, description, wrap_mode, send_newline, send_initial, pre_command, icon, view_mode, launch_url, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
         [uuid(), p.name, p.command, p.description, p.wrap_mode, p.send_newline ? 1 : 0,
-         p.send_initial, p.pre_command, p.icon, p.view_mode, nowIso()],
+         p.send_initial, p.pre_command, p.icon, p.view_mode, p.launch_url,
+         new Date(Date.now() + i * 1000).toISOString()],
       );
     }
     console.log(`[localDb] seeded ${seeds.length} AI profiles`);
