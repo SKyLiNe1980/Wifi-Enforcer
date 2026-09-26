@@ -1671,7 +1671,7 @@ export default function App() {
           <TabBtn t="terminal" cur={tab} icon="console" label="term" onPress={setTab} />
           <TabBtn t="live" cur={tab} icon="satellite-uplink" label="live" onPress={setTab} />
           <TabBtn t="ai" cur={tab} icon="robot-outline" label="ai" onPress={setTab} />
-          <TabBtn t="mcp" cur={tab} icon="hub" label="mcp" onPress={setTab} />
+          <TabBtn t="mcp" cur={tab} icon="hub" label="mesh" onPress={setTab} />
           <TabBtn t="swat" cur={tab} icon="shield-account" label="swat" onPress={setTab} />
           <TabBtn t="settings" cur={tab} icon="cog" label="set" onPress={setTab} />
         </View>

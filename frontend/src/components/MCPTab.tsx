@@ -72,10 +72,10 @@ function formatTs(iso: string): string {
   } catch { return iso; }
 }
 
-type SubTab = "status" | "tools" | "nodes" | "audit";
+type SubTab = "map" | "nodes" | "tools" | "cockpit" | "audit";
 
 export default function MCPTab() {
-  const [subTab, setSubTab] = useState<SubTab>("status");
+  const [subTab, setSubTab] = useState<SubTab>("map");
   const [config, setConfig] = useState<MCPConfig | null>(null);
   const [tools, setTools] = useState<MCPTool[]>([]);
   const [audit, setAudit] = useState<MCPAuditEntry[]>([]);
@@ -1834,9 +1834,10 @@ export default function MCPTab() {
       {/* SUB-TAB BAR */}
       <View style={s.subTabBar}>
         {([
-          { key: "status", label: "status", icon: "heart-pulse", count: null as number | null },
-          { key: "tools", label: "tools", icon: "hammer-wrench", count: tools.length },
+          { key: "map", label: "map", icon: "map-marker-radius", count: nodes.length },
           { key: "nodes", label: "nodes", icon: "server-network", count: nodes.length },
+          { key: "tools", label: "tools", icon: "hammer-wrench", count: tools.length },
+          { key: "cockpit", label: "cockpit", icon: "view-dashboard-outline", count: null as number | null },
           { key: "audit", label: "audit", icon: "clipboard-text-clock", count: audit.length },
         ] as { key: SubTab; label: string; icon: any; count: number | null }[]).map((it) => {
           const active = subTab === it.key;
@@ -1866,26 +1867,16 @@ export default function MCPTab() {
         })}
       </View>
 
-      {/* STATUS PANE */}
-      {subTab === "status" && (
+      {/* COCKPIT PANE */}
+      {subTab === "cockpit" && (
         <ScrollView contentContainerStyle={{ padding: 14 }}>
           <Text style={s.sectionTitle}>{"// server"}</Text>
           <View style={s.card}>
-            <View style={s.row}>
-              <View style={[s.statusDot, { backgroundColor: statusInfo.color }]} />
-              <Text style={[s.statusText, { color: statusInfo.color }]}>{statusInfo.label}</Text>
-            </View>
-            <Text style={s.helper}>
-              {"Transport: "}<Text style={{ color: C.cyan }}>HTTP + SSE</Text>
-            </Text>
-            <Text style={[s.helperFine, { marginTop: 4 }]}>
-              {"client endpoint:"}
-            </Text>
-            <Text style={[s.helperFine, { marginTop: 2 }]}>
-              <Text style={{ color: C.cyan }}>http://{config.bind_host}:{config.port}/mcp</Text>
-            </Text>
-            <View style={[s.row, { marginTop: 10 }]}>
-              <Text style={s.kvLabel}>enable server</Text>
+            <View style={[s.row, { justifyContent: "space-between" }]}>
+              <View style={s.row}>
+                <View style={[s.statusDot, { backgroundColor: statusInfo.color }]} />
+                <Text style={[s.statusText, { color: statusInfo.color }]}>{statusInfo.label}</Text>
+              </View>
               <Switch
                 value={config.server_enabled}
                 onValueChange={handleToggleServer}
@@ -1894,74 +1885,67 @@ export default function MCPTab() {
                 disabled={busy}
               />
             </View>
-          </View>
-
-          <Text style={[s.sectionTitle, { marginTop: 20 }]}>{"// network"}</Text>
-          <View style={s.card}>
-            <Text style={s.kvLabel}>server bind host</Text>
-            <TextInput
-              style={s.input}
-              value={bindInput}
-              onChangeText={setBindInput}
-              onBlur={() => bindInput !== config.bind_host && patchConfig({ bind_host: bindInput.trim() || "127.0.0.1" })}
-              placeholder="127.0.0.1 (loopback) or 0.0.0.0 (LAN/Tailscale)"
-              placeholderTextColor={C.textDim}
-              autoCapitalize="none"
-              autoCorrect={false}
-              keyboardType="numbers-and-punctuation"
-            />
-            <Text style={[s.helperFine, { marginTop: 4 }]}>
-              loopback for local-only · 0.0.0.0 for Tailscale mesh · or a specific iface IP
+            <Text style={[s.helperFine, { marginTop: 8 }]}>
+              <Text style={{ color: C.cyan }}>http://{config.bind_host}:{config.port}/mcp</Text>
             </Text>
 
-            <Text style={[s.kvLabel, { marginTop: 14 }]}>cockpit probe host</Text>
+            <View style={s.divider} />
+
+            <View style={[s.row, { gap: 8 }]}>
+              <View style={{ flex: 1 }}>
+                <Text style={s.kvLabel}>bind host</Text>
+                <TextInput
+                  style={s.input}
+                  value={bindInput}
+                  onChangeText={setBindInput}
+                  onBlur={() => bindInput !== config.bind_host && patchConfig({ bind_host: bindInput.trim() || "127.0.0.1" })}
+                  placeholder="0.0.0.0"
+                  placeholderTextColor={C.textDim}
+                  autoCapitalize="none"
+                  autoCorrect={false}
+                  keyboardType="numbers-and-punctuation"
+                />
+              </View>
+              <View style={{ width: 96 }}>
+                <Text style={s.kvLabel}>port</Text>
+                <TextInput
+                  style={s.input}
+                  value={portInput}
+                  onChangeText={setPortInput}
+                  onBlur={() => {
+                    const n = parseInt(portInput, 10);
+                    if (Number.isInteger(n) && n >= 1024 && n <= 65535 && n !== config.port) {
+                      patchConfig({ port: n });
+                    } else if (n !== config.port) {
+                      setPortInput(String(config.port));
+                      Alert.alert("Invalid port", "Use 1024..65535.");
+                    }
+                  }}
+                  placeholder="8765"
+                  placeholderTextColor={C.textDim}
+                  keyboardType="number-pad"
+                />
+              </View>
+            </View>
+            <Text style={[s.kvLabel, { marginTop: 10 }]}>cockpit probe host</Text>
             <TextInput
               style={s.input}
               value={probeInput}
               onChangeText={setProbeInput}
               onBlur={() => {
-                // Strip anything that isn't a bare host. We construct
-                // `http://{host}:{port}/...` ourselves, so a paste of
-                // `http://s10-nethunter:8765/mcp` should yield just
-                // `s10-nethunter`. This prevents the "/mcp got lost between
-                // host and port" confusion.
                 let v = (probeInput || "").trim();
                 v = v.replace(/^https?:\/\//i, "");
-                v = v.split("/")[0];   // drop path
-                v = v.split(":")[0];   // drop port
+                v = v.split("/")[0];
+                v = v.split(":")[0];
                 v = v || "127.0.0.1";
                 if (v !== probeInput) setProbeInput(v);
                 if (v !== config.cockpit_probe_host) patchConfig({ cockpit_probe_host: v });
               }}
-              placeholder="127.0.0.1 (default — works for bind 0.0.0.0 or loopback)"
+              placeholder="127.0.0.1"
               placeholderTextColor={C.textDim}
               autoCapitalize="none"
               autoCorrect={false}
               keyboardType="numbers-and-punctuation"
-            />
-            <Text style={[s.helperFine, { marginTop: 4 }]}>
-              where THIS cockpit connects to probe /health + /audit. host only — no scheme,
-              no port, no path. set to the tailnet IP (e.g. 100.x.y.z) if MagicDNS
-              hostnames don&apos;t resolve on Android.
-            </Text>
-
-            <Text style={[s.kvLabel, { marginTop: 14 }]}>port</Text>
-            <TextInput
-              style={s.input}
-              value={portInput}
-              onChangeText={setPortInput}
-              onBlur={() => {
-                const n = parseInt(portInput, 10);
-                if (Number.isInteger(n) && n >= 1024 && n <= 65535 && n !== config.port) {
-                  patchConfig({ port: n });
-                } else if (n !== config.port) {
-                  setPortInput(String(config.port));
-                  Alert.alert("Invalid port", "Use 1024..65535.");
-                }
-              }}
-              placeholder="8765"
-              placeholderTextColor={C.textDim}
-              keyboardType="number-pad"
             />
           </View>
 
@@ -2012,7 +1996,7 @@ export default function MCPTab() {
               <Text style={[s.sectionTitle, { marginTop: 20 }]}>{"// autospawn"}</Text>
               <View style={s.card}>
                 <View style={[s.row, { justifyContent: "space-between" }]}>
-                  <Text style={s.kvLabel}>auto-launch chroot server on unreachable</Text>
+                  <Text style={s.kvLabel}>auto-launch server on unreachable</Text>
                   <Switch
                     value={config.autospawn_enabled}
                     onValueChange={(v) => patchConfig({ autospawn_enabled: v })}
@@ -2020,30 +2004,6 @@ export default function MCPTab() {
                     thumbColor={config.autospawn_enabled ? C.green : C.textDim}
                   />
                 </View>
-                <Text style={[s.helperFine, { marginTop: 6 }]}>
-                  when on, the cockpit runs the command below via root shell
-                  the moment a /health probe fails. cooldown: 30 s between
-                  attempts. requires a working chroot wrapper (default uses
-                  <Text style={{ color: C.cyan }}> nethunter -c</Text>).
-                </Text>
-
-                <Text style={[s.kvLabel, { marginTop: 12 }]}>spawn command</Text>
-                <TextInput
-                  style={[s.input, { minHeight: 70, fontFamily: MONO, fontSize: 11 }]}
-                  value={autospawnCmdInput}
-                  onChangeText={setAutospawnCmdInput}
-                  onBlur={() => {
-                    const v = autospawnCmdInput.trim();
-                    if (v && v !== config.autospawn_cmd) {
-                      patchConfig({ autospawn_cmd: v });
-                    }
-                  }}
-                  placeholder='nethunter -c "cd /opt/enforcer-mcp && python3 server.py --config /etc/enforcer-mcp/config.yaml"'
-                  placeholderTextColor={C.textDim}
-                  autoCapitalize="none"
-                  autoCorrect={false}
-                  multiline
-                />
 
                 <View style={[s.row, { marginTop: 10, justifyContent: "space-between" }]}>
                   <Text style={s.helperFine}>
@@ -2185,12 +2145,8 @@ export default function MCPTab() {
                 thumbColor={config.require_token ? C.green : C.textDim}
               />
             </View>
-            <Text style={[s.helperFine, { marginTop: 6 }]}>
-              when off, any client reaching the endpoint can call tools — only
-              acceptable if bind_host=127.0.0.1 AND you trust everything on this device.
-            </Text>
 
-            <View style={[s.tokenBox, { marginTop: 14 }]}>
+            <View style={[s.tokenBox, { marginTop: 12 }]}>
               <TextInput
                 style={[s.tokenText, { padding: 0 }]}
                 value={bearerDraft}
@@ -2238,25 +2194,12 @@ export default function MCPTab() {
             <Text style={[s.helperFine, { marginTop: 10 }]}>
               clients send: <Text style={{ color: C.cyan }}>Authorization: Bearer &lt;token&gt;</Text>
             </Text>
-            <Text style={[s.helperFine, { marginTop: 6, color: C.yellow }]}>
-              ⚠ token lives in Android Keystore (encrypted) + sqlite cache. survives
-              app updates &amp; clear-data, but NOT full uninstall. COPY it somewhere
-              safe before reinstalling the APK — or use SYNC FROM CHROOT below to
-              auto-pull it from /etc/enforcer-mcp/config.yaml after every install.
-            </Text>
           </View>
 
-          {/* CHROOT YAML AUTO-IMPORT CARD ─────────────────────────── */}
-          <Text style={[s.sectionTitle, { marginTop: 20 }]}>{"// auto-import from chroot yaml"}</Text>
+          {/* YAML AUTO-IMPORT CARD ─────────────────────────── */}
+          <Text style={[s.sectionTitle, { marginTop: 20 }]}>{"// auto-import from yaml"}</Text>
           <View style={s.card}>
-            <Text style={s.helperFine}>
-              shell into the chroot and read{" "}
-              <Text style={{ color: C.cyan }}>/etc/enforcer-mcp/config.yaml</Text>
-              {" "}directly — bearer token, port, bind host all imported in one tap.
-              solves the EAS-install wipe problem without manual clipboard dance.
-            </Text>
-
-            <View style={[s.row, { justifyContent: "space-between", marginTop: 12 }]}>
+            <View style={[s.row, { justifyContent: "space-between" }]}>
               <Text style={s.kvLabel}>auto-sync on app start when token empty</Text>
               <Switch
                 value={config.chroot_autosync_enabled}
@@ -2265,29 +2208,6 @@ export default function MCPTab() {
                 thumbColor={config.chroot_autosync_enabled ? C.green : C.textDim}
               />
             </View>
-            <Text style={[s.helperFine, { marginTop: 4 }]}>
-              when on, the cockpit reads the chroot yaml automatically on every
-              app launch IF the bearer token is empty (typical post-install).
-              never overwrites a token you&apos;ve already imported manually.
-            </Text>
-
-            <Text style={[s.kvLabel, { marginTop: 14 }]}>chroot read command</Text>
-            <TextInput
-              style={[s.input, { fontFamily: MONO, fontSize: 11 }]}
-              value={chrootCmdInput}
-              onChangeText={setChrootCmdInput}
-              onBlur={() => {
-                const v = chrootCmdInput.trim();
-                if (v && v !== config.chroot_yaml_cmd) {
-                  patchConfig({ chroot_yaml_cmd: v });
-                }
-              }}
-              placeholder='nethunter -c "cat /etc/enforcer-mcp/config.yaml"'
-              placeholderTextColor={C.textDim}
-              autoCapitalize="none"
-              autoCorrect={false}
-              multiline
-            />
 
             <View style={[s.row, { marginTop: 12, gap: 6 }]}>
               <TouchableOpacity
@@ -2301,7 +2221,7 @@ export default function MCPTab() {
                   color={C.green}
                 />
                 <Text style={[s.btnText, { color: C.green }]}>
-                  {chrootSyncStatus === "running" ? "READING…" : "SYNC FROM CHROOT"}
+                  {chrootSyncStatus === "running" ? "READING…" : "SYNC YAML"}
                 </Text>
               </TouchableOpacity>
             </View>
@@ -2324,15 +2244,10 @@ export default function MCPTab() {
 
             {!HAS_NATIVE_ROOT && (
               <Text style={[s.helperFine, { marginTop: 8, color: C.yellow }]}>
-                ⚠ root shell unavailable — works only on the deployed APK,
-                not Expo Go / web preview.
+                ⚠ root shell unavailable — deployed APK only.
               </Text>
             )}
           </View>
-
-          <Text style={[s.helperFine, { marginTop: 16, color: C.textDim }]}>
-            primary node (// nodes) = where shorthand calls land · roster auto-syncs 60s.
-          </Text>
         </ScrollView>
       )}
 
@@ -2355,13 +2270,6 @@ export default function MCPTab() {
                 <Text style={[s.btnText, { color: C.cyan }]}>
                   {toolSyncStatus === "syncing" ? "SYNCING…" : "RESYNC"}
                 </Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={[s.btn, { backgroundColor: C.panel2, borderColor: C.mcpAccent }]}
-                onPress={() => setEditingTool({ name: "", command_template: "", wrap_mode: "auto", timeout_sec: 60, enabled: true, built_in: false })}
-              >
-                <MaterialCommunityIcons name="plus" size={14} color={C.mcpAccent} />
-                <Text style={[s.btnText, { color: C.mcpAccent }]}>NEW</Text>
               </TouchableOpacity>
             </View>
           </View>
@@ -2430,17 +2338,30 @@ export default function MCPTab() {
           ))}
 
           {tools.length === 0 && (
-            <Text style={s.helper}>{"// no tools registered — tap NEW to add one"}</Text>
+            <Text style={s.helper}>{"// no tools discovered — tap RESYNC to scan the mesh"}</Text>
           )}
         </ScrollView>
+      )}
+
+      {/* MAP PANE — full-screen swarm topology (primary Mesh view) */}
+      {subTab === "map" && (
+        <View style={{ flex: 1, padding: 12 }}>
+          <NodesMap
+            fill
+            localHealth={serverHealth}
+            localEnabled={config.server_enabled}
+            localLabel={config.bind_host}
+            nodes={nodes}
+            nodeHealth={nodeHealth}
+            onPressLocal={() => setShowLocalSheet(true)}
+            onPressNode={(n) => setMapSheetNode(n)}
+          />
+        </View>
       )}
 
       {/* NODES PANE */}
       {subTab === "nodes" && (
         <ScrollView contentContainerStyle={{ padding: 14, paddingBottom: 90 }}>
-          {/* Title gets its own row so the action bar can breathe and
-              wrap without stealing horizontal space from the header. */}
-          <Text style={[s.sectionTitle, { marginBottom: 10 }]}>{"// swarm nodes"}</Text>
           <View style={[s.row, {
             gap: 6, flexWrap: "wrap", marginBottom: 12,
           }]}>
@@ -2561,30 +2482,13 @@ export default function MCPTab() {
             />
           </View>
 
-          <Text style={[s.sectionTitle, { marginBottom: 10 }]}>{"// nodes map"}</Text>
-          <NodesMap
-            localHealth={serverHealth}
-            localEnabled={config.server_enabled}
-            localLabel={config.bind_host}
-            nodes={nodes}
-            nodeHealth={nodeHealth}
-            onPressLocal={() => setShowLocalSheet(true)}
-            onPressNode={(n) => setMapSheetNode(n)}
-          />
-
-          <Text style={[s.sectionTitle, { marginVertical: 10 }]}>{"// node list"}</Text>
+          <Text style={[s.sectionTitle, { marginBottom: 10 }]}>{"// node list"}</Text>
           {nodes.length === 0 ? (
             <View style={s.card}>
               <Text style={s.helper}>
-                No remote nodes yet. Deploy the{" "}
-                <Text style={{ color: C.cyan }}>enforcer-mcp_*.deb</Text> on a
-                Pi / VPS / mini-PC, grab the bearer token from its postinst
-                output, and tap{" "}
-                <Text style={{ color: C.mcpAccent }}>[+ ADD NODE]</Text> above.
-              </Text>
-              <Text style={[s.helperFine, { marginTop: 8 }]}>
-                The cockpit&apos;s own chroot MCP server stays managed under{" "}
-                <Text style={{ color: C.cyan }}>{"// status"}</Text>.
+                No remote nodes. Deploy <Text style={{ color: C.cyan }}>enforcer-mcp_*.deb</Text> on
+                a node, then <Text style={{ color: C.mcpAccent }}>[+ ADD NODE]</Text> with its
+                tailnet IP, port and bearer.
               </Text>
             </View>
           ) : (
@@ -2737,12 +2641,6 @@ export default function MCPTab() {
               );
             })
           )}
-
-          <Text style={[s.helperFine, { marginTop: 12, color: C.textDim }]}>
-            Probe interval: 10 s · Add each node&apos;s public Tailscale IP +
-            port + bearer (printed by postinst). The cockpit caches health
-            state in SQLite so this list paints instantly on tab switch.
-          </Text>
         </ScrollView>
       )}
 
@@ -3603,17 +3501,17 @@ const s = StyleSheet.create({
   container: { flex: 1, backgroundColor: C.bg },
   subTabBar: {
     flexDirection: "row", borderBottomWidth: 1, borderColor: C.border,
-    backgroundColor: C.panel, paddingHorizontal: 8, paddingVertical: 8, gap: 6,
+    backgroundColor: C.panel, paddingHorizontal: 6, paddingVertical: 8, gap: 4,
   },
   subTabBtn: {
     flex: 1, flexDirection: "row", alignItems: "center", justifyContent: "center",
-    gap: 4, paddingVertical: 8, paddingHorizontal: 4,
+    gap: 3, paddingVertical: 8, paddingHorizontal: 2,
     borderWidth: 1, borderColor: C.border, borderRadius: 4, backgroundColor: C.panel2,
   },
   subTabBtnActive: { borderColor: C.mcpAccent, backgroundColor: "#0d2733" },
-  subTabText: { fontFamily: MONO, color: C.textDim, fontSize: 11, fontWeight: "700", letterSpacing: 0.5, includeFontPadding: false },
+  subTabText: { fontFamily: MONO, color: C.textDim, fontSize: 10, fontWeight: "700", letterSpacing: 0.2, includeFontPadding: false },
   subTabBadge: {
-    minWidth: 18, paddingHorizontal: 5, paddingVertical: 1, borderRadius: 8,
+    minWidth: 16, paddingHorizontal: 4, paddingVertical: 1, borderRadius: 8,
     backgroundColor: C.border, alignItems: "center", justifyContent: "center",
   },
   subTabBadgeActive: { backgroundColor: C.mcpAccent },
@@ -3624,6 +3522,7 @@ const s = StyleSheet.create({
     borderRadius: 6, padding: 12,
   },
   row: { flexDirection: "row", alignItems: "center" },
+  divider: { height: 1, backgroundColor: C.border, marginVertical: 12 },
   helper: { fontFamily: MONO, color: C.text, fontSize: 12, lineHeight: 18 },
   helperFine: { fontFamily: MONO, color: C.textDim, fontSize: 11 },
   kvLabel: { fontFamily: MONO, color: C.textDim, fontSize: 11, marginBottom: 4 },

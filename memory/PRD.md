@@ -989,3 +989,28 @@ the description field; added a **launch URL** field. saveAIProfile requires name
 launch_url), forces wrap_mode=pty/view_mode=xterm. List rows drop wrap/view/desc badges, show a
 webui/serve+webui badge when launch_url is set.
 JS-only, android bundle HTTP 200, lint clean. VERIFY ON APK (web preview = SQLite crash).
+
+### 🎨 UI RESTRUCTURE — Mesh tab (ex-MCP, tab-by-tab pass 5, user notes)
+Biggest structural pass. Renamed the bottom-nav tab **MCP → mesh** (internal key stays "mcp").
+New subtab order + names: **[Map] [Nodes] [Tools] [Cockpit] [Audit]** (SubTab type =
+map|nodes|tools|cockpit|audit, default "map"). Target audience = pro secops → stripped the big
+explanatory text blocks throughout (an ops manual will cover the detail).
+
+- **Map** (new, primary/default view): full-screen NodesMap. NodesMap gained a `fill` prop —
+  measures its own height and fills the pane (was a fixed 300px canvas crammed under the list).
+  GRID_THRESHOLD 8→12 (radial→grid collapse point). Tap hub/node still opens sheets.
+- **Nodes** (new split-out): node-management action bar (deploy/provision/add/install .deb/push
+  .deb/update-all) + auto-revive toggle + node-list cards (unchanged actions). Removed the
+  embedded map + double titles + verbose trailing helper; compacted the empty state.
+- **Cockpit** (ex-Status, compacted): merged `// network` INTO `// server` (status dot + enable
+  switch + endpoint, divider, then bind host / port side-by-side + probe host, helpers stripped).
+  `// connectivity` kept. `// autospawn`: dropped "chroot" label word, removed the helper block
+  AND the spawn-cmd textbox; kept STATUS/LOG/STOP. `// cloud sync` untouched (user: good). `//
+  auth`: stripped "when off…" + yellow "token lives…" blocks, kept switch/token/buttons + Bearer
+  hint. `// auto-import from chroot yaml` → **// auto-import from yaml**, stripped both text
+  blocks + read-cmd textbox, button relabelled **SYNC YAML** (kept auto-sync toggle). Dropped
+  trailing "primary node…" helper.
+- **Tools**: removed **+NEW** (tools self-declare / discovered by RESYNC scan). RESYNC + per-tool
+  EDIT/DELETE/enable kept. Empty text → "no tools discovered — tap RESYNC to scan the mesh".
+- **Audit**: unchanged.
+JS-only, android bundle HTTP 200, lint clean. VERIFY ON APK (web preview = SQLite crash).
